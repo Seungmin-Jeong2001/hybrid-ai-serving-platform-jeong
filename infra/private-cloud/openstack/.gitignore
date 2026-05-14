@@ -1,4 +1,6 @@
 .terraform/
+backend.generated.tf
+backend.hcl
 terraform.tfstate
 terraform.tfstate.*
 terraform.tfvars

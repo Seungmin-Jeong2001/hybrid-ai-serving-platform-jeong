@@ -20,7 +20,7 @@ repository에 커밋하지 않습니다.
 
 최소 필요 값:
 
-- `OS_AUTH_URL`
+- `OS_AUTH_URL`: 이 repository가 생성하는 값이 아니라, 이미 존재하는 OpenStack Keystone/Identity endpoint입니다.
 - `OS_USERNAME`
 - `OS_PASSWORD`
 - `OS_PROJECT_NAME`
@@ -31,11 +31,15 @@ repository에 커밋하지 않습니다.
 ## 로컬 점검
 
 ```sh
-terraform init
-terraform fmt -check
-terraform validate
-terraform plan -var-file=terraform.tfvars
+ha test
+ha test --integration
+```
+
+실제 OpenStack 리소스를 올릴 때는 repository root에서 실행합니다.
+
+```sh
+ha up openstack --auto-approve
 ```
 
 로컬에서 확인할 때만 `terraform.tfvars.example`을 `terraform.tfvars`로 복사해서
-사용합니다. 값이 채워진 `terraform.tfvars`는 커밋하지 않습니다.
+사용합니다. 값이 채워진 `terraform.tfvars`, Terraform state, backend 설정 파일은 커밋하지 않습니다.

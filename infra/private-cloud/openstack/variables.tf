@@ -73,31 +73,37 @@ variable "gpu_worker_count" {
 variable "control_plane_image_name" {
   description = "OpenStack image name for control-plane VMs."
   type        = string
+  default     = "ubuntu-22.04"
 }
 
 variable "control_plane_flavor_name" {
   description = "OpenStack flavor name for control-plane VMs."
   type        = string
+  default     = "m1.medium"
 }
 
 variable "build_worker_image_name" {
   description = "OpenStack image name for build-worker VMs."
   type        = string
+  default     = "ubuntu-22.04"
 }
 
 variable "build_worker_flavor_name" {
   description = "OpenStack flavor name for build-worker VMs."
   type        = string
+  default     = "m1.large"
 }
 
 variable "gpu_worker_image_name" {
   description = "OpenStack image name for GPU-worker VMs."
   type        = string
+  default     = "ubuntu-22.04-gpu"
 }
 
 variable "gpu_worker_flavor_name" {
   description = "OpenStack GPU flavor name for GPU-worker VMs."
   type        = string
+  default     = "g1.large"
 }
 
 variable "instance_metadata" {
