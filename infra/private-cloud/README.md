@@ -24,6 +24,113 @@ infra/private-cloud/
 5. Storage와 GPU 리소스는 실제 NFS/GPU 노드 준비가 끝난 뒤 선택적으로 적용합니다.
 6. `handoff/` 문서를 기준으로 model, public, hybrid, monitoring 담당자에게 필요한 값을 전달합니다.
 
+## 로컬 실행
+
+검증과 실제 반영은 `ha`에서 분리합니다.
+
+```sh
+./ha install --with-deps
+ha explain
+ha completion zsh
+ha test
+ha test --integration
+ha prod check
+ha env init
+ha env check
+ha up all --auto-approve
+ha up openstack --auto-approve
+```
+
+- `./ha install --with-deps`: `terraform`과 `kubectl`을 project-local `.ha/bin`에 설치합니다.
+- `ha install`: bash/zsh 자동완성을 `.ha/completions`에 생성하고 shell config에 연결합니다.
+- 자동완성은 애매한 후보를 바로 선택하지 않고 아래 목록으로 보여주도록 설정합니다.
+- `ha explain`: 설치, 테스트, 실제 반영, 필수 환경 변수를 설명합니다.
+- `ha test`: 로컬 구조, YAML, kustomization 참조, 선택적 Terraform/kustomize 렌더링을 확인합니다.
+- `ha test --integration`: 선택 provider 기준으로 변경 전 검증을 수행합니다.
+- `ha prod check`: 현재 kubeconfig 대상이 운영 기준을 만족하는지 검사합니다.
+- `ha env init`: `.env`, `.env.secret` 템플릿을 생성합니다.
+- `ha env check`: provider와 로컬 프로비저닝 가능 상태를 확인합니다.
+- `ha up all --auto-approve`: 기본값으로 현재 서버 또는 LXD 컨테이너에 k3s Kubernetes를 프로비저닝하고 baseline manifest를 적용합니다.
+- `ha up openstack --auto-approve`: `HA_PROVIDER=openstack`일 때만 OpenStack Terraform 리소스를 생성/변경합니다.
+- `ha up kubernetes|storage|gpu`: 현재 kubeconfig 대상 cluster에 manifest를 실제 적용합니다.
+
+기본 provider는 `auto`입니다. sudo가 가능하면 `local`, 아니면 LXD가 있으면 `lxd`를 선택합니다. OpenStack은 이미 존재하는 OpenStack API에 붙는 선택 provider입니다.
+
+## 테스트 방법
+
+로컬 smoke test는 cloud credential 없이 실행합니다.
+
+```sh
+ha test
+ha test --terraform-init
+```
+
+- `ha test`: YAML 문법, kustomization 참조, `kubectl kustomize` 렌더링을 확인합니다.
+- `ha test --terraform-init`: OpenStack provider를 내려받고 Terraform validate까지 확인합니다.
+
+현재 서버 프로비저닝 전 상태를 확인합니다.
+
+```sh
+ha env init
+vi .env
+ha env check
+ha test --integration
+```
+
+`ha`는 `.env`와 `.env.secret`이 있으면 자동으로 읽습니다. 기본 `.env`에는 `HA_PROVIDER=auto`와
+k3s/LXD provisioning 옵션만 둡니다. OpenStack credential은 `HA_PROVIDER=openstack`일 때만 필요합니다.
+
+## 실제 실행 방법
+
+현재 서버 또는 LXD 컨테이너에 Kubernetes를 실제로 프로비저닝하고 baseline manifest를 적용합니다.
+
+```sh
+ha up all --auto-approve
+ha prod check
+```
+
+Storage/GPU 예시는 실제 NFS/GPU backing이 있을 때 opt-in으로 적용합니다.
+
+```sh
+HA_APPLY_STORAGE=1 ha up all --auto-approve
+HA_APPLY_GPU=1 ha up all --auto-approve
+```
+
+이미 접근 가능한 Kubernetes cluster가 있을 때 manifest만 적용합니다.
+
+```sh
+ha up kubernetes
+ha up storage
+ha up gpu
+```
+
+이미 존재하는 OpenStack을 provider로 쓸 때만 아래 경로를 사용합니다.
+
+```sh
+HA_PROVIDER=openstack ha up openstack --auto-approve
+ha tf output
+```
+
+## Production readiness
+
+현재 local/LXD provider는 개발 및 통합 테스트용입니다. 접속 가능한 Kubernetes API와 baseline
+manifest 적용까지는 확인하지만, 단일 host/단일 node이므로 production으로 간주하지 않습니다.
+
+`ha prod check`가 검사하는 운영 기준:
+
+- control-plane 3대 이상, 전체 node 3대 이상
+- 모든 node Ready, 모든 non-completed pod Ready
+- `local-path`가 아닌 replicated/external default StorageClass
+- IngressClass, cert-manager, monitoring stack, backup target/controller
+- workload namespace의 Pod Security label, ResourceQuota, LimitRange, NetworkPolicy
+
+삭제 또는 정리는 Terraform destroy로 수행합니다.
+
+```sh
+ha tf plan -destroy
+ha tf destroy
+```
+
 ## 주요 Namespace
 
 | Namespace | 용도 |
