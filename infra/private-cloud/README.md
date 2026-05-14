@@ -28,6 +28,7 @@ infra/private-cloud/
 ## 로컬 실행
 
 검증과 실제 반영은 `ha`에서 분리합니다.
+여기서 `ha`와 `HA_*` prefix는 Hybrid AI 프로젝트 이름을 뜻하며, High Availability 약자가 아닙니다.
 
 ```sh
 ./ha install --with-deps

@@ -80,7 +80,7 @@ Usage:
   ha uninstall [--bin-dir DIR]
 
 Commands:
-  install    Install a project-scoped ha launcher in the first writable PATH location
+  install    Install the Hybrid AI project CLI launcher in the first writable PATH location
   uninstall  Remove the managed launcher
   doctor     Check project layout and local tool availability
   test       Run smoke/integration validation without applying changes
@@ -121,8 +121,9 @@ EOF
 
 explain() {
   cat <<EOF
-ha는 이 repository 전용 helper입니다.
+ha는 Hybrid AI 프로젝트 이름을 딴 repository 전용 CLI입니다.
 현재 git root가 ${HA_PROJECT_ROOT}일 때만 실행되며, 다른 repository에서는 동작하지 않습니다.
+HA_* 환경 변수는 이 프로젝트 전용 prefix이며, High Availability 약자가 아닙니다.
 
 1. 설치
 
