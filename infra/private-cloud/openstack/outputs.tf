@@ -18,7 +18,7 @@ output "control_plane_nodes" {
   value = [
     for index, node in openstack_compute_instance_v2.control_plane : {
       name       = node.name
-      private_ip = node.network[0].fixed_ip_v4
+      private_ip = openstack_networking_port_v2.control_plane[index].all_fixed_ips[0]
       floating_ip = (
         var.assign_floating_ips
         ? openstack_networking_floatingip_v2.control_plane[index].address
@@ -34,7 +34,7 @@ output "build_worker_nodes" {
   value = [
     for index, node in openstack_compute_instance_v2.build_worker : {
       name       = node.name
-      private_ip = node.network[0].fixed_ip_v4
+      private_ip = openstack_networking_port_v2.build_worker[index].all_fixed_ips[0]
       floating_ip = (
         var.assign_floating_ips
         ? openstack_networking_floatingip_v2.build_worker[index].address
@@ -50,7 +50,7 @@ output "gpu_worker_nodes" {
   value = [
     for index, node in openstack_compute_instance_v2.gpu_worker : {
       name       = node.name
-      private_ip = node.network[0].fixed_ip_v4
+      private_ip = openstack_networking_port_v2.gpu_worker[index].all_fixed_ips[0]
       floating_ip = (
         var.assign_floating_ips
         ? openstack_networking_floatingip_v2.gpu_worker[index].address

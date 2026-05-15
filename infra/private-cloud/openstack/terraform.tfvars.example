@@ -25,3 +25,8 @@ build_worker_flavor_name = "m1.large"
 gpu_worker_count       = 1
 gpu_worker_image_name  = "ubuntu-22.04-gpu"
 gpu_worker_flavor_name = "g1.large"
+
+# Cloud-init installs common Kubernetes, storage, diagnostics, and GPU host dependencies.
+install_node_dependencies = true
+enable_gpu_bootstrap      = true
+gpu_driver_autoinstall    = true

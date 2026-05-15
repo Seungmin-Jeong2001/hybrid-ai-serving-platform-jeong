@@ -184,7 +184,7 @@ Workflow 경로: `.github/workflows/private-cloud-foundation.yml`
 - `OPENSTACK_USER_DOMAIN_NAME`
 - `OPENSTACK_PROJECT_DOMAIN_NAME`
 - `PRIVATE_CLOUD_SSH_PUBLIC_KEY`
-- `TF_BACKEND_CONFIG`: `apply`, `destroy` 실행 시 사용할 S3 호환 Terraform 원격 state 설정
+- `TF_BACKEND_CONFIG`: `apply`, `destroy` 실행 시 사용할 Terraform backend 설정
 - `PRIVATE_KUBECONFIG_B64`: Kubernetes manifest 적용 시 사용할 kubeconfig base64 값
 
 필수 GitHub Variables:
@@ -203,6 +203,10 @@ Workflow 경로: `.github/workflows/private-cloud-foundation.yml`
 선택 GitHub Variable:
 
 - `OPENSTACK_REGION`
+- `PRIVATE_CLOUD_RUNNER`: private OpenStack endpoint에 접근할 self-hosted runner label
+- `PRIVATE_CLOUD_TOOL_BIN_DIR`: self-hosted runner에서 사용할 `terraform`, `kubectl` 경로
+- `PRIVATE_CLOUD_AUTO_APPLY`: `feature/private` push 시 Terraform apply까지 자동 실행하려면 `true`
+- `TF_BACKEND_TYPE`: 기본 `s3`, self-hosted local 검증은 `local`
 
 DNS workflow 경로: `.github/workflows/private-cloud-dns.yml`
 

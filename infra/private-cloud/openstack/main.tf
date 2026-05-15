@@ -6,6 +6,12 @@ locals {
     },
     var.instance_metadata,
   )
+
+  cloud_init_common = {
+    install_node_dependencies = tostring(var.install_node_dependencies)
+    enable_gpu_bootstrap      = tostring(var.enable_gpu_bootstrap)
+    gpu_driver_autoinstall    = tostring(var.gpu_driver_autoinstall)
+  }
 }
 
 resource "openstack_networking_network_v2" "private" {
@@ -86,6 +92,19 @@ resource "openstack_compute_keypair_v2" "admin" {
   public_key = var.ssh_public_key
 }
 
+resource "openstack_networking_port_v2" "control_plane" {
+  count = var.control_plane_count
+
+  name               = format("%s-control-%02d-port", var.project_name, count.index + 1)
+  network_id         = openstack_networking_network_v2.private.id
+  admin_state_up     = true
+  security_group_ids = [openstack_networking_secgroup_v2.private.id]
+
+  fixed_ip {
+    subnet_id = openstack_networking_subnet_v2.private.id
+  }
+}
+
 resource "openstack_compute_instance_v2" "control_plane" {
   count = var.control_plane_count
 
@@ -93,16 +112,15 @@ resource "openstack_compute_instance_v2" "control_plane" {
   image_name        = var.control_plane_image_name
   flavor_name       = var.control_plane_flavor_name
   key_pair          = openstack_compute_keypair_v2.admin.name
-  security_groups   = [openstack_networking_secgroup_v2.private.name]
   availability_zone = var.availability_zone
-  user_data         = templatefile("${path.module}/cloud-init/base.yaml.tftpl", { node_role = "control-plane" })
+  user_data         = templatefile("${path.module}/cloud-init/base.yaml.tftpl", merge(local.cloud_init_common, { node_role = "control-plane" }))
 
   metadata = merge(local.common_metadata, {
     role = "control-plane"
   })
 
   network {
-    uuid = openstack_networking_network_v2.private.id
+    port = openstack_networking_port_v2.control_plane[count.index].id
   }
 }
 
@@ -110,7 +128,20 @@ resource "openstack_networking_floatingip_v2" "control_plane" {
   count = var.assign_floating_ips ? var.control_plane_count : 0
 
   pool    = var.floating_ip_pool
-  port_id = openstack_compute_instance_v2.control_plane[count.index].network[0].port
+  port_id = openstack_networking_port_v2.control_plane[count.index].id
+}
+
+resource "openstack_networking_port_v2" "build_worker" {
+  count = var.build_worker_count
+
+  name               = format("%s-build-%02d-port", var.project_name, count.index + 1)
+  network_id         = openstack_networking_network_v2.private.id
+  admin_state_up     = true
+  security_group_ids = [openstack_networking_secgroup_v2.private.id]
+
+  fixed_ip {
+    subnet_id = openstack_networking_subnet_v2.private.id
+  }
 }
 
 resource "openstack_compute_instance_v2" "build_worker" {
@@ -120,16 +151,15 @@ resource "openstack_compute_instance_v2" "build_worker" {
   image_name        = var.build_worker_image_name
   flavor_name       = var.build_worker_flavor_name
   key_pair          = openstack_compute_keypair_v2.admin.name
-  security_groups   = [openstack_networking_secgroup_v2.private.name]
   availability_zone = var.availability_zone
-  user_data         = templatefile("${path.module}/cloud-init/base.yaml.tftpl", { node_role = "build-worker" })
+  user_data         = templatefile("${path.module}/cloud-init/base.yaml.tftpl", merge(local.cloud_init_common, { node_role = "build-worker" }))
 
   metadata = merge(local.common_metadata, {
     role = "build-worker"
   })
 
   network {
-    uuid = openstack_networking_network_v2.private.id
+    port = openstack_networking_port_v2.build_worker[count.index].id
   }
 }
 
@@ -137,7 +167,20 @@ resource "openstack_networking_floatingip_v2" "build_worker" {
   count = var.assign_floating_ips ? var.build_worker_count : 0
 
   pool    = var.floating_ip_pool
-  port_id = openstack_compute_instance_v2.build_worker[count.index].network[0].port
+  port_id = openstack_networking_port_v2.build_worker[count.index].id
+}
+
+resource "openstack_networking_port_v2" "gpu_worker" {
+  count = var.gpu_worker_count
+
+  name               = format("%s-gpu-%02d-port", var.project_name, count.index + 1)
+  network_id         = openstack_networking_network_v2.private.id
+  admin_state_up     = true
+  security_group_ids = [openstack_networking_secgroup_v2.private.id]
+
+  fixed_ip {
+    subnet_id = openstack_networking_subnet_v2.private.id
+  }
 }
 
 resource "openstack_compute_instance_v2" "gpu_worker" {
@@ -147,16 +190,15 @@ resource "openstack_compute_instance_v2" "gpu_worker" {
   image_name        = var.gpu_worker_image_name
   flavor_name       = var.gpu_worker_flavor_name
   key_pair          = openstack_compute_keypair_v2.admin.name
-  security_groups   = [openstack_networking_secgroup_v2.private.name]
   availability_zone = var.availability_zone
-  user_data         = templatefile("${path.module}/cloud-init/base.yaml.tftpl", { node_role = "gpu-worker" })
+  user_data         = templatefile("${path.module}/cloud-init/base.yaml.tftpl", merge(local.cloud_init_common, { node_role = "gpu-worker" }))
 
   metadata = merge(local.common_metadata, {
     role = "gpu-worker"
   })
 
   network {
-    uuid = openstack_networking_network_v2.private.id
+    port = openstack_networking_port_v2.gpu_worker[count.index].id
   }
 }
 
@@ -164,5 +206,5 @@ resource "openstack_networking_floatingip_v2" "gpu_worker" {
   count = var.assign_floating_ips ? var.gpu_worker_count : 0
 
   pool    = var.floating_ip_pool
-  port_id = openstack_compute_instance_v2.gpu_worker[count.index].network[0].port
+  port_id = openstack_networking_port_v2.gpu_worker[count.index].id
 }

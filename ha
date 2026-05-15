@@ -1164,7 +1164,7 @@ paths = sorted(
     path
     for pattern in ("*.yaml", "*.yml")
     for path in root.rglob(pattern)
-    if ".git" not in path.parts
+    if ".git" not in path.parts and ".ha" not in path.parts
 )
 
 failed = False

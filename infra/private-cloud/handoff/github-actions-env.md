@@ -33,6 +33,27 @@ Workflow: `.github/workflows/private-cloud-foundation.yml`
 | `BUILD_WORKER_FLAVOR_NAME` | `TF_VAR_build_worker_flavor_name` | build worker VM flavor |
 | `GPU_WORKER_IMAGE_NAME` | `TF_VAR_gpu_worker_image_name` | GPU worker VM image |
 | `GPU_WORKER_FLAVOR_NAME` | `TF_VAR_gpu_worker_flavor_name` | GPU worker VM flavor |
+| `PRIVATE_CLOUD_RUNNER` | self-hosted runner label | Private OpenStack endpoint에 접근할 runner, 예: `private-cloud` |
+| `PRIVATE_CLOUD_TOOL_BIN_DIR` | self-hosted tool path | self-hosted runner에서 사용할 `terraform`, `kubectl` 경로 |
+| `PRIVATE_CLOUD_AUTO_APPLY` | `true` 또는 `false` | `feature/private` push 시 Terraform apply까지 자동 실행할지 여부 |
+| `TF_BACKEND_TYPE` | Terraform backend type | 기본 `s3`, self-hosted local 검증은 `local` |
+| `PRIVATE_CLOUD_SSH_USER` | bootstrap SSH user | dependency bootstrap 검증용 SSH user, 기본 `ubuntu` |
+| `PRIVATE_CLOUD_SSH_TARGET` | `auto`, `floating_ip`, `private_ip` | dependency bootstrap 검증용 SSH 대상 선택 |
+| `PRIVATE_CLOUD_SSH_PROXY_CONTAINER` | LXD container name | 로컬 DevStack처럼 proxy가 필요할 때 사용 |
+
+### Optional GitHub Secrets
+
+| Secret | 로컬 값 | 용도 |
+| --- | --- | --- |
+| `PRIVATE_CLOUD_SSH_PRIVATE_KEY` | OpenStack VM SSH private key | cloud-init 완료와 dependency check를 Actions에서 검증 |
+
+`PRIVATE_CLOUD_AUTO_APPLY=true`이면 `feature/private` branch에 OpenStack Terraform 또는
+Foundation workflow 변경이 push될 때 Terraform `apply`까지 실행합니다. `false` 또는 미설정이면
+push 실행은 `plan`까지만 수행합니다.
+
+Private OpenStack API가 Tailscale 또는 로컬 네트워크 안에 있으면 GitHub-hosted runner에서
+접근할 수 없습니다. 이 경우 repository self-hosted runner를 등록하고 `PRIVATE_CLOUD_RUNNER`에
+해당 runner label을 지정합니다.
 
 ## Private Cloud DNS workflow
 

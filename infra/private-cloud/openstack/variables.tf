@@ -118,6 +118,24 @@ variable "gpu_worker_flavor_name" {
   default     = "g1.large"
 }
 
+variable "install_node_dependencies" {
+  description = "Install common infrastructure node dependencies through cloud-init."
+  type        = bool
+  default     = true
+}
+
+variable "enable_gpu_bootstrap" {
+  description = "Install and tune GPU worker host dependencies through cloud-init."
+  type        = bool
+  default     = true
+}
+
+variable "gpu_driver_autoinstall" {
+  description = "Allow GPU workers to use ubuntu-drivers autoinstall when an NVIDIA PCI device is detected."
+  type        = bool
+  default     = true
+}
+
 variable "instance_metadata" {
   description = "Extra metadata added to every provisioned VM."
   type        = map(string)
