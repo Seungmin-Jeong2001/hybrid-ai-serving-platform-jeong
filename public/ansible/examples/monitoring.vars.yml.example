@@ -1,0 +1,11 @@
+---
+grafana_admin_password: change-this-before-deploy
+
+# Optional overrides
+# monitoring_namespace: monitoring
+# monitoring_chart_version: "69.8.2"
+# grafana_service_type: ClusterIP
+# grafana_storage_class_name: gp3
+# prometheus_storage_class_name: gp3
+# grafana_persistence_size: 10Gi
+# prometheus_storage_size: 20Gi

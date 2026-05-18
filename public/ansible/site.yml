@@ -1,0 +1,10 @@
+---
+- name: Deploy platform services on EKS
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  roles:
+    - role: monitoring
+      tags:
+        - monitoring
