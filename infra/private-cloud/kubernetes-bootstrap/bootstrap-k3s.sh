@@ -17,6 +17,10 @@ script_dir() {
 
 ROOT="$(cd "$(script_dir)/../../.." && pwd)"
 OPENSTACK_DIR="${ROOT}/infra/private-cloud/openstack"
+OPENSTACK_TFSTATE="${HA_OPENSTACK_TFSTATE:-}"
+if [[ -n "$OPENSTACK_TFSTATE" && "$OPENSTACK_TFSTATE" != /* ]]; then
+  OPENSTACK_TFSTATE="${ROOT}/${OPENSTACK_TFSTATE}"
+fi
 HANDOFF_DIR="${HA_HANDOFF_DIR:-${ROOT}/.ha/handoff}"
 KUBECONFIG_PATH="${HA_OPENSTACK_KUBECONFIG:-${ROOT}/.ha/openstack/kubeconfig}"
 K3S_TOKEN_FILE="${HA_K3S_TOKEN_FILE:-${ROOT}/.ha/openstack/k3s-token}"
@@ -48,6 +52,7 @@ Environment:
   HA_OPENSTACK_SSH_TARGET            auto|floating_ip|private_ip. Default: auto
   HA_OPENSTACK_SSH_PROXY_CONTAINER   Optional LXD container used as SSH ProxyCommand
   HA_OPENSTACK_KUBECONFIG            Output kubeconfig path. Default: .ha/openstack/kubeconfig
+  HA_OPENSTACK_TFSTATE               Optional local Terraform state path for node inventory
   HA_K3S_TOKEN_FILE                  Token file path. Default: .ha/openstack/k3s-token
   HA_K3S_CHANNEL                     k3s install channel. Default: stable
 EOF
@@ -123,7 +128,11 @@ terraform_inventory() {
   local output_file
 
   output_file="$(mktemp)"
-  terraform -chdir="$OPENSTACK_DIR" output -json >"$output_file"
+  if [[ -n "$OPENSTACK_TFSTATE" ]]; then
+    terraform -chdir="$OPENSTACK_DIR" output -state="$OPENSTACK_TFSTATE" -json >"$output_file"
+  else
+    terraform -chdir="$OPENSTACK_DIR" output -json >"$output_file"
+  fi
   python3 - "$SSH_TARGET" "$output_file" <<'PY'
 import json
 import sys

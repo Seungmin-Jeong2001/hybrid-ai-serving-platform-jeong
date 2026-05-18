@@ -49,6 +49,7 @@ infra/private-cloud/kubernetes-bootstrap/bootstrap-k3s.sh --dry-run
 export HA_OPENSTACK_SSH_USER=ubuntu
 export HA_OPENSTACK_SSH_TARGET=auto
 export HA_OPENSTACK_SSH_PROXY_CONTAINER=ha-openstack
+export HA_OPENSTACK_TFSTATE=.ha/tfstate/private-cloud-foundation.tfstate
 ./ha up openstack-kubernetes --auto-approve
 ```
 
