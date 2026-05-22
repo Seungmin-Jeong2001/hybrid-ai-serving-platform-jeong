@@ -78,6 +78,7 @@ jobs:
       PRIVATE_CLOUD_SSH_PROXY_CONTAINER: ${{ vars.PRIVATE_CLOUD_SSH_PROXY_CONTAINER }}
       PRIVATE_CLOUD_K3S_CHANNEL: ${{ vars.PRIVATE_CLOUD_K3S_CHANNEL || 'stable' }}
       PRIVATE_CLOUD_K3S_DISABLE_COMPONENTS: ${{ vars.PRIVATE_CLOUD_K3S_DISABLE_COMPONENTS || 'traefik' }}
+      KUBECONFIG_B64: ${{ secrets.PRIVATE_KUBECONFIG_B64 }}
       TF_VAR_ssh_public_key: ${{ secrets.PRIVATE_CLOUD_SSH_PUBLIC_KEY }}
       TF_VAR_control_plane_image_name: ${{ vars.CONTROL_PLANE_IMAGE_NAME }}
       TF_VAR_control_plane_flavor_name: ${{ vars.CONTROL_PLANE_FLAVOR_NAME }}
@@ -100,7 +101,7 @@ jobs:
           terraform_wrapper: false
 
       - name: Setup kubectl
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.bootstrap_kubernetes && (inputs.apply_kubernetes || inputs.apply_storage || inputs.apply_gpu) }}
+        if: ${{ github.event_name == 'workflow_dispatch' && (inputs.apply_kubernetes || inputs.apply_storage || inputs.apply_gpu) }}
         uses: azure/setup-kubectl@v4
 
       - name: Verify required inputs
@@ -378,21 +379,8 @@ jobs:
             remote_apply ../gpu-worker
           fi
 
-  kubernetes:
-    name: Kubernetes Baseline From Secret
-    runs-on: ${{ vars.PRIVATE_CLOUD_RUNNER || 'self-hosted' }}
-    needs: terraform
-    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.bootstrap_kubernetes && (inputs.apply_kubernetes || inputs.apply_storage || inputs.apply_gpu) }}
-    env:
-      KUBECONFIG_B64: ${{ secrets.PRIVATE_KUBECONFIG_B64 }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Setup kubectl
-        uses: azure/setup-kubectl@v4
-
       - name: Configure kubeconfig
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.bootstrap_kubernetes && (inputs.apply_kubernetes || inputs.apply_storage || inputs.apply_gpu) }}
         run: |
           if [[ -z "${KUBECONFIG_B64}" ]]; then
             echo "::error::PRIVATE_KUBECONFIG_B64 secret is required to apply Kubernetes manifests."
@@ -405,13 +393,13 @@ jobs:
           echo "KUBECONFIG=${kubeconfig}" >> "${GITHUB_ENV}"
 
       - name: Apply Kubernetes foundation
-        if: ${{ inputs.apply_kubernetes || inputs.apply_storage || inputs.apply_gpu }}
-        run: kubectl apply -k private/kubernetes
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.bootstrap_kubernetes && (inputs.apply_kubernetes || inputs.apply_storage || inputs.apply_gpu) }}
+        run: kubectl apply -k ../kubernetes
 
       - name: Apply storage foundation
-        if: ${{ inputs.apply_storage }}
-        run: kubectl apply -k private/storage
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.bootstrap_kubernetes && inputs.apply_storage }}
+        run: kubectl apply -k ../storage
 
       - name: Apply GPU foundation
-        if: ${{ inputs.apply_gpu }}
-        run: kubectl apply -k private/gpu-worker
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.bootstrap_kubernetes && inputs.apply_gpu }}
+        run: kubectl apply -k ../gpu-worker
