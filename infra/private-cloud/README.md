@@ -21,8 +21,8 @@ infra/private-cloud/
 
 1. GitHub Actions에서 `Private Cloud Foundation` workflow를 수동 실행합니다.
 2. `openstack/` Terraform이 private network, subnet, security group, VM node group을 생성합니다.
-3. Terraform output에 나온 node inventory를 기준으로 Kubernetes bootstrap을 진행합니다.
-4. 생성된 kubeconfig를 GitHub Secret에 등록한 뒤 namespace, quota, RBAC, network policy를 적용합니다.
+3. 같은 workflow에서 `bootstrap_kubernetes=true`로 Terraform output node inventory 기준 k3s bootstrap을 진행합니다.
+4. `apply_kubernetes=true`로 namespace, quota, RBAC, network policy를 적용합니다.
 5. Storage와 GPU 리소스는 실제 NFS/GPU 노드 준비가 끝난 뒤 선택적으로 적용합니다.
 6. `handoff/` 문서를 기준으로 model, public, hybrid, monitoring 담당자에게 필요한 값을 전달합니다.
 
@@ -184,8 +184,7 @@ Workflow 경로: `.github/workflows/private-cloud-foundation.yml`
 - `OPENSTACK_USER_DOMAIN_NAME`
 - `OPENSTACK_PROJECT_DOMAIN_NAME`
 - `PRIVATE_CLOUD_SSH_PUBLIC_KEY`
-- `TF_BACKEND_CONFIG`: `apply`, `destroy` 실행 시 사용할 Terraform backend 설정
-- `PRIVATE_KUBECONFIG_B64`: Kubernetes manifest 적용 시 사용할 kubeconfig base64 값
+- `TF_BACKEND_CONFIG`: `plan`, `apply`, `destroy` 실행 시 사용할 Terraform backend 설정
 
 필수 GitHub Variables:
 
@@ -199,14 +198,20 @@ Workflow 경로: `.github/workflows/private-cloud-foundation.yml`
 선택 GitHub Secret:
 
 - `PRIVATE_CLOUD_TFVARS`: CIDR, external network ID, node count, metadata처럼 환경별로 달라지는 Terraform 값
+- `PRIVATE_CLOUD_SSH_PRIVATE_KEY`: Actions에서 dependency check와 k3s bootstrap을 실행할 SSH private key
+- `PRIVATE_KUBECONFIG_B64`: bootstrap 없이 Kubernetes manifest만 적용할 때 사용할 kubeconfig base64 값
 
 선택 GitHub Variable:
 
 - `OPENSTACK_REGION`
-- `PRIVATE_CLOUD_RUNNER`: private OpenStack endpoint에 접근할 self-hosted runner label
+- `PRIVATE_CLOUD_RUNNER`: private OpenStack endpoint에 접근할 self-hosted runner label, 기본 `self-hosted`
 - `PRIVATE_CLOUD_TOOL_BIN_DIR`: self-hosted runner에서 사용할 `terraform`, `kubectl` 경로
-- `PRIVATE_CLOUD_AUTO_APPLY`: `feature/private` push 시 Terraform apply까지 자동 실행하려면 `true`
 - `TF_BACKEND_TYPE`: 기본 `s3`, self-hosted local 검증은 `local`
+- `PRIVATE_CLOUD_SSH_USER`: OpenStack VM SSH user, 기본 `ubuntu`
+- `PRIVATE_CLOUD_SSH_TARGET`: `auto`, `floating_ip`, `private_ip`
+- `PRIVATE_CLOUD_SSH_PROXY_CONTAINER`: OpenStack 접근에 LXD SSH proxy가 필요할 때 container 이름
+- `PRIVATE_CLOUD_K3S_CHANNEL`: k3s install channel, 기본 `stable`
+- `PRIVATE_CLOUD_K3S_DISABLE_COMPONENTS`: k3s 비활성화 component, 기본 `traefik`
 
 DNS workflow 경로: `.github/workflows/private-cloud-dns.yml`
 

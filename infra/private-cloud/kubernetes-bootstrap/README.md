@@ -77,6 +77,9 @@ kubectl kustomize infra/private-cloud/kubernetes \
       'sudo k3s kubectl apply -f -'
 ```
 
+GitHub Actions의 `bootstrap_kubernetes=true` 경로도 같은 방식을 사용합니다. runner가 Kubernetes API
+endpoint에 직접 접속할 수 없어도 SSH proxy가 가능하면 baseline manifest 적용까지 이어갈 수 있습니다.
+
 ## 운영 기준
 
 로컬 DevStack에서는 1대 control-plane으로 end-to-end 흐름만 검증합니다.

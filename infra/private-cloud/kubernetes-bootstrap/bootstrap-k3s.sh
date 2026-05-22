@@ -124,6 +124,20 @@ ensure_k3s_token() {
   fi
 }
 
+persist_k3s_token() {
+  local token="$1"
+
+  mkdir -p "$(dirname "$K3S_TOKEN_FILE")"
+  printf '%s\n' "$token" >"$K3S_TOKEN_FILE"
+  chmod 600 "$K3S_TOKEN_FILE"
+}
+
+read_k3s_server_token() {
+  local host="$1"
+
+  ssh_node "$host" 'sudo cat /var/lib/rancher/k3s/server/node-token'
+}
+
 terraform_inventory() {
   local output_file
 
@@ -409,6 +423,8 @@ main() {
 
   wait_for_ssh "$server_target_ip" "$server_name"
   install_k3s_control_plane_init "$server_target_ip" "$server_name" "$server_target_ip" "$token"
+  token="$(read_k3s_server_token "$server_target_ip")"
+  persist_k3s_token "$token"
 
   for index in "${!NODE_ROLES[@]}"; do
     [[ "$index" != "$first_index" ]] || continue
