@@ -1,0 +1,293 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+
+packages:
+  - apt-transport-https
+  - bash-completion
+  - build-essential
+  - ca-certificates
+  - conntrack
+  - curl
+  - ethtool
+  - fio
+  - git
+  - gnupg
+  - hwloc
+  - iproute2
+  - ipset
+  - iptables
+  - jq
+  - kmod
+  - linux-tools-generic
+  - lshw
+  - lsb-release
+  - lvm2
+  - make
+  - multipath-tools
+  - net-tools
+  - nfs-common
+  - nftables
+  - numactl
+  - nvme-cli
+  - open-iscsi
+  - pciutils
+  - python3
+  - python3-pip
+  - python3-venv
+  - qemu-guest-agent
+  - socat
+  - software-properties-common
+  - sysstat
+  - tar
+  - unzip
+  - xfsprogs
+  - xz-utils
+  - zip
+
+write_files:
+  - path: /etc/hybrid-ai-node-role
+    permissions: "0644"
+    content: |
+      ${node_role}
+  - path: /etc/hybrid-ai-foundation.env
+    permissions: "0644"
+    content: |
+      node_role=${node_role}
+      install_node_dependencies=${install_node_dependencies}
+      enable_gpu_bootstrap=${enable_gpu_bootstrap}
+      gpu_driver_autoinstall=${gpu_driver_autoinstall}
+  - path: /etc/modules-load.d/hybrid-ai-kubernetes.conf
+    permissions: "0644"
+    content: |
+      overlay
+      br_netfilter
+  - path: /etc/modules-load.d/hybrid-ai-storage.conf
+    permissions: "0644"
+    content: |
+      iscsi_tcp
+      nvme_tcp
+  - path: /etc/sysctl.d/99-hybrid-ai-private-cloud.conf
+    permissions: "0644"
+    content: |
+      fs.inotify.max_user_instances = 8192
+      fs.inotify.max_user_watches = 1048576
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.bridge.bridge-nf-call-iptables = 1
+      net.ipv4.ip_forward = 1
+      vm.max_map_count = 262144
+  - path: /usr/local/sbin/hybrid-ai-node-bootstrap
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      exec > >(tee -a /var/log/hybrid-ai-node-bootstrap.log) 2>&1
+
+      role="$(cat /etc/hybrid-ai-node-role 2>/dev/null || printf unknown)"
+      install_node_dependencies="${install_node_dependencies}"
+      enable_gpu_bootstrap="${enable_gpu_bootstrap}"
+
+      printf 'hybrid-ai node bootstrap start role=%s\n' "$role"
+
+      mkdir -p /opt/hybrid-ai
+      cp /etc/hybrid-ai-foundation.env /opt/hybrid-ai/foundation.env
+
+      if [[ "$install_node_dependencies" != "true" ]]; then
+        printf 'dependency bootstrap disabled\n'
+        exit 0
+      fi
+
+      for module in overlay br_netfilter iscsi_tcp; do
+        modprobe "$module" || true
+      done
+
+      if ! modprobe nvme_tcp; then
+        printf 'warn: nvme_tcp is unavailable in the current kernel; bake linux-modules-extra-$(uname -r) into the image when NVMe/TCP storage is required\n'
+      fi
+
+      sysctl --system || true
+
+      systemctl start qemu-guest-agent || true
+      systemctl enable iscsid || true
+      systemctl start iscsid || true
+      systemctl enable open-iscsi || true
+      systemctl enable --now multipathd || true
+
+      for governor in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        [[ -w "$governor" ]] || continue
+        printf performance > "$governor" || true
+      done
+
+      if [[ "$role" == "gpu-worker" && "$enable_gpu_bootstrap" == "true" ]]; then
+        /usr/local/sbin/hybrid-ai-gpu-bootstrap || true
+        systemctl enable --now hybrid-ai-gpu-pcie-tune.service || true
+      fi
+
+      /usr/local/sbin/hybrid-ai-dependency-check
+      printf 'hybrid-ai node bootstrap complete role=%s\n' "$role"
+  - path: /usr/local/sbin/hybrid-ai-gpu-bootstrap
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      exec > >(tee -a /var/log/hybrid-ai-gpu-bootstrap.log) 2>&1
+
+      gpu_driver_autoinstall="${gpu_driver_autoinstall}"
+
+      printf 'hybrid-ai gpu bootstrap start\n'
+
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y ubuntu-drivers-common pciutils
+
+      if ! dpkg-query -W nvidia-container-toolkit >/dev/null 2>&1; then
+        install -d -m 0755 /usr/share/keyrings
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+          | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+        curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+          | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+          > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+        apt-get update
+        apt-get install -y nvidia-container-toolkit
+      fi
+
+      if lspci -nn | grep -qi nvidia; then
+        if [[ "$gpu_driver_autoinstall" == "true" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
+          ubuntu-drivers autoinstall || true
+        fi
+
+        if command -v nvidia-smi >/dev/null 2>&1; then
+          systemctl enable --now nvidia-persistenced || true
+          nvidia-smi -pm 1 || true
+        else
+          printf 'warn: NVIDIA PCI device found but nvidia-smi is not available yet; a reboot may be required after driver install\n'
+        fi
+      else
+        printf 'warn: no NVIDIA PCI device detected on this GPU worker image\n'
+      fi
+
+      /usr/local/sbin/hybrid-ai-gpu-pcie-tune || true
+      printf 'hybrid-ai gpu bootstrap complete\n'
+  - path: /usr/local/sbin/hybrid-ai-gpu-pcie-tune
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      exec > >(tee -a /var/log/hybrid-ai-gpu-pcie-tune.log) 2>&1
+
+      printf 'hybrid-ai gpu pcie tune start\n'
+
+      if [[ -w /sys/module/pcie_aspm/parameters/policy ]]; then
+        printf performance > /sys/module/pcie_aspm/parameters/policy || true
+        printf 'pcie_aspm_policy=%s\n' "$(cat /sys/module/pcie_aspm/parameters/policy 2>/dev/null || true)"
+      fi
+
+      for governor in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        [[ -w "$governor" ]] || continue
+        printf performance > "$governor" || true
+      done
+
+      if command -v nvidia-smi >/dev/null 2>&1; then
+        nvidia-smi --query-gpu=index,name,pci.bus_id,pcie.link.gen.max,pcie.link.gen.current,pcie.link.width.max,pcie.link.width.current --format=csv || true
+        nvidia-smi topo -m || true
+        nvidia-smi pci -gCnt || true
+      fi
+
+      printf 'hybrid-ai gpu pcie tune complete\n'
+  - path: /usr/local/sbin/hybrid-ai-dependency-check
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      role="$(cat /etc/hybrid-ai-node-role 2>/dev/null || printf unknown)"
+      missing=0
+
+      need_cmd() {
+        if ! command -v "$1" >/dev/null 2>&1; then
+          printf 'missing command: %s\n' "$1" >&2
+          missing=1
+        fi
+      }
+
+      need_pkg() {
+        if ! dpkg-query -W "$1" >/dev/null 2>&1; then
+          printf 'missing package: %s\n' "$1" >&2
+          missing=1
+        fi
+      }
+
+      need_module() {
+        local module="$1"
+        local sys_module
+        sys_module="$(printf '%s' "$module" | tr '-' '_')"
+        if [[ -d "/sys/module/$sys_module" ]] || modinfo "$module" >/dev/null 2>&1; then
+          return 0
+        fi
+
+        printf 'missing kernel module: %s\n' "$module" >&2
+        missing=1
+      }
+
+      for cmd in curl jq python3 git unzip lspci lshw numactl ethtool fio nvme iscsiadm multipath qemu-ga; do
+        need_cmd "$cmd"
+      done
+
+      for pkg in qemu-guest-agent nfs-common open-iscsi multipath-tools nvme-cli pciutils sysstat xfsprogs; do
+        need_pkg "$pkg"
+      done
+
+      for module in overlay br_netfilter iscsi_tcp; do
+        need_module "$module"
+      done
+
+      if ! [[ -d /sys/module/nvme_tcp ]] && ! modinfo nvme_tcp >/dev/null 2>&1; then
+        printf 'warn: optional kernel module unavailable: nvme_tcp\n' >&2
+      fi
+
+      if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || printf 0)" != "1" ]]; then
+        printf 'unexpected sysctl: net.ipv4.ip_forward is not 1\n' >&2
+        missing=1
+      fi
+
+      if [[ "$role" == "gpu-worker" ]]; then
+        need_pkg nvidia-container-toolkit
+
+        if ! lspci -nn | grep -qi nvidia; then
+          printf 'missing NVIDIA PCI device on gpu-worker\n' >&2
+          missing=1
+        fi
+
+        if command -v nvidia-smi >/dev/null 2>&1; then
+          nvidia-smi --query-gpu=index,name,pci.bus_id,pcie.link.gen.current,pcie.link.width.current --format=csv || missing=1
+        else
+          printf 'missing command: nvidia-smi\n' >&2
+          missing=1
+        fi
+      fi
+
+      if [[ "$missing" -ne 0 ]]; then
+        exit 1
+      fi
+
+      printf 'ok: hybrid-ai dependency check passed role=%s\n' "$role"
+  - path: /etc/systemd/system/hybrid-ai-gpu-pcie-tune.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Hybrid AI GPU PCIe performance policy
+      After=multi-user.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/hybrid-ai-gpu-pcie-tune
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - /usr/local/sbin/hybrid-ai-node-bootstrap

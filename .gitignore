@@ -1,14 +1,31 @@
-# Terraform
+.ha/
+.env
+.env.*
+!.env.example
+!.env.secret.example
+__pycache__/
+*.pyc
+
+# Terraform local state and provider cache.
 .terraform/
-*.tfstate
-*.tfstate.*
-*.tfplan
+**/.terraform/
 .terraform.lock.hcl
-
-# Ansible
-*.retry
-
-# Local variable files
+**/.terraform.lock.hcl
+*.tfstate
+**/*.tfstate
+*.tfstate.*
+**/*.tfstate.*
+*.tfplan
+**/*.tfplan
+**/backend.generated.tf
+**/backend.hcl
 terraform.tfvars
 *.auto.tfvars
+
+# Ansible local runtime files.
+*.retry
 monitoring.yml
+
+# Local reverse proxy runtime overrides.
+**/Caddyfile.local
+**/caddy.env
