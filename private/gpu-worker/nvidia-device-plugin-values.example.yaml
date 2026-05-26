@@ -1,0 +1,9 @@
+runtimeClassName: nvidia
+migStrategy: none
+failOnInitError: true
+nodeSelector:
+  accelerator: nvidia
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
