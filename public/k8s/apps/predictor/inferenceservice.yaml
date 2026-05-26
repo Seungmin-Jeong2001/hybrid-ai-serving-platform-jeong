@@ -8,6 +8,8 @@ spec:
     serviceAccountName: predictor-sa
     minReplicas: 1
     maxReplicas: 3
+    nodeSelector:
+      workload: inference
     containers:
       - name: kserve-container
         image: 808379768010.dkr.ecr.ap-northeast-2.amazonaws.com/predictor:latest

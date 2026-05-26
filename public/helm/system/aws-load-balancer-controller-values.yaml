@@ -7,3 +7,6 @@ serviceAccount:
     eks.amazonaws.com/role-arn: arn:aws:iam::808379768010:role/sgs-hasp-aws-load-balancer-controller-role
 
 enableServiceMutatorWebhook: true
+
+nodeSelector:
+  workload: system
