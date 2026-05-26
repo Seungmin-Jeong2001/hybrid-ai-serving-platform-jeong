@@ -1,0 +1,32 @@
+project_name = "hybrid-ai-private"
+
+private_network_cidr = "10.42.0.0/24"
+dns_nameservers      = ["1.1.1.1", "8.8.8.8"]
+ssh_allowed_cidrs    = ["203.0.113.0/24"]
+
+# Set this only when the private network must egress through an OpenStack router.
+external_network_id = ""
+
+# Set these when bootstrap automation needs SSH access from outside the private subnet.
+floating_ip_pool    = ""
+assign_floating_ips = false
+
+key_pair_name  = "hybrid-ai-private-admin"
+ssh_public_key = "ssh-ed25519 REPLACE_WITH_PUBLIC_KEY_ONLY"
+
+control_plane_count       = 1
+control_plane_image_name  = "ubuntu-22.04"
+control_plane_flavor_name = "m1.medium"
+
+build_worker_count       = 1
+build_worker_image_name  = "ubuntu-22.04"
+build_worker_flavor_name = "m1.large"
+
+gpu_worker_count       = 1
+gpu_worker_image_name  = "ubuntu-22.04-gpu"
+gpu_worker_flavor_name = "g1.large"
+
+# Cloud-init installs common Kubernetes, storage, diagnostics, and GPU host dependencies.
+install_node_dependencies = true
+enable_gpu_bootstrap      = true
+gpu_driver_autoinstall    = true

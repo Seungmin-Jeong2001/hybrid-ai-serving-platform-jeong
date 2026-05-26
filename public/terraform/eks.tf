@@ -1,10 +1,15 @@
+# EKS 클러스터
 resource "aws_eks_cluster" "main" {
   name     = "${var.project_name}-eks"
   role_arn = aws_iam_role.eks_cluster.arn
   version  = var.eks_cluster_version
 
   vpc_config {
-    subnet_ids              = concat(aws_subnet.public[*].id, aws_subnet.private[*].id)
+    subnet_ids = concat(
+      aws_subnet.public[*].id,
+      aws_subnet.eks_private[*].id,
+      [aws_subnet.mgmt_private.id],
+    )
     endpoint_private_access = true
     endpoint_public_access  = true
   }
@@ -18,38 +23,63 @@ resource "aws_eks_cluster" "main" {
   })
 }
 
+# EKS VPC CNI 애드온
 resource "aws_eks_addon" "vpc_cni" {
   cluster_name = aws_eks_cluster.main.name
   addon_name   = "vpc-cni"
 }
 
+# EKS CoreDNS 애드온
 resource "aws_eks_addon" "coredns" {
   cluster_name = aws_eks_cluster.main.name
   addon_name   = "coredns"
 }
 
+# EKS kube-proxy 애드온
 resource "aws_eks_addon" "kube_proxy" {
   cluster_name = aws_eks_cluster.main.name
   addon_name   = "kube-proxy"
 }
 
-resource "aws_eks_node_group" "main" {
-  cluster_name    = aws_eks_cluster.main.name
-  node_group_name = "${var.project_name}-node-group"
-  node_role_arn   = aws_iam_role.eks_node_group.arn
-  subnet_ids      = aws_subnet.private[*].id
+# 노드 그룹별 서브넷 매핑
+locals {
+  node_group_subnet_ids = {
+    for name, cfg in var.eks_node_groups :
+    name => cfg.use_mgmt_subnet ? [aws_subnet.mgmt_private.id] : slice(aws_subnet.eks_private[*].id, 0, cfg.az_count)
+  }
+}
 
-  instance_types = var.eks_node_instance_types
+# EKS 노드 그룹 (워크로드별 5종: inference, app, system, monitoring, management)
+resource "aws_eks_node_group" "workloads" {
+  for_each = var.eks_node_groups
+
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "${var.project_name}-${each.key}"
+  node_role_arn   = aws_iam_role.eks_node_group.arn
+  subnet_ids      = local.node_group_subnet_ids[each.key]
+
+  instance_types = each.value.instance_types
   capacity_type  = "ON_DEMAND"
 
   scaling_config {
-    desired_size = var.eks_node_desired_size
-    min_size     = var.eks_node_min_size
-    max_size     = var.eks_node_max_size
+    desired_size = each.value.desired_size
+    min_size     = each.value.min_size
+    max_size     = each.value.max_size
   }
 
   update_config {
     max_unavailable = 1
+  }
+
+  labels = each.value.labels
+
+  dynamic "taint" {
+    for_each = each.value.taints
+    content {
+      key    = taint.value.key
+      value  = taint.value.value
+      effect = taint.value.effect
+    }
   }
 
   depends_on = [
@@ -59,6 +89,7 @@ resource "aws_eks_node_group" "main" {
   ]
 
   tags = merge(local.common_tags, {
-    Name = "${var.project_name}-node-group"
+    Name     = "${var.project_name}-${each.key}"
+    Workload = each.key
   })
 }

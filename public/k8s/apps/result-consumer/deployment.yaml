@@ -1,0 +1,18 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: result-consumer
+  namespace: hasp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: result-consumer
+  template:
+    metadata:
+      labels:
+        app: result-consumer
+    spec:
+      containers:
+        - name: result-consumer
+          image: replace-me

@@ -1,0 +1,18 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-worker
+  namespace: hasp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inference-worker
+  template:
+    metadata:
+      labels:
+        app: inference-worker
+    spec:
+      containers:
+        - name: inference-worker
+          image: replace-me
