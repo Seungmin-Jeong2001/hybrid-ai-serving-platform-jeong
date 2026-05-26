@@ -1,4 +1,6 @@
-# 가상 프라이빗 게이트웨이
+# 현재 전부 비활성화
+
+# Virtual Private Gateway
 resource "aws_vpn_gateway" "main" {
   count = var.enable_site_to_site_vpn ? 1 : 0
 
@@ -9,7 +11,7 @@ resource "aws_vpn_gateway" "main" {
   })
 }
 
-# 고객 게이트웨이
+# Customer Gateway
 resource "aws_customer_gateway" "main" {
   count = var.enable_site_to_site_vpn ? 1 : 0
 
@@ -42,4 +44,20 @@ resource "aws_vpn_connection_route" "main" {
 
   destination_cidr_block = var.vpn_static_route_cidrs[count.index]
   vpn_connection_id      = aws_vpn_connection.main[0].id
+}
+
+# 라우트 전파 - 프라이빗 라우팅 테이블
+resource "aws_vpn_gateway_route_propagation" "private" {
+  count = var.enable_site_to_site_vpn ? 1 : 0
+
+  vpn_gateway_id = aws_vpn_gateway.main[0].id
+  route_table_id = aws_route_table.private.id
+}
+
+# 라우트 전파 - 퍼블릭 라우팅 테이블 (ALB 응답 경로 확보용)
+resource "aws_vpn_gateway_route_propagation" "public" {
+  count = var.enable_site_to_site_vpn ? 1 : 0
+
+  vpn_gateway_id = aws_vpn_gateway.main[0].id
+  route_table_id = aws_route_table.public.id
 }

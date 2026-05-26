@@ -39,8 +39,8 @@ resource "aws_subnet" "public" {
   map_public_ip_on_launch = true
 
   tags = merge(local.common_tags, {
-    Name                                 = "${var.project_name}-public-${count.index + 1}"
-    "kubernetes.io/role/elb"             = "1"
+    Name                                            = "${var.project_name}-public-${count.index + 1}"
+    "kubernetes.io/role/elb"                        = "1"
     "kubernetes.io/cluster/${var.project_name}-eks" = "shared"
   })
 }
@@ -54,8 +54,8 @@ resource "aws_subnet" "eks_private" {
   availability_zone = data.aws_availability_zones.available.names[count.index]
 
   tags = merge(local.common_tags, {
-    Name                                 = "${var.project_name}-eks-private-${count.index + 1}"
-    "kubernetes.io/role/internal-elb"    = "1"
+    Name                                            = "${var.project_name}-eks-private-${count.index + 1}"
+    "kubernetes.io/role/internal-elb"               = "1"
     "kubernetes.io/cluster/${var.project_name}-eks" = "shared"
   })
 }
@@ -73,6 +73,19 @@ resource "aws_subnet" "msk_private" {
   })
 }
 
+# 관리/CICD 프라이빗 서브넷 (단일 AZ)
+resource "aws_subnet" "mgmt_private" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.mgmt_private_subnet_cidr
+  availability_zone = data.aws_availability_zones.available.names[var.mgmt_subnet_az_index]
+
+  tags = merge(local.common_tags, {
+    Name                                            = "${var.project_name}-mgmt-private"
+    "kubernetes.io/role/internal-elb"               = "1"
+    "kubernetes.io/cluster/${var.project_name}-eks" = "shared"
+  })
+}
+
 # 퍼블릭 라우팅 테이블
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
@@ -87,44 +100,38 @@ resource "aws_route_table" "public" {
   })
 }
 
-# NAT EIP
+# NAT EIP (단일)
 resource "aws_eip" "nat" {
-  count = length(aws_subnet.public)
-
   domain = "vpc"
 
   tags = merge(local.common_tags, {
-    Name = "${var.project_name}-nat-eip-${count.index + 1}"
+    Name = "${var.project_name}-nat-eip"
   })
 }
 
-# NAT 게이트웨이
+# NAT 게이트웨이 (단일, AZ-b 배치)
 resource "aws_nat_gateway" "main" {
-  count = length(aws_subnet.public)
-
-  allocation_id = aws_eip.nat[count.index].id
-  subnet_id     = aws_subnet.public[count.index].id
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[var.nat_gateway_az_index].id
 
   tags = merge(local.common_tags, {
-    Name = "${var.project_name}-nat-${count.index + 1}"
+    Name = "${var.project_name}-nat"
   })
 
   depends_on = [aws_internet_gateway.main]
 }
 
-# 프라이빗 라우팅 테이블
+# 프라이빗 라우팅 테이블 (단일, 모든 프라이빗 서브넷이 공유)
 resource "aws_route_table" "private" {
-  count = length(aws_subnet.public)
-
   vpc_id = aws_vpc.main.id
 
   route {
     cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.main[count.index].id
+    nat_gateway_id = aws_nat_gateway.main.id
   }
 
   tags = merge(local.common_tags, {
-    Name = "${var.project_name}-private-rt-${count.index + 1}"
+    Name = "${var.project_name}-private-rt"
   })
 }
 
@@ -137,11 +144,11 @@ resource "aws_route_table_association" "public" {
 }
 
 # EKS 서브넷 연결
-resource "aws_route_table_association" "private" {
+resource "aws_route_table_association" "eks_private" {
   count = length(aws_subnet.eks_private)
 
   subnet_id      = aws_subnet.eks_private[count.index].id
-  route_table_id = aws_route_table.private[count.index].id
+  route_table_id = aws_route_table.private.id
 }
 
 # MSK 서브넷 연결
@@ -149,5 +156,11 @@ resource "aws_route_table_association" "msk_private" {
   count = length(aws_subnet.msk_private)
 
   subnet_id      = aws_subnet.msk_private[count.index].id
-  route_table_id = aws_route_table.private[count.index].id
+  route_table_id = aws_route_table.private.id
+}
+
+# 관리 서브넷 연결
+resource "aws_route_table_association" "mgmt_private" {
+  subnet_id      = aws_subnet.mgmt_private.id
+  route_table_id = aws_route_table.private.id
 }

@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-api
+  namespace: hasp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inference-api
+  template:
+    metadata:
+      labels:
+        app: inference-api
+    spec:
+      containers:
+        - name: inference-api
+          image: replace-me
+          ports:
+            - containerPort: 8080
