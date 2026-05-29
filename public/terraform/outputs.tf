@@ -121,12 +121,18 @@ output "vpn_gateway_id" {
   value       = try(aws_vpn_gateway.main[0].id, null)
 }
 
-output "customer_gateway_id" {
-  description = "Customer gateway ID"
-  value       = try(aws_customer_gateway.main[0].id, null)
+output "customer_gateway_ids" {
+  description = "Customer gateway IDs keyed by site name"
+  value       = { for k, cgw in aws_customer_gateway.sites : k => cgw.id }
 }
 
-output "vpn_connection_id" {
-  description = "Site-to-Site VPN connection ID"
-  value       = try(aws_vpn_connection.main[0].id, null)
+output "vpn_connection_ids" {
+  description = "Site-to-Site VPN connection IDs keyed by site name"
+  value       = { for k, vpn in aws_vpn_connection.sites : k => vpn.id }
+}
+
+# Route 53 Resolver 출력
+output "inbound_resolver_ips" {
+  description = "온프레미스 DNS 서버가 *.amazonaws.com / Private Hosted Zone 등을 forward할 대상 IP"
+  value       = [for ip in aws_route53_resolver_endpoint.inbound.ip_address : ip.ip]
 }

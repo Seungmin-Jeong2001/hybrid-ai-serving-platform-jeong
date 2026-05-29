@@ -12,6 +12,14 @@ terraform {
       version = "~> 4.0"
     }
   }
+
+  backend "s3" {
+    bucket       = "sgs-hasp-tfstate"
+    key          = "terraform/terraform.tfstate"
+    region       = "ap-northeast-2"
+    use_lockfile = true
+    encrypt      = true
+  }
 }
 
 # AWS Provider
