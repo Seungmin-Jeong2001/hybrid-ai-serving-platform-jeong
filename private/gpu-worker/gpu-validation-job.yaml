@@ -61,30 +61,3 @@ spec:
           resources:
             limits:
               nvidia.com/gpu: "1"
----
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: dataset-minio-test
-  namespace: default
-spec:
-  template:
-    spec:
-      restartPolicy: Never
-      containers:
-        - name: minio-client
-          image: minio/mc:latest
-          command:
-            - /bin/sh
-            - -c
-            - |
-              echo "Testing MinIO connectivity..."
-              mc alias set local http://minio-api.minio-tenant.svc.cluster.local:9000 minioadmin minioadmin123
-              
-              echo "Creating test bucket..."
-              mc mb local/test-bucket --ignore-existing
-              
-              echo "Listing buckets..."
-              mc ls local
-              
-              echo "MinIO test passed!"

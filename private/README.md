@@ -19,12 +19,14 @@ private/
 
 ## 프로비저닝 흐름
 
-1. GitHub Actions에서 `Private Cloud Foundation` workflow를 수동 실행합니다.
-2. `openstack/` Terraform이 private network, subnet, security group, VM node group을 생성합니다.
-3. 같은 workflow에서 `bootstrap_kubernetes=true`로 Terraform output node inventory 기준 k3s bootstrap을 진행합니다.
-4. `apply_kubernetes=true`로 namespace, quota, RBAC, network policy를 적용합니다.
-5. Storage와 GPU 리소스는 실제 NFS/GPU 노드 준비가 끝난 뒤 선택적으로 적용합니다.
-6. `handoff/` 문서를 기준으로 model, public, hybrid, monitoring 담당자에게 필요한 값을 전달합니다.
+1. GitHub Actions에서 `Private Cloud Plan` workflow로 변경 내용을 확인합니다.
+2. 문제가 없으면 `Private Cloud Apply` workflow로 OpenStack VM node group을 생성/변경합니다.
+3. `bootstrap_kubernetes=true`이면 Terraform output node inventory 기준으로 k3s bootstrap을 진행합니다.
+4. `apply_kubernetes=true`이면 namespace, quota, RBAC, network policy baseline을 적용합니다.
+5. DNS는 foundation 생명주기와 같이 움직입니다. Plan은 dry-run, Apply는 Cloudflare upsert, Destroy는 Cloudflare delete를 실행합니다.
+6. `setup_storage=true`, `validate_gpu=true`는 실제 NFS/GPU backing 준비가 끝난 뒤 선택적으로 켭니다.
+7. 제거는 `Private Cloud Destroy` workflow로 실행합니다.
+8. `handoff/` 문서를 기준으로 model, public, hybrid, monitoring 담당자에게 필요한 값을 전달합니다.
 
 ## 로컬 실행
 
@@ -173,13 +175,23 @@ ha tf destroy
 
 ## GitHub Actions 입력값
 
-Workflow 경로: `.github/workflows/private-cloud-foundation.yml`
+Workflow 경로:
+
+- `.github/workflows/private-cloud-plan.yml`: push 또는 수동 plan, Terraform plan, DNS dry-run
+- `.github/workflows/private-cloud-apply.yml`: 수동 apply, Terraform apply, DNS upsert, k3s/bootstrap/storage
+- `.github/workflows/private-cloud-destroy.yml`: 수동 destroy, Kubernetes cleanup, Terraform destroy, DNS delete
+- `.github/workflows/private-cloud-foundation.yml`: UI에서 직접 실행하지 않는 reusable core
 
 필수 GitHub Secrets:
 
 - `OPENSTACK_PASSWORD`
 - `PRIVATE_CLOUD_SSH_PUBLIC_KEY`
 - `TF_BACKEND_CONFIG`: `plan`, `apply`, `destroy` 실행 시 사용할 Terraform backend 설정
+
+`install_openstack=true`인 로컬 DevStack 모드에서는 `OPENSTACK_PASSWORD`가 DevStack `admin`
+password로 쓰입니다. workflow는 8-128자, whitespace 없음, `A-Z a-z 0-9 . _ ~ ! -` 문자만 허용하는
+DevStack-safe policy를 먼저 검사합니다. 외부 OpenStack 모드에서는 별도 문자 제한 대신 Keystone login으로
+credential을 검증합니다.
 
 필수 GitHub Variables:
 
@@ -199,21 +211,22 @@ Workflow 경로: `.github/workflows/private-cloud-foundation.yml`
 
 - `PRIVATE_CLOUD_TFVARS`: CIDR, external network ID, node count, metadata처럼 환경별로 달라지는 Terraform 값
 - `PRIVATE_CLOUD_SSH_PRIVATE_KEY`: Actions에서 dependency check와 k3s bootstrap을 실행할 SSH private key
-- `PRIVATE_KUBECONFIG_B64`: bootstrap 없이 Kubernetes manifest만 적용할 때 사용할 kubeconfig base64 값
+- `PRIVATE_KUBECONFIG_B64`: `destroy` 전 Kubernetes resource cleanup이 필요할 때 사용할 kubeconfig base64 값
 
 선택 GitHub Variable:
 
 - `OPENSTACK_REGION`
 - `PRIVATE_CLOUD_RUNNER`: private OpenStack endpoint에 접근할 self-hosted runner label, 기본 `self-hosted`
-- `PRIVATE_CLOUD_TOOL_BIN_DIR`: self-hosted runner에서 사용할 `terraform`, `kubectl` 경로
 - `TF_BACKEND_TYPE`: 기본 `s3`, self-hosted local 검증은 `local`
 - `PRIVATE_CLOUD_SSH_USER`: OpenStack VM SSH user, 기본 `ubuntu`
-- `PRIVATE_CLOUD_SSH_TARGET`: `auto`, `floating_ip`, `private_ip`
-- `PRIVATE_CLOUD_SSH_PROXY_CONTAINER`: OpenStack 접근에 LXD SSH proxy가 필요할 때 container 이름
 - `PRIVATE_CLOUD_K3S_CHANNEL`: k3s install channel, 기본 `stable`
 - `PRIVATE_CLOUD_K3S_DISABLE_COMPONENTS`: k3s 비활성화 component, 기본 `traefik`
 
-DNS workflow 경로: `.github/workflows/private-cloud-dns.yml`
+DNS는 Plan/Apply/Destroy workflow 안에서 자동 실행됩니다.
+
+- `Private Cloud Plan`: DNS dry-run
+- `Private Cloud Apply`: DNS upsert
+- `Private Cloud Destroy`: DNS delete
 
 필수 GitHub Secret:
 

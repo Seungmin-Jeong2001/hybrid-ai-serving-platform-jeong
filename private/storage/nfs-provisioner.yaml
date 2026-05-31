@@ -16,10 +16,13 @@ spec:
   valuesContent: |-
     replicaCount: 1
     storageClass:
-      name: nfs-client
+      create: true
+      name: private-nfs-rwx
       defaultClass: false
       reclaimPolicy: Retain
+      allowVolumeExpansion: true
       archiveOnDelete: false
+      pathPattern: "${.PVC.namespace}/${.PVC.name}"
     nfs:
       server: 192.168.100.1
       path: /mnt/nfs/hybrid-ai
@@ -35,17 +38,3 @@ spec:
       limits:
         cpu: 500m
         memory: 256Mi
----
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: nfs-client
-  annotations:
-    storageclass.kubernetes.io/is-default-class: "false"
-provisioner: cluster.local/nfs-subdir-external-provisioner
-reclaimPolicy: Retain
-allowVolumeExpansion: true
-volumeBindingMode: Immediate
-parameters:
-  archiveOnDelete: "false"
-  pathPattern: "${.PVC.namespace}/${.PVC.name}"

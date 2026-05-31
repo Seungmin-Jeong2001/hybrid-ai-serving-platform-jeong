@@ -239,8 +239,7 @@ required_project_paths() {
     "${HA_PROJECT_ROOT}/private/kubernetes/kustomization.yaml" \
     "${HA_PROJECT_ROOT}/private/storage/kustomization.yaml" \
     "${HA_PROJECT_ROOT}/private/gpu-worker/kustomization.yaml" \
-    "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-foundation.yml" \
-    "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-dns.yml"
+    "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-foundation.yml"
 }
 
 default_launcher_locations() {
@@ -2215,8 +2214,10 @@ openstack_lxd_container_name() {
 ensure_openstack_lxd_container() {
   local name="$1"
   local raw_lxc
+  local kernel_modules_source
 
   raw_lxc=$'lxc.apparmor.profile=unconfined\nlxc.cap.drop=\nlxc.mount.auto=proc:rw sys:rw cgroup:rw'
+  kernel_modules_source="$(readlink -f /lib/modules)"
 
   ensure_lxd_initialized
 
@@ -2226,7 +2227,8 @@ ensure_openstack_lxd_container() {
       -c security.privileged=true \
       -c raw.lxc="$raw_lxc"
     lxc config device add "$name" kmsg unix-char source=/dev/kmsg path=/dev/kmsg >/dev/null 2>&1 || true
-    lxc config device add "$name" host-kernel-modules disk source=/lib/modules path=/lib/modules readonly=true >/dev/null 2>&1 || true
+    lxc config device remove "$name" host-kernel-modules >/dev/null 2>&1 || true
+    lxc config device add "$name" host-kernel-modules disk source="$kernel_modules_source" path=/usr/lib/modules readonly=true >/dev/null 2>&1 || true
     if [[ -e /dev/kvm ]]; then
       lxc config device add "$name" kvm unix-char source=/dev/kvm path=/dev/kvm >/dev/null 2>&1 || true
     fi
@@ -2236,7 +2238,8 @@ ensure_openstack_lxd_container() {
     lxc config set "$name" security.privileged true
     lxc config set "$name" raw.lxc "$raw_lxc"
     lxc config device add "$name" kmsg unix-char source=/dev/kmsg path=/dev/kmsg >/dev/null 2>&1 || true
-    lxc config device add "$name" host-kernel-modules disk source=/lib/modules path=/lib/modules readonly=true >/dev/null 2>&1 || true
+    lxc config device remove "$name" host-kernel-modules >/dev/null 2>&1 || true
+    lxc config device add "$name" host-kernel-modules disk source="$kernel_modules_source" path=/usr/lib/modules readonly=true >/dev/null 2>&1 || true
     if [[ -e /dev/kvm ]]; then
       lxc config device add "$name" kvm unix-char source=/dev/kvm path=/dev/kvm >/dev/null 2>&1 || true
     fi
@@ -2289,6 +2292,19 @@ chmod 600 /opt/stack/devstack/local.conf
 EOS
 }
 
+validate_devstack_password() {
+  local password="$1"
+  local source_name="$2"
+
+  [[ -n "$password" ]] || die "${source_name} is required for local DevStack"
+  [[ "${#password}" -ge 8 ]] || die "${source_name} must be at least 8 characters"
+  [[ "${#password}" -le 128 ]] || die "${source_name} must be 128 characters or fewer"
+  [[ ! "$password" =~ [[:space:]] ]] || die "${source_name} must not contain whitespace"
+  if [[ ! "$password" =~ ^[A-Za-z0-9._~!-]+$ ]]; then
+    die "${source_name} contains characters outside the DevStack-safe set: letters, digits, dot, underscore, hyphen, tilde, exclamation"
+  fi
+}
+
 devstack_openstack_ready() {
   local name="$1"
 
@@ -2310,6 +2326,8 @@ install_lxd_devstack() {
   local password="${HA_DEVSTACK_PASSWORD:-hybrid-ai-devstack}"
   local branch="${HA_DEVSTACK_BRANCH:-master}"
   local host_ip
+
+  validate_devstack_password "$password" "HA_DEVSTACK_PASSWORD"
 
   host_ip="$(lxd_container_ip "$name")"
   [[ -n "$host_ip" ]] || die "could not resolve LXD container IP for $name"

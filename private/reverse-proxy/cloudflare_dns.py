@@ -104,6 +104,20 @@ def upsert_record(zone_id: str, token: str, payload: dict, apply: bool) -> None:
         api_request("POST", f"/zones/{zone_id}/dns_records", token, payload)
 
 
+def delete_record(zone_id: str, token: str, payload: dict, apply: bool) -> None:
+    existing = list_records(zone_id, token, payload["name"])
+    same_type = [record for record in existing if record.get("type") == payload["type"]]
+
+    if not same_type:
+        print(f"skip: {payload['type']} {payload['name']} not found")
+        return
+
+    for record in same_type:
+        print(f"delete: {payload['type']} {payload['name']} -> {record.get('content', '')}")
+        if apply:
+            api_request("DELETE", f"/zones/{zone_id}/dns_records/{record['id']}", token)
+
+
 def desired_records(base_domain: str, tailscale_ip: str, ttl: int, services: tuple[str, ...]) -> list[dict]:
     ipaddress.ip_address(tailscale_ip)
     base = base_domain.rstrip(".")
@@ -118,6 +132,7 @@ def desired_records(base_domain: str, tailscale_ip: str, ttl: int, services: tup
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="apply changes to Cloudflare")
+    parser.add_argument("--delete", action="store_true", help="delete desired records instead of upserting them")
     parser.add_argument(
         "--services",
         default=first_env(
@@ -136,13 +151,18 @@ def main() -> int:
     ttl = int(first_env("PRIVATE_CLOUD_DNS_TTL", "HA_CLOUDFLARE_DNS_TTL", default="120"))
     services = tuple(service.strip() for service in args.services.split(",") if service.strip())
 
+    operation = "delete" if args.delete else "upsert"
     mode = "apply" if args.apply else "dry-run"
     print(f"mode: {mode}")
+    print(f"operation: {operation}")
     print(f"zone: {zone_id}")
     print(f"base domain: {base_domain}")
 
     for payload in desired_records(base_domain, tailscale_ip, ttl, services):
-        upsert_record(zone_id, token, payload, args.apply)
+        if args.delete:
+            delete_record(zone_id, token, payload, args.apply)
+        else:
+            upsert_record(zone_id, token, payload, args.apply)
 
     return 0
 

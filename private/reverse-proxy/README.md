@@ -104,8 +104,8 @@ python3 private/reverse-proxy/cloudflare_dns.py
 python3 private/reverse-proxy/cloudflare_dns.py --apply
 ```
 
-GitHub Actions에서는 `.github/workflows/private-cloud-dns.yml`을 수동 실행합니다.
-`apply=false`가 기본값이라 먼저 dry-run을 확인하고, 문제가 없으면 `apply=true`로 다시 실행합니다.
+GitHub Actions에서는 Plan/Apply/Destroy workflow 안에서 DNS가 자동 실행됩니다.
+Plan은 dry-run만 확인하고, Apply는 Cloudflare에 record를 upsert하며, Destroy는 record를 삭제합니다.
 
 ## Cloudflare API token 권한
 

@@ -11,7 +11,11 @@
 {$HA_OPENSTACK_DOMAIN:openstack.intp.me} {
 	import cloudflare_tls
 	encode zstd gzip
-	reverse_proxy {$HA_OPENSTACK_HORIZON_UPSTREAM:127.0.0.1:18081}
+	reverse_proxy {$HA_OPENSTACK_HORIZON_UPSTREAM:127.0.0.1:18081} {
+		header_up Host {host}
+		header_up X-Forwarded-Host {host}
+		header_up X-Forwarded-Proto {scheme}
+	}
 }
 
 {$HA_K8S_DOMAIN:k8s.intp.me} {

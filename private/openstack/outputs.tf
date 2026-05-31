@@ -8,6 +8,11 @@ output "private_subnet_id" {
   value       = openstack_networking_subnet_v2.private.id
 }
 
+output "private_network_cidr" {
+  description = "CIDR block for the private foundation network."
+  value       = var.private_network_cidr
+}
+
 output "security_group_id" {
   description = "Base security group ID for private cloud nodes."
   value       = openstack_networking_secgroup_v2.private.id

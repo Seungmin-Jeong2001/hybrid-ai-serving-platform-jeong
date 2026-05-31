@@ -46,8 +46,10 @@ ensure_lxd_initialized() {
 
 ensure_container() {
   local raw_lxc
+  local kernel_modules_source
 
   raw_lxc=$'lxc.apparmor.profile=unconfined\nlxc.cap.drop=\nlxc.mount.auto=proc:rw sys:rw cgroup:rw'
+  kernel_modules_source="$(readlink -f /lib/modules)"
   ensure_lxd_initialized
 
   if ! lxc info "$CONTAINER" >/dev/null 2>&1; then
@@ -57,7 +59,8 @@ ensure_container() {
       -c security.privileged=true \
       -c raw.lxc="$raw_lxc"
     lxc config device add "$CONTAINER" kmsg unix-char source=/dev/kmsg path=/dev/kmsg >/dev/null 2>&1 || true
-    lxc config device add "$CONTAINER" host-kernel-modules disk source=/lib/modules path=/lib/modules readonly=true >/dev/null 2>&1 || true
+    lxc config device remove "$CONTAINER" host-kernel-modules >/dev/null 2>&1 || true
+    lxc config device add "$CONTAINER" host-kernel-modules disk source="$kernel_modules_source" path=/usr/lib/modules readonly=true >/dev/null 2>&1 || true
     if [[ -e /dev/kvm ]]; then
       lxc config device add "$CONTAINER" kvm unix-char source=/dev/kvm path=/dev/kvm >/dev/null 2>&1 || true
     fi
@@ -68,7 +71,8 @@ ensure_container() {
     lxc config set "$CONTAINER" security.privileged true
     lxc config set "$CONTAINER" raw.lxc "$raw_lxc"
     lxc config device add "$CONTAINER" kmsg unix-char source=/dev/kmsg path=/dev/kmsg >/dev/null 2>&1 || true
-    lxc config device add "$CONTAINER" host-kernel-modules disk source=/lib/modules path=/lib/modules readonly=true >/dev/null 2>&1 || true
+    lxc config device remove "$CONTAINER" host-kernel-modules >/dev/null 2>&1 || true
+    lxc config device add "$CONTAINER" host-kernel-modules disk source="$kernel_modules_source" path=/usr/lib/modules readonly=true >/dev/null 2>&1 || true
     if [[ -e /dev/kvm ]]; then
       lxc config device add "$CONTAINER" kvm unix-char source=/dev/kvm path=/dev/kvm >/dev/null 2>&1 || true
     fi
