@@ -67,7 +67,7 @@ jobs:
             elif ! lxc info ha-openstack >/dev/null 2>&1; then
               echo "::error::ha-openstack container is not available"
               missing=1
-            elif ! lxc exec ha-openstack -- command -v openstack >/dev/null 2>&1; then
+            elif ! lxc exec ha-openstack -- bash -lc 'command -v openstack >/dev/null 2>&1'; then
               echo "::error::Missing openstack CLI in ha-openstack container"
               missing=1
             fi
