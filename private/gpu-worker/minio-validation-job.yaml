@@ -1,0 +1,40 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dataset-minio-test
+  namespace: default
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: minio-client
+          image: minio/mc:latest
+          env:
+            - name: MINIO_ENDPOINT
+              value: http://minio-api.minio-tenant.svc.cluster.local:9000
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-client-credentials
+                  key: accessKey
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-client-credentials
+                  key: secretKey
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Testing MinIO connectivity..."
+              mc alias set local "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+
+              echo "Creating test bucket..."
+              mc mb local/test-bucket --ignore-existing
+
+              echo "Listing buckets..."
+              mc ls local
+
+              echo "MinIO test passed!"

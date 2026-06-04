@@ -3,8 +3,8 @@
 이 디렉터리는 물리 서버에 들어온 HTTP/HTTPS 요청을 Private Cloud 관리자 서비스로
 분기하는 Caddy 설정과 Cloudflare DNS 자동화 스크립트를 관리합니다.
 
-현재 Private Kubernetes는 k3s입니다. Caddy는 k3s를 대체하지 않고, 물리 서버 앞단의
-관리자 reverse proxy 역할만 맡습니다. k3s 내부에 Grafana, ArgoCD, Kubernetes Dashboard
+현재 Private Kubernetes는 kubeadm 기반 Kubernetes입니다. Caddy는 Kubernetes를 대체하지 않고, 물리 서버 앞단의
+관리자 reverse proxy 역할만 맡습니다. Kubernetes 내부에 Grafana, ArgoCD, Kubernetes Dashboard
 같은 서비스가 올라가면 Caddy upstream을 해당 서비스의 NodePort, port-forward, 또는
 내부 ingress 경로로 연결합니다.
 
@@ -104,8 +104,8 @@ python3 private/reverse-proxy/cloudflare_dns.py
 python3 private/reverse-proxy/cloudflare_dns.py --apply
 ```
 
-GitHub Actions에서는 `.github/workflows/private-cloud-dns.yml`을 수동 실행합니다.
-`apply=false`가 기본값이라 먼저 dry-run을 확인하고, 문제가 없으면 `apply=true`로 다시 실행합니다.
+GitHub Actions에서는 Plan/Apply/Destroy workflow 안에서 DNS가 자동 실행됩니다.
+Plan은 dry-run만 확인하고, Apply는 Cloudflare에 record를 upsert하며, Destroy는 record를 삭제합니다.
 
 ## Cloudflare API token 권한
 

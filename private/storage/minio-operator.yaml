@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: minio-operator
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: minio-operator
+  namespace: kube-system
+spec:
+  repo: https://operator.min.io/
+  chart: operator
+  targetNamespace: minio-operator
+  version: "7.1.1"
+  valuesContent: |-
+    operator:
+      replicaCount: 1
+      resources:
+        requests:
+          memory: 256Mi
+          cpu: 100m
+        limits:
+          memory: 512Mi
+          cpu: 500m

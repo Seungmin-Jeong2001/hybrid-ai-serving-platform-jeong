@@ -1,12 +1,12 @@
 # OpenStack Kubernetes Bootstrap
 
 이 디렉터리는 `private/openstack` Terraform output을 읽어서
-OpenStack VM에 k3s Kubernetes를 설치하는 bootstrap 도구를 제공합니다.
+OpenStack VM에 kubeadm 기반 Kubernetes를 설치하는 bootstrap 도구를 제공합니다.
 
 ## 전제 조건
 
 - Terraform apply가 완료되어 `control_plane_nodes` output이 있어야 합니다.
-- VM image는 SSH, cloud-init, systemd, curl을 지원하는 Ubuntu 계열 image를 사용합니다.
+- VM image는 SSH, cloud-init, systemd, curl, apt를 지원하는 Ubuntu 계열 image를 사용합니다.
 - `cirros` image는 OpenStack smoke provisioning 확인용이며 Kubernetes node로 쓰지 않습니다.
 - bootstrap 실행 위치에서 VM의 private IP 또는 floating IP로 SSH가 가능해야 합니다.
 
@@ -40,7 +40,7 @@ export TF_VAR_control_plane_flavor_name=m1.medium
 먼저 inventory가 맞는지 확인합니다.
 
 ```sh
-private/kubernetes-bootstrap/bootstrap-k3s.sh --dry-run
+private/kubernetes-bootstrap/bootstrap-k8s.sh --dry-run
 ```
 
 문제가 없으면 `ha`에서 실행합니다.
@@ -51,6 +51,14 @@ export HA_OPENSTACK_SSH_TARGET=auto
 export HA_OPENSTACK_SSH_PROXY_CONTAINER=ha-openstack
 export HA_OPENSTACK_TFSTATE=.ha/tfstate/private-cloud-foundation.tfstate
 ./ha up openstack-kubernetes --auto-approve
+```
+
+선택적으로 Kubernetes 버전과 CNI를 조정할 수 있습니다.
+
+```sh
+export HA_K8S_VERSION_MINOR=v1.36
+export HA_K8S_POD_CIDR=192.168.0.0/16
+export HA_K8S_CNI_MANIFEST=https://raw.githubusercontent.com/projectcalico/calico/v3.32.0/manifests/calico.yaml
 ```
 
 성공하면 아래 파일이 생성됩니다.
@@ -74,7 +82,7 @@ kubectl kustomize private/kubernetes \
   | ssh -o ProxyCommand='lxc exec ha-openstack -- nc %h %p' \
       -i .ha/ssh/hybrid-ai-private-admin \
       ubuntu@<floating-ip> \
-      'sudo k3s kubectl apply -f -'
+      'sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -'
 ```
 
 GitHub Actions의 `bootstrap_kubernetes=true` 경로도 같은 방식을 사용합니다. runner가 Kubernetes API

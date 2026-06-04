@@ -8,6 +8,11 @@ output "private_subnet_id" {
   value       = openstack_networking_subnet_v2.private.id
 }
 
+output "private_network_cidr" {
+  description = "CIDR block for the private foundation network."
+  value       = var.private_network_cidr
+}
+
 output "security_group_id" {
   description = "Base security group ID for private cloud nodes."
   value       = openstack_networking_secgroup_v2.private.id
@@ -59,4 +64,9 @@ output "gpu_worker_nodes" {
       role = node.metadata.role
     }
   ]
+}
+
+output "nfs_server_ip" {
+  description = "NFS server IP (first control-plane node)."
+  value       = openstack_networking_port_v2.control_plane[0].all_fixed_ips[0]
 }

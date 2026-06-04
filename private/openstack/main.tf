@@ -127,8 +127,16 @@ resource "openstack_compute_instance_v2" "control_plane" {
 resource "openstack_networking_floatingip_v2" "control_plane" {
   count = var.assign_floating_ips ? var.control_plane_count : 0
 
-  pool    = var.floating_ip_pool
-  port_id = openstack_networking_port_v2.control_plane[count.index].id
+  pool = var.floating_ip_pool
+}
+
+resource "openstack_networking_floatingip_associate_v2" "control_plane" {
+  count = var.assign_floating_ips ? var.control_plane_count : 0
+
+  floating_ip = openstack_networking_floatingip_v2.control_plane[count.index].address
+  port_id     = openstack_networking_port_v2.control_plane[count.index].id
+
+  depends_on = [openstack_networking_router_interface_v2.private]
 }
 
 resource "openstack_networking_port_v2" "build_worker" {
@@ -166,8 +174,16 @@ resource "openstack_compute_instance_v2" "build_worker" {
 resource "openstack_networking_floatingip_v2" "build_worker" {
   count = var.assign_floating_ips ? var.build_worker_count : 0
 
-  pool    = var.floating_ip_pool
-  port_id = openstack_networking_port_v2.build_worker[count.index].id
+  pool = var.floating_ip_pool
+}
+
+resource "openstack_networking_floatingip_associate_v2" "build_worker" {
+  count = var.assign_floating_ips ? var.build_worker_count : 0
+
+  floating_ip = openstack_networking_floatingip_v2.build_worker[count.index].address
+  port_id     = openstack_networking_port_v2.build_worker[count.index].id
+
+  depends_on = [openstack_networking_router_interface_v2.private]
 }
 
 resource "openstack_networking_port_v2" "gpu_worker" {
@@ -205,6 +221,14 @@ resource "openstack_compute_instance_v2" "gpu_worker" {
 resource "openstack_networking_floatingip_v2" "gpu_worker" {
   count = var.assign_floating_ips ? var.gpu_worker_count : 0
 
-  pool    = var.floating_ip_pool
-  port_id = openstack_networking_port_v2.gpu_worker[count.index].id
+  pool = var.floating_ip_pool
+}
+
+resource "openstack_networking_floatingip_associate_v2" "gpu_worker" {
+  count = var.assign_floating_ips ? var.gpu_worker_count : 0
+
+  floating_ip = openstack_networking_floatingip_v2.gpu_worker[count.index].address
+  port_id     = openstack_networking_port_v2.gpu_worker[count.index].id
+
+  depends_on = [openstack_networking_router_interface_v2.private]
 }
