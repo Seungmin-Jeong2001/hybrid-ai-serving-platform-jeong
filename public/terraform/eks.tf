@@ -8,6 +8,7 @@ resource "aws_eks_cluster" "main" {
     subnet_ids = concat(
       aws_subnet.public[*].id,
       aws_subnet.eks_private[*].id,
+      [aws_subnet.mgmt_private.id],
     )
     endpoint_private_access      = true
     endpoint_public_access       = true
@@ -45,7 +46,7 @@ resource "aws_eks_addon" "kube_proxy" {
 locals {
   node_group_subnet_ids = {
     for name, cfg in var.eks_node_groups :
-    name => slice(aws_subnet.eks_private[*].id, 0, cfg.az_count)
+    name => cfg.use_mgmt_subnet ? [aws_subnet.mgmt_private.id] : slice(aws_subnet.eks_private[*].id, 0, cfg.az_count)
   }
 }
 
@@ -63,7 +64,7 @@ resource "aws_launch_template" "node_groups" {
   }
 }
 
-# EKS 노드 그룹 (워크로드별: inference, app, system, monitoring)
+# EKS 노드 그룹 (워크로드별 5종: inference, app, system, monitoring, management)
 resource "aws_eks_node_group" "workloads" {
   for_each = var.eks_node_groups
 
