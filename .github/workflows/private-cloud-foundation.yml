@@ -457,6 +457,89 @@ jobs:
           done
           ENSURE_IMAGE
 
+      - name: Ensure configured OpenStack project and user
+        run: |
+          if [[ -z "${OS_USERNAME:-}" || -z "${OS_PASSWORD:-}" || -z "${OS_PROJECT_NAME:-}" ]]; then
+            echo "::error::OPENSTACK_USERNAME, OPENSTACK_PASSWORD, and OPENSTACK_PROJECT_NAME are required"
+            exit 1
+          fi
+
+          printf '%s' "${OS_PASSWORD}" \
+            | lxc exec ha-openstack -- sudo -u stack -H bash -c 'umask 077 && cat > /opt/stack/devstack/.configured-openstack-password'
+
+          lxc exec ha-openstack -- sudo -u stack -H bash -s -- \
+            "${OS_USERNAME}" \
+            "${OS_PROJECT_NAME}" \
+            "${OS_USER_DOMAIN_NAME:-Default}" \
+            "${OS_PROJECT_DOMAIN_NAME:-Default}" <<'ENSURE_OPENSTACK_TENANT'
+          set -euo pipefail
+          cd /opt/stack/devstack
+          set +u
+          source openrc admin admin >/dev/null
+          set -u
+
+          user_name="$1"
+          project_name="$2"
+          user_domain="$3"
+          project_domain="$4"
+          password_file=/opt/stack/devstack/.configured-openstack-password
+          trap 'rm -f "$password_file"' EXIT
+          password="$(cat "$password_file")"
+
+          openstack domain show "$user_domain" >/dev/null
+          openstack domain show "$project_domain" >/dev/null
+
+          openstack project create \
+            --domain "$project_domain" \
+            --description "Hybrid AI private cloud project managed by GitHub Actions" \
+            --or-show \
+            "$project_name" >/dev/null
+
+          if openstack user show --domain "$user_domain" "$user_name" >/dev/null 2>&1; then
+            openstack user set \
+              --domain "$user_domain" \
+              --project "$project_name" \
+              --project-domain "$project_domain" \
+              --password "$password" \
+              --enable \
+              "$user_name"
+          else
+            openstack user create \
+              --domain "$user_domain" \
+              --project "$project_name" \
+              --project-domain "$project_domain" \
+              --password "$password" \
+              --enable \
+              "$user_name" >/dev/null
+          fi
+
+          openstack role add member \
+            --user "$user_name" \
+            --user-domain "$user_domain" \
+            --project "$project_name" \
+            --project-domain "$project_domain"
+
+          openstack quota set \
+            --instances 10 \
+            --cores 20 \
+            --ram 51200 \
+            --key-pairs 100 \
+            --floating-ips -1 \
+            --secgroups -1 \
+            --secgroup-rules -1 \
+            --networks 20 \
+            --subnets 20 \
+            --ports 200 \
+            --routers 20 \
+            "$project_name" || true
+
+          if openstack network show public >/dev/null 2>&1; then
+            openstack network set --share public || true
+          fi
+
+          echo "ok: ensured OpenStack project '$project_name' and user '$user_name'"
+          ENSURE_OPENSTACK_TENANT
+
       - name: Ensure DevStack SSH proxy tools
         run: |
           lxc exec ha-openstack -- bash -s <<'ENSURE_PROXY_TOOLS'
@@ -628,21 +711,8 @@ jobs:
 
       - name: Prepare OpenStack environment
         run: |
-          write_env() {
-            {
-              printf '%s<<__EOF__\n' "$1"
-              printf '%s\n' "$2"
-              printf '__EOF__\n'
-            } >> "$GITHUB_ENV"
-          }
-
           if [[ "${INSTALL_OPENSTACK}" == "true" ]]; then
-            write_env OS_AUTH_URL "http://127.0.0.1:18081/identity/v3"
-            write_env OS_USERNAME "admin"
-            write_env OS_PROJECT_NAME "admin"
-            write_env OS_USER_DOMAIN_NAME "Default"
-            write_env OS_PROJECT_DOMAIN_NAME "Default"
-            write_env OS_REGION_NAME "RegionOne"
+            echo "Using GitHub-configured OpenStack credentials for local DevStack tenant login"
           fi
 
       - name: Validate required configuration

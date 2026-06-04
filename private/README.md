@@ -188,10 +188,13 @@ Workflow 경로:
 - `PRIVATE_CLOUD_SSH_PUBLIC_KEY`
 - `TF_BACKEND_CONFIG`: `plan`, `apply`, `destroy` 실행 시 사용할 Terraform backend 설정
 
-`install_openstack=true`인 로컬 DevStack 모드에서는 `OPENSTACK_PASSWORD`가 DevStack `admin`
-password로 쓰입니다. workflow는 8-128자, whitespace 없음, `A-Z a-z 0-9 . _ ~ ! -` 문자만 허용하는
-DevStack-safe policy를 먼저 검사합니다. 외부 OpenStack 모드에서는 별도 문자 제한 대신 Keystone login으로
-credential을 검증합니다.
+`install_openstack=true`인 로컬 DevStack 모드에서는 `OPENSTACK_PASSWORD`가 DevStack bootstrap
+password로 쓰입니다. workflow는 DevStack `admin`으로 내부 bootstrap을 수행한 뒤 GitHub Variables의
+`OPENSTACK_USERNAME`/`OPENSTACK_PROJECT_NAME`을 Keystone user/project로 생성하거나 업데이트합니다.
+Terraform provider와 Horizon 로그인은 GitHub Secrets/Variables에 등록된 OpenStack 계정 기준으로 동작합니다.
+
+workflow는 8-128자, whitespace 없음, `A-Z a-z 0-9 . _ ~ ! -` 문자만 허용하는 DevStack-safe policy를
+먼저 검사합니다. 외부 OpenStack 모드에서는 별도 문자 제한 대신 Keystone login으로 credential을 검증합니다.
 
 필수 GitHub Variables:
 

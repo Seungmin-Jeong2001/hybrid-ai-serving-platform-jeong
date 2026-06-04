@@ -22,10 +22,16 @@ Workflows:
 | `PRIVATE_CLOUD_TFVARS` | `*.auto.tfvars` 내용 | CIDR, node count 등 환경별 Terraform override |
 
 `install_openstack=true`로 Actions가 로컬 DevStack을 만들 때는 `OPENSTACK_PASSWORD`가 DevStack
-`admin` password가 됩니다. 이 값은 DevStack config와 여러 service URL에 들어가므로 workflow가
-다음 DevStack-safe policy를 먼저 검사합니다: 8-128자, whitespace 없음, 허용 문자 `A-Z a-z 0-9 . _ ~ ! -`.
-이미 떠 있는 DevStack container는 Secret 변경만으로 password가 바뀌지 않으므로, known password로 다시
-맞추려면 `force_cleanup=true`로 재설치합니다.
+bootstrap password가 됩니다. workflow는 이 값으로 DevStack `admin`을 준비한 뒤, GitHub Variables의
+`OPENSTACK_USERNAME`/`OPENSTACK_PROJECT_NAME`을 Keystone user/project로 생성하거나 업데이트합니다.
+Terraform과 Horizon 로그인은 GitHub Secrets/Variables에 등록된 OpenStack 계정 기준으로 동작합니다.
+
+이 값은 DevStack config와 Keystone user password에 들어가므로 workflow가 다음 DevStack-safe policy를
+먼저 검사합니다: 8-128자, whitespace 없음, 허용 문자 `A-Z a-z 0-9 . _ ~ ! -`.
+이미 떠 있는 DevStack container는 Secret 변경만으로 DevStack `admin` password가 바뀌지 않지만,
+다음 workflow 실행 시 GitHub Variables의 `OPENSTACK_USERNAME` user password는 현재 `OPENSTACK_PASSWORD`
+값으로 업데이트됩니다. DevStack 자체 bootstrap password까지 known password로 다시 맞추려면
+`force_cleanup=true`로 재설치합니다.
 
 ### GitHub Variables
 
@@ -79,11 +85,12 @@ bootstrap 이후 workflow가 kubeconfig artifact를 만들고, `apply_kubernetes
 
 ### OpenStack 계정 구분
 
-외부 OpenStack 로그인은 `OPENSTACK_USERNAME`/`OPENSTACK_PASSWORD`와 project/domain Variables에서만 옵니다.
+OpenStack provider 로그인은 `OPENSTACK_USERNAME`/`OPENSTACK_PASSWORD`와 project/domain Variables에서만 옵니다.
 workflow에는 이 값들의 기본 계정이 없습니다.
 
 로컬 DevStack을 설치할 때 보이는 `stack`은 DevStack 실행용 Linux 사용자이고, `admin`은 DevStack이 만드는
-로컬 OpenStack 관리자 계정입니다. 둘 다 외부 OpenStack provider 계정 기본값이 아닙니다.
+로컬 OpenStack 관리자 계정입니다. `admin`은 image 준비, public network share 설정, tenant bootstrap 같은
+내부 bootstrap 작업에만 쓰고, Terraform provider와 Horizon 운영 로그인은 GitHub Variables의 계정을 씁니다.
 
 ## Private Cloud DNS
 

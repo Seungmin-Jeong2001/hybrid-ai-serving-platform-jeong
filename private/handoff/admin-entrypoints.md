@@ -9,7 +9,7 @@
 
 | 대상 | 진입점 | 용도 | 계정 또는 접속 방법 |
 | --- | --- | --- | --- |
-| OpenStack Horizon | `http://127.0.0.1:18081/dashboard/` | OpenStack 웹 관리자 콘솔 | Domain `Default`, User `admin`, Password `hybrid-ai-devstack` |
+| OpenStack Horizon | `http://127.0.0.1:18081/dashboard/` | OpenStack 웹 콘솔 | GitHub Variables `OPENSTACK_USER_DOMAIN_NAME`, `OPENSTACK_USERNAME`, `OPENSTACK_PROJECT_NAME` + Secret `OPENSTACK_PASSWORD` |
 | OpenStack Horizon via Caddy | `http://openstack.intp.me/dashboard/` 또는 HTTPS profile 적용 후 `https://openstack.intp.me/dashboard/` | VPN 사용자용 관리자 콘솔 | Cloudflare DNS-only + Caddy reverse proxy |
 | SSH to physical server | `ssh.intp.me` | 물리 서버 SSH 진입점 | Tailscale VPN 연결 후 SSH |
 | Future Kubernetes UI | `k8s.intp.me` | Kubernetes 관리자 UI 예약 | Dashboard/API UI 설치 후 upstream 연결 |
@@ -29,12 +29,14 @@
 http://127.0.0.1:18081/dashboard/
 ```
 
-로그인 정보:
+로그인 정보는 GitHub Secrets/Variables 기준입니다. 현재 Actions는 DevStack 준비 후 이 계정과 project를
+Keystone에 생성하거나 업데이트합니다.
 
 ```txt
-Domain: Default
-User: admin
-Password: hybrid-ai-devstack
+Domain: OPENSTACK_USER_DOMAIN_NAME
+User: OPENSTACK_USERNAME
+Project: OPENSTACK_PROJECT_NAME
+Password: OPENSTACK_PASSWORD
 ```
 
 `127.0.0.1:18081`은 LXD proxy device를 통해 `ha-openstack` 컨테이너의 Horizon으로 연결됩니다.
