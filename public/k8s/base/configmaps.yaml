@@ -2,21 +2,24 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: app-config
-  namespace: inference
+  namespace: hasp
 data:
   APP_ENV: production
   AWS_REGION: ap-northeast-2
-  PREDICTOR_URL: http://predictor-predictor-default.inference.svc.cluster.local
+  PREDICTOR_URL: http://kserve-predictor.hasp.svc.cluster.local
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: kafka-config
-  namespace: inference
+  namespace: hasp
 data:
   BOOTSTRAP_SERVERS: "replace-me:9092"
-  REQUEST_TOPIC: inference-requests
-  RESULT_TOPIC: inference-results
-  CONSUMER_GROUP: inference-workers
-  RESULT_CONSUMER_GROUP: result-consumers
-  DYNAMODB_TABLE_NAME: replace-me
+  REQUEST_TOPIC: inference-request
+  RETRY_TOPIC: inference-retry
+  DLQ_TOPIC: inference-dlq
+  WORKER_CONSUMER_GROUP: inference-worker-group
+  DYNAMODB_TABLE_NAME: sgs-hasp-inference-jobs
+  MAX_RETRY_COUNT: "3"
+  RETRY_JITTER_SECONDS: "5"
+  RETRY_POLL_DELAY_SECONDS: "1"
