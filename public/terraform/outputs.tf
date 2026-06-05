@@ -35,6 +35,12 @@ output "account_id" {
   value       = data.aws_caller_identity.current.account_id
 }
 
+# IRSA 출력 (inference-worker ServiceAccount annotation에 사용)
+output "inference_worker_role_arn" {
+  description = "IAM role ARN for the inference-worker service account (IRSA)"
+  value       = aws_iam_role.inference_worker.arn
+}
+
 # 컨테이너 출력
 output "ecr_repository_urls" {
   description = "ECR repository URLs"

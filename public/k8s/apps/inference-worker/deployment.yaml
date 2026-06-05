@@ -13,6 +13,7 @@ spec:
       labels:
         app: inference-worker
     spec:
+      serviceAccountName: inference-worker
       containers:
         - name: inference-worker
           image: 808379768010.dkr.ecr.ap-northeast-2.amazonaws.com/inference-worker:latest
