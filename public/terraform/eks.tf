@@ -9,9 +9,9 @@ resource "aws_eks_cluster" "main" {
       aws_subnet.public[*].id,
       aws_subnet.eks_private[*].id,
     )
-    endpoint_private_access      = true
-    endpoint_public_access       = true
-    public_access_cidrs          = var.eks_public_access_cidrs
+    endpoint_private_access = true
+    endpoint_public_access  = true
+    public_access_cidrs     = var.eks_public_access_cidrs
   }
 
   depends_on = [
