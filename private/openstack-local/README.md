@@ -26,6 +26,8 @@ private/openstack-local/bootstrap-devstack.sh
 - 이미지: `ubuntu:24.04`
 - DevStack branch: `master`
 - 로컬 admin password: `hybrid-ai-devstack`
+- GPU passthrough alias/flavor: `nvidia-gpu`, `g1.large`
+- GPU passthrough VFIO bind: GPU IOMMU group 전체를 `vfio-pci`로 bind
 
 환경 변수로 조정할 수 있습니다.
 
@@ -34,6 +36,9 @@ HA_OPENSTACK_CONTAINER=ha-openstack \
 HA_OPENSTACK_LXD_IMAGE=ubuntu:24.04 \
 HA_DEVSTACK_BRANCH=master \
 HA_DEVSTACK_PASSWORD=hybrid-ai-devstack \
+HA_OPENSTACK_GPU_PCI_PRODUCT_ID=auto \
+HA_OPENSTACK_GPU_BIND_IOMMU_GROUP=true \
+HA_OPENSTACK_GPU_FLAVOR_NAME=g1.large \
 private/openstack-local/bootstrap-devstack.sh
 ```
 
@@ -44,6 +49,11 @@ private/openstack-local/bootstrap-devstack.sh
   `vport-geneve`, `vport-vxlan` 모듈이 있어야 합니다.
 - Ubuntu 계열 호스트에서 모듈이 없으면 보통 `linux-modules-extra-$(uname -r)`
   패키지를 설치해야 합니다.
+- GPU passthrough를 검증하려면 host BIOS/OS에서 IOMMU가 켜져 있어야 하고,
+  `/dev/vfio`가 host와 LXD container 양쪽에서 보여야 합니다.
+- 기본값은 GPU와 companion audio function이 같은 IOMMU group에 있는 경우까지 처리하기 위해
+  전체 group을 `vfio-pci`로 bind합니다. Host가 해당 GPU를 display/audio 용도로 사용 중이면
+  `HA_OPENSTACK_GPU_BIND_IOMMU_GROUP=false`로 끄고 별도 passthrough 준비를 먼저 해야 합니다.
 
 ## 결과 파일
 

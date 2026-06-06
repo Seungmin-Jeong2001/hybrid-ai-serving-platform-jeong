@@ -93,8 +93,38 @@ Terraform으로 생성되는 VM은 cloud-init 단계에서 아래 host dependenc
 - GPU worker prereq: NVIDIA Container Toolkit repo/package, `ubuntu-drivers autoinstall`, `nvidia-persistenced`
 - GPU PCIe tuning: PCIe ASPM `performance` policy, CPU governor `performance`, `nvidia-smi` PCIe link/counter report
 
+## Local DevStack GPU passthrough
+
+Local DevStack mode configures Nova PCI passthrough for the first detected NVIDIA display/3D PCI device.
+It creates or updates a dedicated GPU flavor, default `g1.large`, with `pci_passthrough:alias=nvidia-gpu:1`.
+Keep `GPU_WORKER_FLAVOR_NAME` separate from `BUILD_WORKER_FLAVOR_NAME`; sharing `m1.large` would make normal
+build workers request the GPU too.
+
+Default local GPU passthrough values:
+
+- PCI vendor ID: `10de`
+- PCI product ID: auto-detected from `/sys/bus/pci/devices`
+- Nova PCI device type: `type-PF`. The same value is written to `device_spec` as `dev_type` so `PciPassthroughFilter`
+  can match the physical function pool.
+- Nova alias: `nvidia-gpu`
+- GPU flavor: `g1.large`, `8192` MiB RAM, `4` vCPU, `40` GiB disk
+- Host VFIO bind: enabled by default. The GPU's full IOMMU group is bound to `vfio-pci` so companion
+  functions, such as NVIDIA HDMI audio, do not keep the group non-viable.
+
+Override only when the hardware or desired local flavor shape differs:
+
+```sh
+HA_OPENSTACK_GPU_PCI_PRODUCT_ID=2d04 \
+HA_OPENSTACK_GPU_BIND_IOMMU_GROUP=true \
+HA_OPENSTACK_GPU_FLAVOR_NAME=g1.large \
+ha up openstack-local --auto-approve
+```
+
 GPU PCIe lane width/generation 자체는 BIOS, hypervisor, physical slot, passthrough/vGPU 설정의 영향을 받습니다.
 VM 안에서는 가능한 guest-side performance policy와 진단까지만 자동화합니다.
+Actual VM passthrough still requires host IOMMU support and a GPU that can be detached from host display/audio
+use. Set `HA_OPENSTACK_GPU_BIND_IOMMU_GROUP=false` only when the host already prepares a viable VFIO group
+through another mechanism.
 
 노드 내부 검증:
 

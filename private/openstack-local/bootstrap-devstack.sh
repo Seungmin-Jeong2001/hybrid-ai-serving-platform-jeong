@@ -7,6 +7,16 @@ CONTAINER="${HA_OPENSTACK_CONTAINER:-ha-openstack}"
 IMAGE="${HA_OPENSTACK_LXD_IMAGE:-ubuntu:24.04}"
 BRANCH="${HA_DEVSTACK_BRANCH:-master}"
 PASSWORD="${HA_DEVSTACK_PASSWORD:-hybrid-ai-devstack}"
+GPU_PCI_ALIAS="${HA_OPENSTACK_GPU_PCI_ALIAS:-nvidia-gpu}"
+GPU_PCI_VENDOR_ID="$(printf '%s' "${HA_OPENSTACK_GPU_PCI_VENDOR_ID:-10de}" | tr '[:upper:]' '[:lower:]' | sed 's/^0x//')"
+GPU_PCI_PRODUCT_ID="${HA_OPENSTACK_GPU_PCI_PRODUCT_ID:-auto}"
+GPU_PCI_DEVICE_TYPE="${HA_OPENSTACK_GPU_PCI_DEVICE_TYPE:-type-PF}"
+GPU_PCI_NUMA_POLICY="${HA_OPENSTACK_GPU_PCI_NUMA_POLICY:-preferred}"
+GPU_BIND_IOMMU_GROUP="${HA_OPENSTACK_GPU_BIND_IOMMU_GROUP:-true}"
+GPU_FLAVOR_NAME="${HA_OPENSTACK_GPU_FLAVOR_NAME:-g1.large}"
+GPU_FLAVOR_RAM="${HA_OPENSTACK_GPU_FLAVOR_RAM:-8192}"
+GPU_FLAVOR_VCPUS="${HA_OPENSTACK_GPU_FLAVOR_VCPUS:-4}"
+GPU_FLAVOR_DISK="${HA_OPENSTACK_GPU_FLAVOR_DISK:-40}"
 HANDOFF_DIR="${PROJECT_ROOT}/.ha/handoff"
 OPENSTACK_DIR="${PROJECT_ROOT}/.ha/openstack-local"
 
@@ -33,6 +43,10 @@ lxd_container_ip() {
   '
 }
 
+lxd_container_running() {
+  [[ "$(lxc list "$CONTAINER" -c s --format csv | tr -d '"')" == "RUNNING" ]]
+}
+
 ensure_lxd_initialized() {
   if ! lxc profile show default >/dev/null 2>&1; then
     lxd init --auto
@@ -44,12 +58,86 @@ ensure_lxd_initialized() {
   fi
 }
 
-ensure_container() {
-  local raw_lxc
+desired_lxc_raw_lines() {
+  printf '%s\n' \
+    'lxc.apparmor.profile=unconfined' \
+    'lxc.cap.drop=' \
+    'lxc.mount.auto=proc:rw sys:rw cgroup:rw'
+
+  if [[ -d /dev/vfio ]]; then
+    printf '%s\n' 'lxc.cgroup2.devices.allow = c 10:196 rwm'
+    awk '/vfio/ {print "lxc.cgroup2.devices.allow = c " $1 ":* rwm"}' /proc/devices
+  fi
+}
+
+ensure_lxc_raw_config() {
+  local current
+  local line
+  local updated
+
+  current="$(lxc config get "$CONTAINER" raw.lxc 2>/dev/null || true)"
+  updated="$current"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if ! printf '%s\n' "$updated" | grep -Fxq "$line"; then
+      if [[ -n "$updated" ]]; then
+        updated="${updated}"$'\n'"${line}"
+      else
+        updated="$line"
+      fi
+    fi
+  done < <(desired_lxc_raw_lines)
+
+  if [[ "$updated" != "$current" ]]; then
+    if lxd_container_running; then
+      info "Stopping ${CONTAINER} to update LXD raw.lxc"
+      lxc stop "$CONTAINER" --timeout 60 || lxc stop "$CONTAINER" --force
+    fi
+    lxc config set "$CONTAINER" raw.lxc "$updated"
+    return 0
+  fi
+
+  return 1
+}
+
+ensure_lxc_config_value() {
+  local current
+  local key="$1"
+  local value="$2"
+
+  current="$(lxc config get "$CONTAINER" "$key" 2>/dev/null || true)"
+  if [[ "$current" == "$value" ]]; then
+    return 1
+  fi
+
+  if lxd_container_running; then
+    info "Stopping ${CONTAINER} to update LXD ${key}"
+    lxc stop "$CONTAINER" --timeout 60 || lxc stop "$CONTAINER" --force
+  fi
+  lxc config set "$CONTAINER" "$key" "$value"
+  return 0
+}
+
+configure_lxc_devices() {
   local kernel_modules_source
 
-  raw_lxc=$'lxc.apparmor.profile=unconfined\nlxc.cap.drop=\nlxc.mount.auto=proc:rw sys:rw cgroup:rw'
   kernel_modules_source="$(readlink -f /lib/modules)"
+  lxc config device add "$CONTAINER" kmsg unix-char source=/dev/kmsg path=/dev/kmsg >/dev/null 2>&1 || true
+  lxc config device remove "$CONTAINER" host-kernel-modules >/dev/null 2>&1 || true
+  lxc config device add "$CONTAINER" host-kernel-modules disk source="$kernel_modules_source" path=/usr/lib/modules readonly=true >/dev/null 2>&1 || true
+  if [[ -e /dev/kvm ]]; then
+    lxc config device add "$CONTAINER" kvm unix-char source=/dev/kvm path=/dev/kvm >/dev/null 2>&1 || true
+  fi
+  if [[ -d /dev/vfio ]]; then
+    lxc config device add "$CONTAINER" vfio disk source=/dev/vfio path=/dev/vfio >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_container() {
+  local raw_lxc
+  local raw_lxc_changed
+
+  raw_lxc=$'lxc.apparmor.profile=unconfined\nlxc.cap.drop=\nlxc.mount.auto=proc:rw sys:rw cgroup:rw'
   ensure_lxd_initialized
 
   if ! lxc info "$CONTAINER" >/dev/null 2>&1; then
@@ -58,26 +146,23 @@ ensure_container() {
       -c security.nesting=true \
       -c security.privileged=true \
       -c raw.lxc="$raw_lxc"
-    lxc config device add "$CONTAINER" kmsg unix-char source=/dev/kmsg path=/dev/kmsg >/dev/null 2>&1 || true
-    lxc config device remove "$CONTAINER" host-kernel-modules >/dev/null 2>&1 || true
-    lxc config device add "$CONTAINER" host-kernel-modules disk source="$kernel_modules_source" path=/usr/lib/modules readonly=true >/dev/null 2>&1 || true
-    if [[ -e /dev/kvm ]]; then
-      lxc config device add "$CONTAINER" kvm unix-char source=/dev/kvm path=/dev/kvm >/dev/null 2>&1 || true
-    fi
+    ensure_lxc_raw_config || true
+    configure_lxc_devices
     lxc start "$CONTAINER"
   else
     info "Using existing LXD container: ${CONTAINER}"
-    lxc config set "$CONTAINER" security.nesting true
-    lxc config set "$CONTAINER" security.privileged true
-    lxc config set "$CONTAINER" raw.lxc "$raw_lxc"
-    lxc config device add "$CONTAINER" kmsg unix-char source=/dev/kmsg path=/dev/kmsg >/dev/null 2>&1 || true
-    lxc config device remove "$CONTAINER" host-kernel-modules >/dev/null 2>&1 || true
-    lxc config device add "$CONTAINER" host-kernel-modules disk source="$kernel_modules_source" path=/usr/lib/modules readonly=true >/dev/null 2>&1 || true
-    if [[ -e /dev/kvm ]]; then
-      lxc config device add "$CONTAINER" kvm unix-char source=/dev/kvm path=/dev/kvm >/dev/null 2>&1 || true
+    ensure_lxc_config_value security.nesting true || true
+    ensure_lxc_config_value security.privileged true || true
+    raw_lxc_changed=false
+    if ensure_lxc_raw_config; then
+      raw_lxc_changed=true
     fi
-    if ! lxc info "$CONTAINER" | grep -q '^Status: RUNNING'; then
+    configure_lxc_devices
+    if ! lxd_container_running; then
       lxc start "$CONTAINER"
+    elif [[ "$raw_lxc_changed" == "true" ]]; then
+      info "Restarting ${CONTAINER} to apply LXD VFIO cgroup rules"
+      lxc restart "$CONTAINER"
     fi
   fi
 
@@ -104,8 +189,116 @@ openstack_ready() {
     openstack compute service list -f value >/dev/null
     openstack network list -f value >/dev/null
     openstack image list -f value >/dev/null
-    openstack volume service list -f value >/dev/null
   ' >/dev/null 2>&1
+}
+
+detect_gpu_product_id() {
+  local vendor_id
+
+  vendor_id="$GPU_PCI_VENDOR_ID"
+  lxc exec "$CONTAINER" -- bash -s -- "$vendor_id" <<'EOS'
+set -euo pipefail
+vendor_id="$1"
+for device in /sys/bus/pci/devices/*; do
+  vendor="$(cat "${device}/vendor" 2>/dev/null || true)"
+  product="$(cat "${device}/device" 2>/dev/null || true)"
+  class="$(cat "${device}/class" 2>/dev/null || true)"
+  vendor="${vendor#0x}"
+  product="${product#0x}"
+  vendor="$(printf '%s' "$vendor" | tr '[:upper:]' '[:lower:]')"
+  class="$(printf '%s' "${class#0x}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$vendor" == "$vendor_id" && "$class" == 03* && -n "$product" ]]; then
+    printf '%s\n' "$product"
+    exit 0
+  fi
+done
+EOS
+}
+
+resolve_gpu_product_id() {
+  local product_id
+
+  if [[ "$GPU_PCI_PRODUCT_ID" != "auto" ]]; then
+    printf '%s\n' "$(printf '%s' "$GPU_PCI_PRODUCT_ID" | tr '[:upper:]' '[:lower:]' | sed 's/^0x//')"
+    return
+  fi
+
+  product_id="$(detect_gpu_product_id || true)"
+  if [[ -z "$product_id" ]]; then
+    return
+  fi
+
+  printf '%s\n' "$product_id"
+}
+
+bind_gpu_iommu_group_to_vfio() {
+  local product_id="$1"
+
+  [[ "$GPU_BIND_IOMMU_GROUP" == "true" ]] || return 0
+  [[ -n "$product_id" ]] || return 0
+
+  lxc exec "$CONTAINER" -- bash -s -- "$GPU_PCI_VENDOR_ID" "$product_id" <<'EOS'
+set -euo pipefail
+vendor_id="$1"
+product_id="$2"
+bdf=""
+for device in /sys/bus/pci/devices/*; do
+  vendor="$(cat "${device}/vendor" 2>/dev/null || true)"
+  product="$(cat "${device}/device" 2>/dev/null || true)"
+  class="$(cat "${device}/class" 2>/dev/null || true)"
+  vendor="$(printf '%s' "${vendor#0x}" | tr '[:upper:]' '[:lower:]')"
+  product="$(printf '%s' "${product#0x}" | tr '[:upper:]' '[:lower:]')"
+  class="$(printf '%s' "${class#0x}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$vendor" == "$vendor_id" && "$product" == "$product_id" && "$class" == 03* ]]; then
+    bdf="${device##*/}"
+    break
+  fi
+done
+
+if [[ -z "$bdf" ]]; then
+  echo "warn: could not find GPU PCI device for ${vendor_id}:${product_id}; skipping VFIO bind"
+  exit 0
+fi
+
+group_dir="$(readlink -f "/sys/bus/pci/devices/${bdf}/iommu_group" 2>/dev/null || true)"
+if [[ -z "$group_dir" || ! -d "$group_dir" ]]; then
+  echo "warn: GPU PCI device ${bdf} has no IOMMU group; skipping VFIO bind"
+  exit 0
+fi
+
+echo "Binding GPU IOMMU group $(basename "$group_dir") to vfio-pci"
+modprobe vfio-pci
+for member in "${group_dir}"/devices/*; do
+  [[ -e "$member" ]] || continue
+  member_bdf="${member##*/}"
+  vendor="$(cat "${member}/vendor" 2>/dev/null || true)"
+  product="$(cat "${member}/device" 2>/dev/null || true)"
+  class="$(cat "${member}/class" 2>/dev/null || true)"
+  class="$(printf '%s' "${class#0x}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$class" == 06* ]]; then
+    echo "skip: ${member_bdf} (${vendor}:${product}) is a PCI bridge class 0x${class}"
+    continue
+  fi
+  current_driver="$(basename "$(readlink -f "${member}/driver" 2>/dev/null)" 2>/dev/null || true)"
+  if [[ "$current_driver" == "vfio-pci" ]]; then
+    echo "ok: ${member_bdf} (${vendor}:${product}) is already bound to vfio-pci"
+    continue
+  fi
+
+  echo "Binding ${member_bdf} (${vendor}:${product}, driver=${current_driver:-none}) to vfio-pci"
+  printf vfio-pci >"${member}/driver_override"
+  driver_path="$(readlink -f "${member}/driver" 2>/dev/null || true)"
+  if [[ -n "$driver_path" ]]; then
+    printf '%s' "$member_bdf" >"${driver_path}/unbind"
+  fi
+  printf '%s' "$member_bdf" >/sys/bus/pci/drivers_probe
+  current_driver="$(basename "$(readlink -f "${member}/driver" 2>/dev/null)" 2>/dev/null || true)"
+  [[ "$current_driver" == "vfio-pci" ]] || {
+    echo "error: failed to bind ${member_bdf} to vfio-pci; current driver=${current_driver:-none}" >&2
+    exit 1
+  }
+done
+EOS
 }
 
 prepare_container() {
@@ -137,12 +330,25 @@ clone_devstack() {
 
 write_local_conf() {
   local host_ip="$1"
+  local gpu_product_id="$2"
 
   info "Writing DevStack local.conf for ${host_ip}"
-  lxc exec "$CONTAINER" -- bash -s -- "$host_ip" "$PASSWORD" <<'EOS'
+  lxc exec "$CONTAINER" -- bash -s -- \
+    "$host_ip" \
+    "$PASSWORD" \
+    "$GPU_PCI_ALIAS" \
+    "$GPU_PCI_VENDOR_ID" \
+    "$gpu_product_id" \
+    "$GPU_PCI_DEVICE_TYPE" \
+    "$GPU_PCI_NUMA_POLICY" <<'EOS'
 set -euo pipefail
 host_ip="$1"
 password="$2"
+gpu_alias="$3"
+gpu_vendor_id="$4"
+gpu_product_id="$5"
+gpu_device_type="$6"
+gpu_numa_policy="$7"
 install -d -o stack -g stack /opt/stack/devstack
 cat >/opt/stack/devstack/local.conf <<EOF
 [[local|localrc]]
@@ -159,12 +365,118 @@ LIBVIRT_TYPE=qemu
 ENABLE_VOLUME_BACKING_FILE=True
 disable_service tempest
 EOF
+if [[ -n "$gpu_product_id" ]]; then
+  cat >>/opt/stack/devstack/local.conf <<EOF
+
+[[post-config|\$NOVA_CONF]]
+[pci]
+EOF
+  if [[ -n "$gpu_device_type" ]]; then
+    printf 'device_spec = { "vendor_id": "%s", "product_id": "%s", "dev_type": "%s" }\n' \
+      "$gpu_vendor_id" "$gpu_product_id" "$gpu_device_type" >>/opt/stack/devstack/local.conf
+  else
+    printf 'device_spec = { "vendor_id": "%s", "product_id": "%s" }\n' \
+      "$gpu_vendor_id" "$gpu_product_id" >>/opt/stack/devstack/local.conf
+  fi
+  if [[ -n "$gpu_device_type" ]]; then
+    printf 'alias = { "name": "%s", "vendor_id": "%s", "product_id": "%s", "device_type": "%s", "numa_policy": "%s" }\n' \
+      "$gpu_alias" "$gpu_vendor_id" "$gpu_product_id" "$gpu_device_type" "$gpu_numa_policy" >>/opt/stack/devstack/local.conf
+  else
+    printf 'alias = { "name": "%s", "vendor_id": "%s", "product_id": "%s", "numa_policy": "%s" }\n' \
+      "$gpu_alias" "$gpu_vendor_id" "$gpu_product_id" "$gpu_numa_policy" >>/opt/stack/devstack/local.conf
+  fi
+  cat >>/opt/stack/devstack/local.conf <<EOF
+
+[filter_scheduler]
+available_filters = nova.scheduler.filters.all_filters
+enabled_filters = ComputeFilter,ComputeCapabilitiesFilter,ImagePropertiesFilter,ServerGroupAntiAffinityFilter,ServerGroupAffinityFilter,SameHostFilter,DifferentHostFilter,PciPassthroughFilter
+EOF
+fi
 chown stack:stack /opt/stack/devstack/local.conf
 chmod 600 /opt/stack/devstack/local.conf
 EOS
 }
 
+configure_gpu_passthrough() {
+  local gpu_product_id="$1"
+
+  [[ -n "$gpu_product_id" ]] || return 0
+
+  info "Configuring Nova GPU passthrough alias ${GPU_PCI_ALIAS} for ${GPU_PCI_VENDOR_ID}:${gpu_product_id}"
+  lxc exec "$CONTAINER" -- sudo -u stack -H bash -s -- \
+    "$GPU_PCI_ALIAS" \
+    "$GPU_PCI_VENDOR_ID" \
+    "$gpu_product_id" \
+    "$GPU_PCI_DEVICE_TYPE" \
+    "$GPU_PCI_NUMA_POLICY" \
+    "$GPU_FLAVOR_NAME" \
+    "$GPU_FLAVOR_RAM" \
+    "$GPU_FLAVOR_VCPUS" \
+    "$GPU_FLAVOR_DISK" <<'EOS'
+set -euo pipefail
+gpu_alias="$1"
+gpu_vendor_id="$2"
+gpu_product_id="$3"
+gpu_device_type="$4"
+gpu_numa_policy="$5"
+gpu_flavor_name="$6"
+gpu_flavor_ram="$7"
+gpu_flavor_vcpus="$8"
+gpu_flavor_disk="$9"
+
+cd /opt/stack/devstack
+set +u
+source openrc admin admin >/dev/null
+source functions-common
+set -u
+
+if [[ -n "$gpu_device_type" ]]; then
+  device_spec="{ \"vendor_id\": \"${gpu_vendor_id}\", \"product_id\": \"${gpu_product_id}\", \"dev_type\": \"${gpu_device_type}\" }"
+  alias_spec="{ \"name\": \"${gpu_alias}\", \"vendor_id\": \"${gpu_vendor_id}\", \"product_id\": \"${gpu_product_id}\", \"device_type\": \"${gpu_device_type}\", \"numa_policy\": \"${gpu_numa_policy}\" }"
+else
+  device_spec="{ \"vendor_id\": \"${gpu_vendor_id}\", \"product_id\": \"${gpu_product_id}\" }"
+  alias_spec="{ \"name\": \"${gpu_alias}\", \"vendor_id\": \"${gpu_vendor_id}\", \"product_id\": \"${gpu_product_id}\", \"numa_policy\": \"${gpu_numa_policy}\" }"
+fi
+filters="ComputeFilter,ComputeCapabilitiesFilter,ImagePropertiesFilter,ServerGroupAntiAffinityFilter,ServerGroupAffinityFilter,SameHostFilter,DifferentHostFilter,PciPassthroughFilter"
+
+for conf in /etc/nova/nova.conf /etc/nova/nova-cpu.conf; do
+  [[ -f "$conf" ]] || continue
+  iniset -sudo "$conf" pci device_spec "$device_spec"
+  iniset -sudo "$conf" pci alias "$alias_spec"
+  iniset -sudo "$conf" filter_scheduler available_filters "nova.scheduler.filters.all_filters"
+  iniset -sudo "$conf" filter_scheduler enabled_filters "$filters"
+done
+
+if ! openstack flavor show "$gpu_flavor_name" >/dev/null 2>&1; then
+  openstack flavor create \
+    --ram "$gpu_flavor_ram" \
+    --vcpus "$gpu_flavor_vcpus" \
+    --disk "$gpu_flavor_disk" \
+    "$gpu_flavor_name" >/dev/null
+fi
+openstack flavor set \
+  --property "pci_passthrough:alias=${gpu_alias}:1" \
+  --property "hw:pci_numa_affinity_policy=${gpu_numa_policy}" \
+  --property "hw_rng:allowed=True" \
+  "$gpu_flavor_name"
+
+sudo systemctl restart devstack@n-api.service devstack@n-sch.service devstack@n-super-cond.service devstack@n-cpu.service
+EOS
+}
+
 run_devstack() {
+  local attempt
+
+  for attempt in {1..30}; do
+    if openstack_ready; then
+      info "ok: local OpenStack API is already reachable"
+      return
+    fi
+    if [[ "$attempt" -lt 30 ]]; then
+      sleep 10
+    fi
+  done
+
   if openstack_ready; then
     info "ok: local OpenStack API is already reachable"
     return
@@ -201,21 +513,29 @@ write_handoff() {
   } >"${HANDOFF_DIR}/local-openstack.env"
   chmod 600 "${HANDOFF_DIR}/local-openstack.env"
 
-  info "Wrote ${OPENSTACK_DIR#${PROJECT_ROOT}/}/openrc.sh"
-  info "Wrote ${HANDOFF_DIR#${PROJECT_ROOT}/}/local-openstack.env"
+  info "Wrote ${OPENSTACK_DIR#"${PROJECT_ROOT}"/}/openrc.sh"
+  info "Wrote ${HANDOFF_DIR#"${PROJECT_ROOT}"/}/local-openstack.env"
 }
 
 main() {
   local host_ip
+  local gpu_product_id
 
   require_tool lxc
   ensure_container
   host_ip="$(lxd_container_ip)"
   [[ -n "$host_ip" ]] || die "could not resolve LXD container IP"
+  gpu_product_id="$(resolve_gpu_product_id)"
+  if [[ -n "$gpu_product_id" ]]; then
+    info "Detected GPU PCI device: ${GPU_PCI_VENDOR_ID}:${gpu_product_id}"
+  else
+    info "warn: no NVIDIA display/3D PCI device detected; Nova GPU passthrough will be skipped"
+  fi
+  bind_gpu_iommu_group_to_vfio "$gpu_product_id"
 
   prepare_container
   clone_devstack
-  write_local_conf "$host_ip"
+  write_local_conf "$host_ip" "$gpu_product_id"
   ensure_kernel_modules
   run_devstack
 
@@ -224,6 +544,7 @@ main() {
     die "local OpenStack did not become ready"
   fi
 
+  configure_gpu_passthrough "$gpu_product_id"
   write_handoff "$host_ip"
   info "ok: local OpenStack API is reachable at http://${host_ip}/identity/v3"
 }

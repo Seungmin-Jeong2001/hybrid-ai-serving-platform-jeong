@@ -109,7 +109,7 @@ variable "build_worker_flavor_name" {
 variable "gpu_worker_image_name" {
   description = "OpenStack image name for GPU-worker VMs."
   type        = string
-  default     = "ubuntu-22.04-gpu"
+  default     = "ubuntu-22.04"
 }
 
 variable "gpu_worker_flavor_name" {

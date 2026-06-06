@@ -42,7 +42,7 @@ Workflows:
 | `BUILD_WORKER_IMAGE_NAME` | `TF_VAR_build_worker_image_name` | build worker VM image |
 | `BUILD_WORKER_FLAVOR_NAME` | `TF_VAR_build_worker_flavor_name` | build worker VM flavor |
 | `GPU_WORKER_IMAGE_NAME` | `TF_VAR_gpu_worker_image_name` | GPU worker VM image |
-| `GPU_WORKER_FLAVOR_NAME` | `TF_VAR_gpu_worker_flavor_name` | GPU worker VM flavor |
+| `GPU_WORKER_FLAVOR_NAME` | `TF_VAR_gpu_worker_flavor_name` | GPU worker VM flavor. Local DevStack GPU passthrough should use a dedicated flavor such as `g1.large`, not the build-worker flavor. |
 | `PRIVATE_CLOUD_RUNNER` | self-hosted runner label | Private OpenStack endpoint에 접근할 runner |
 | `TF_BACKEND_TYPE` | `TF_BACKEND_TYPE` | Terraform backend type, self-hosted local 검증은 `local` |
 | `PRIVATE_CLOUD_SSH_USER` | bootstrap SSH user | dependency bootstrap 검증용 SSH user |
@@ -50,6 +50,21 @@ Workflows:
 | `PRIVATE_CLOUD_K8S_POD_CIDR` | `HA_K8S_POD_CIDR` | kubeadm과 CNI가 사용할 Pod CIDR, 기본 `192.168.0.0/16` |
 | `PRIVATE_CLOUD_K8S_CNI_MANIFEST` | `HA_K8S_CNI_MANIFEST` | bootstrap 후 적용할 CNI manifest, 기본 Calico |
 | `PRIVATE_CLOUD_K8S_API_ENDPOINT` | `HA_K8S_API_ENDPOINT` | kubeconfig에 기록할 API endpoint, 기본 `PRIVATE_CLOUD_TAILSCALE_IP` |
+
+Local DevStack GPU passthrough optional Variables:
+
+| Variable | 기본값 | 용도 |
+| --- | --- | --- |
+| `OPENSTACK_GPU_PCI_ALIAS` | `nvidia-gpu` | Nova PCI alias 이름 |
+| `OPENSTACK_GPU_PCI_VENDOR_ID` | `10de` | NVIDIA PCI vendor ID |
+| `OPENSTACK_GPU_PCI_PRODUCT_ID` | `auto` | GPU PCI product ID. `auto`이면 runner host의 NVIDIA display/3D device에서 감지 |
+| `OPENSTACK_GPU_PCI_DEVICE_TYPE` | `type-PF` | Nova PCI device type. Physical NVIDIA GPUs must be requested as PFs, and the same value is added to `device_spec` as `dev_type`. |
+| `OPENSTACK_GPU_PCI_NUMA_POLICY` | `preferred` | GPU flavor NUMA affinity policy |
+| `OPENSTACK_GPU_BIND_IOMMU_GROUP` | `true` | Local DevStack GPU passthrough 전에 GPU가 속한 host IOMMU group 전체를 `vfio-pci`로 bind |
+| `OPENSTACK_GPU_FLAVOR_NAME` | `g1.large` | Local DevStack 전용 GPU flavor 이름 |
+| `OPENSTACK_GPU_FLAVOR_RAM` | `8192` | Local DevStack GPU flavor RAM MiB |
+| `OPENSTACK_GPU_FLAVOR_VCPUS` | `4` | Local DevStack GPU flavor vCPU |
+| `OPENSTACK_GPU_FLAVOR_DISK` | `40` | Local DevStack GPU flavor root disk GiB. Must satisfy the Ubuntu image `min_disk`. |
 
 ### Optional GitHub Secrets
 
