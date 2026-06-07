@@ -8,7 +8,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/kimbirdwon/hybrid-ai-serving-platform.git
+    repoURL: https://github.com/SGS-Strategy/hybrid-ai-serving-platform.git
     targetRevision: main
     path: public/k8s/apps/inference-api
   destination:
