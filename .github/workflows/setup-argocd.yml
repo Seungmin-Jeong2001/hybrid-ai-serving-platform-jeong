@@ -16,7 +16,7 @@ env:
   ARGOCD_TARGET_REVISION: ${{ github.ref_name }}
   SSM_BOOTSTRAP_TAG_KEY: Name
   SSM_BOOTSTRAP_TAG_VALUE: sgs-hasp-system
-  SSM_WAIT_ATTEMPTS: 120
+  SSM_WAIT_ATTEMPTS: 180
   SSM_WAIT_INTERVAL_SECONDS: 10
 
 concurrency:
@@ -130,27 +130,40 @@ jobs:
           repo_secret_name = f"repo-{os.environ['GITHUB_REPOSITORY'].replace('/', '-')}"
           commands = [
               "set -euo pipefail",
+              "echo '[1/19] Ensure kubectl is installed'",
               "if ! command -v kubectl >/dev/null 2>&1; then curl -fsSLo /tmp/kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl && chmod +x /tmp/kubectl && sudo mv /tmp/kubectl /usr/local/bin/kubectl; fi",
+              "echo '[2/19] Ensure helm is installed'",
               "if ! command -v helm >/dev/null 2>&1; then curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash; fi",
+              "echo '[3/19] Prepare kubeconfig path'",
               "mkdir -p ~/.kube",
               "export KUBECONFIG=/tmp/eks-kubeconfig",
+              "echo '[4/19] Assume bootstrap admin role'",
               f"ASSUME_ROLE_OUTPUT=$(aws sts assume-role --role-arn {os.environ['BOOTSTRAP_ROLE_ARN']} --role-session-name argocd-bootstrap --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)",
               "if [ -z \"$ASSUME_ROLE_OUTPUT\" ] || [ \"$ASSUME_ROLE_OUTPUT\" = \"None\" ]; then echo 'Failed to assume bootstrap role.'; exit 1; fi",
               "read AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<< \"$ASSUME_ROLE_OUTPUT\"",
               "if [ -z \"$AWS_ACCESS_KEY_ID\" ] || [ -z \"$AWS_SECRET_ACCESS_KEY\" ] || [ -z \"$AWS_SESSION_TOKEN\" ]; then echo 'Bootstrap role credentials are incomplete.'; exit 1; fi",
               "export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN",
+              "echo '[5/19] Verify assumed identity'",
               "aws sts get-caller-identity",
+              "echo '[6/19] Verify EKS cluster access'",
               f"aws eks describe-cluster --region {os.environ['AWS_REGION']} --name {os.environ['EKS_CLUSTER_NAME']} >/dev/null",
+              "echo '[7/19] Update kubeconfig'",
               f"aws eks update-kubeconfig --region {os.environ['AWS_REGION']} --name {os.environ['EKS_CLUSTER_NAME']} --kubeconfig /tmp/eks-kubeconfig",
+              "echo '[8/19] Verify kubectl context'",
               "kubectl config current-context",
               "kubectl cluster-info",
+              "echo '[9/19] Ensure Argo CD namespace exists'",
               f"kubectl create namespace {os.environ['ARGOCD_NAMESPACE']} --dry-run=client -o yaml | kubectl apply -f -",
+              "echo '[10/19] Add and update Argo Helm repo'",
               "helm repo add argo https://argoproj.github.io/argo-helm",
               "helm repo update",
+              "echo '[11/19] Install or upgrade Argo CD'",
               f"helm upgrade --install argocd argo/argo-cd --namespace {os.environ['ARGOCD_NAMESPACE']} --version {os.environ['ARGOCD_CHART_VERSION']}",
+              "echo '[12/19] Wait for Argo CD core components'",
               f"kubectl rollout status deployment/argocd-server -n {os.environ['ARGOCD_NAMESPACE']} --timeout=300s",
               f"kubectl rollout status deployment/argocd-repo-server -n {os.environ['ARGOCD_NAMESPACE']} --timeout=300s",
               f"kubectl rollout status statefulset/argocd-application-controller -n {os.environ['ARGOCD_NAMESPACE']} --timeout=300s",
+              "echo '[13/19] Configure Argo CD repository secret when token is provided'",
               (
                   f"if [ -n \"{os.environ.get('GITHUB_TOKEN_FOR_ARGOCD', '')}\" ]; then "
                   f"kubectl -n {os.environ['ARGOCD_NAMESPACE']} create secret generic {repo_secret_name} "
@@ -161,22 +174,22 @@ jobs:
                   f"kubectl -n {os.environ['ARGOCD_NAMESPACE']} label secret {repo_secret_name} "
                   f"argocd.argoproj.io/secret-type=repository --overwrite; fi"
               ),
+              "echo '[14/19] Apply platform root application'",
               f"echo {os.environ['ROOT_APP_YAML_B64']} | base64 -d | kubectl apply -f -",
-              f"for i in $(seq 1 60); do kubectl get application platform-addons -n {os.environ['ARGOCD_NAMESPACE']} >/dev/null 2>&1 && break; sleep 10; done",
+              "echo '[15/19] Wait for platform-addons application to appear'",
+              f"for i in $(seq 1 30); do kubectl get application platform-addons -n {os.environ['ARGOCD_NAMESPACE']} >/dev/null 2>&1 && break; sleep 10; done",
               f"kubectl get application platform-addons -n {os.environ['ARGOCD_NAMESPACE']}",
-              f"for i in $(seq 1 60); do kubectl get application aws-load-balancer-controller -n {os.environ['ARGOCD_NAMESPACE']} >/dev/null 2>&1 && break; sleep 10; done",
-              f"kubectl get application aws-load-balancer-controller -n {os.environ['ARGOCD_NAMESPACE']}",
-              f"for i in $(seq 1 60); do sync_status=$(kubectl get application aws-load-balancer-controller -n {os.environ['ARGOCD_NAMESPACE']} -o jsonpath='{{.status.sync.status}}' 2>/dev/null || true); health_status=$(kubectl get application aws-load-balancer-controller -n {os.environ['ARGOCD_NAMESPACE']} -o jsonpath='{{.status.health.status}}' 2>/dev/null || true); if [ \"$sync_status\" = \"Synced\" ] && [ \"$health_status\" = \"Healthy\" ]; then break; fi; sleep 10; done",
+              "echo '[16/19] Wait for aws-load-balancer-controller application to become Synced/Healthy'",
+              f"for i in $(seq 1 30); do sync_status=$(kubectl get application aws-load-balancer-controller -n {os.environ['ARGOCD_NAMESPACE']} -o jsonpath='{{.status.sync.status}}' 2>/dev/null || true); health_status=$(kubectl get application aws-load-balancer-controller -n {os.environ['ARGOCD_NAMESPACE']} -o jsonpath='{{.status.health.status}}' 2>/dev/null || true); echo \"aws-load-balancer-controller: sync=$sync_status health=$health_status attempt=$i\"; if [ \"$sync_status\" = \"Synced\" ] && [ \"$health_status\" = \"Healthy\" ]; then break; fi; sleep 10; done",
               f"kubectl get application aws-load-balancer-controller -n {os.environ['ARGOCD_NAMESPACE']} -o yaml",
-              f"for i in $(seq 1 60); do kubectl get application inference-api -n {os.environ['ARGOCD_NAMESPACE']} >/dev/null 2>&1 && break; sleep 10; done",
-              f"kubectl get application inference-api -n {os.environ['ARGOCD_NAMESPACE']}",
-              f"for i in $(seq 1 60); do sync_status=$(kubectl get application inference-api -n {os.environ['ARGOCD_NAMESPACE']} -o jsonpath='{{.status.sync.status}}' 2>/dev/null || true); health_status=$(kubectl get application inference-api -n {os.environ['ARGOCD_NAMESPACE']} -o jsonpath='{{.status.health.status}}' 2>/dev/null || true); if [ \"$sync_status\" = \"Synced\" ] && [ \"$health_status\" = \"Healthy\" ]; then break; fi; sleep 10; done",
+              "echo '[17/19] Wait for inference-api application to become Synced/Healthy'",
+              f"for i in $(seq 1 30); do sync_status=$(kubectl get application inference-api -n {os.environ['ARGOCD_NAMESPACE']} -o jsonpath='{{.status.sync.status}}' 2>/dev/null || true); health_status=$(kubectl get application inference-api -n {os.environ['ARGOCD_NAMESPACE']} -o jsonpath='{{.status.health.status}}' 2>/dev/null || true); echo \"inference-api: sync=$sync_status health=$health_status attempt=$i\"; if [ \"$sync_status\" = \"Synced\" ] && [ \"$health_status\" = \"Healthy\" ]; then break; fi; sleep 10; done",
               f"kubectl get application inference-api -n {os.environ['ARGOCD_NAMESPACE']} -o yaml",
-              "for i in $(seq 1 60); do kubectl get deployment aws-load-balancer-controller -n kube-system >/dev/null 2>&1 && break; sleep 10; done",
+              "echo '[18/19] Verify application deployments are available'",
               "kubectl wait --for=condition=available deployment/aws-load-balancer-controller -n kube-system --timeout=600s",
-              "for i in $(seq 1 60); do kubectl get deployment inference-api -n inference >/dev/null 2>&1 && break; sleep 10; done",
               "kubectl wait --for=condition=available deployment/inference-api -n inference --timeout=600s",
-              "for i in $(seq 1 60); do kubectl get ingress inference-api -n inference >/dev/null 2>&1 && break; sleep 10; done",
+              "echo '[19/19] Verify inference ingress exists'",
+              "for i in $(seq 1 30); do kubectl get ingress inference-api -n inference >/dev/null 2>&1 && break; sleep 10; done",
               "kubectl get ingress inference-api -n inference",
           ]
 
@@ -213,6 +226,8 @@ jobs:
               --instance-id "${TARGET_INSTANCE_ID}" \
               --query 'Status' \
               --output text)
+
+            echo "Current SSM bootstrap status (${i}/${SSM_WAIT_ATTEMPTS}): ${STATUS}"
 
             if [[ "${STATUS}" == "Success" ]]; then
               echo "Argo CD bootstrap completed successfully."
