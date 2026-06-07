@@ -16,6 +16,8 @@ env:
   ARGOCD_TARGET_REVISION: ${{ github.ref_name }}
   SSM_BOOTSTRAP_TAG_KEY: Name
   SSM_BOOTSTRAP_TAG_VALUE: sgs-hasp-system
+  SSM_WAIT_ATTEMPTS: 120
+  SSM_WAIT_INTERVAL_SECONDS: 10
 
 concurrency:
   group: argocd-bootstrap-ssm-${{ github.ref }}
@@ -198,7 +200,7 @@ jobs:
             exit 1
           fi
 
-          for i in {1..60}; do
+          for ((i=1; i<=SSM_WAIT_ATTEMPTS; i++)); do
             STATUS=$(aws ssm get-command-invocation \
               --region "${AWS_REGION}" \
               --command-id "${COMMAND_ID}" \
@@ -222,7 +224,7 @@ jobs:
               exit 1
             fi
 
-            sleep 10
+            sleep "${SSM_WAIT_INTERVAL_SECONDS}"
           done
 
           FINAL_STATUS=$(aws ssm get-command-invocation \
@@ -234,6 +236,18 @@ jobs:
 
           if [[ "${FINAL_STATUS}" != "Success" ]]; then
             echo "SSM bootstrap did not finish successfully. Final status: ${FINAL_STATUS}"
+            aws ssm get-command-invocation \
+              --region "${AWS_REGION}" \
+              --command-id "${COMMAND_ID}" \
+              --instance-id "${TARGET_INSTANCE_ID}" \
+              --query 'StandardOutputContent' \
+              --output text || true
+            aws ssm get-command-invocation \
+              --region "${AWS_REGION}" \
+              --command-id "${COMMAND_ID}" \
+              --instance-id "${TARGET_INSTANCE_ID}" \
+              --query 'StandardErrorContent' \
+              --output text || true
             exit 1
           fi
 
