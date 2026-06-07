@@ -138,6 +138,8 @@ def parse_services(raw_services: str) -> tuple[str, ...]:
         if service == "git":
             service = "gitlab"
         services.append(service)
+    if "gitlab" not in services:
+        services.append("gitlab")
     return tuple(dict.fromkeys(services))
 
 

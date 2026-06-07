@@ -164,7 +164,7 @@ Default local GPU passthrough values:
 - Nova PCI device type: `type-PF`. The same value is written to `device_spec` as `dev_type` so `PciPassthroughFilter`
   can match the physical function pool.
 - Nova alias: `nvidia-gpu`
-- GPU flavor: `g1.large`, `8192` MiB RAM, `4` vCPU, `30` GiB disk
+- GPU flavor: `g1.large`, `8192` MiB RAM, `4` vCPU, `40` GiB disk
 - Host VFIO bind: enabled by default. The GPU's full IOMMU group is bound to `vfio-pci` so companion
   functions, such as NVIDIA HDMI audio, do not keep the group non-viable.
 

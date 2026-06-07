@@ -22,7 +22,7 @@ on:
         description: MinIO volume size per disk (Gi)
         required: true
         type: string
-        default: "50"
+        default: "10"
 
 permissions:
   contents: read

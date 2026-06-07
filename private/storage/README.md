@@ -26,6 +26,8 @@ kubectl apply -k private/storage
 - access key, secret key, 내부 endpoint, bucket credential은 커밋하지 않습니다.
 
 MinIO tenant는 기본적으로 private network VM에서도 접근할 수 있도록 고정 NodePort를 사용합니다.
+기본 tenant shape은 단일 서버에 4개 local-path volume을 붙이고, GitHub Actions 기본값은
+volume당 `10Gi`입니다. 따라서 기본 요청량은 총 `40Gi`입니다.
 
 - API: `http://<k8s-node-private-ip>:30900`
 - Console: `http://<k8s-node-private-ip>:30990`

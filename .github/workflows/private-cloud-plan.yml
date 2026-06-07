@@ -30,6 +30,6 @@ jobs:
       apply_kubernetes: false
       setup_storage: false
       validate_gpu: false
-      minio_volume_size: "50"
+      minio_volume_size: "10"
       force_cleanup: false
     secrets: inherit

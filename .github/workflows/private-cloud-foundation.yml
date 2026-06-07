@@ -67,7 +67,7 @@ env:
   PRIVATE_CLOUD_BASE_DOMAIN: ${{ vars.PRIVATE_CLOUD_BASE_DOMAIN }}
   PRIVATE_CLOUD_TAILSCALE_IP: ${{ vars.PRIVATE_CLOUD_TAILSCALE_IP }}
   PRIVATE_CLOUD_DNS_TTL: ${{ vars.PRIVATE_CLOUD_DNS_TTL }}
-  PRIVATE_CLOUD_DNS_SERVICES: ${{ vars.PRIVATE_CLOUD_DNS_SERVICES && format('{0},gitlab', vars.PRIVATE_CLOUD_DNS_SERVICES) || 'openstack,k8s,grafana,argocd,gitlab' }}
+  PRIVATE_CLOUD_DNS_SERVICES: ${{ vars.PRIVATE_CLOUD_DNS_SERVICES || 'openstack,k8s,grafana,argocd,gitlab' }}
   # Terraform backend
   TF_BACKEND_CONFIG: ${{ secrets.TF_BACKEND_CONFIG }}
   TF_BACKEND_TYPE: ${{ vars.TF_BACKEND_TYPE || 'local' }}
@@ -80,7 +80,7 @@ env:
   # Terraform variables
   TF_VAR_ssh_public_key: ${{ secrets.PRIVATE_CLOUD_SSH_PUBLIC_KEY }}
   TF_VAR_control_plane_image_name: ${{ vars.CONTROL_PLANE_IMAGE_NAME || 'ubuntu-22.04' }}
-  TF_VAR_control_plane_flavor_name: ${{ vars.CONTROL_PLANE_FLAVOR_NAME || 'm1.medium' }}
+  TF_VAR_control_plane_flavor_name: ${{ vars.CONTROL_PLANE_FLAVOR_NAME || 'm1.large' }}
   TF_VAR_build_worker_image_name: ${{ vars.BUILD_WORKER_IMAGE_NAME || 'ubuntu-22.04' }}
   TF_VAR_build_worker_flavor_name: ${{ vars.BUILD_WORKER_FLAVOR_NAME || 'm1.large' }}
   TF_VAR_gpu_worker_image_name: ${{ vars.GPU_WORKER_IMAGE_NAME || 'ubuntu-22.04' }}
@@ -97,15 +97,15 @@ env:
   HA_OPENSTACK_GPU_FLAVOR_NAME: ${{ vars.OPENSTACK_GPU_FLAVOR_NAME || 'g1.large' }}
   HA_OPENSTACK_GPU_FLAVOR_RAM: ${{ vars.OPENSTACK_GPU_FLAVOR_RAM || '8192' }}
   HA_OPENSTACK_GPU_FLAVOR_VCPUS: ${{ vars.OPENSTACK_GPU_FLAVOR_VCPUS || '4' }}
-  HA_OPENSTACK_GPU_FLAVOR_DISK: ${{ vars.OPENSTACK_GPU_FLAVOR_DISK || '30' }}
-  HA_DEVSTACK_CONTROL_FLAVOR_NAME: ha.m1.medium
-  HA_DEVSTACK_CONTROL_FLAVOR_RAM: "4096"
-  HA_DEVSTACK_CONTROL_FLAVOR_VCPUS: "2"
-  HA_DEVSTACK_CONTROL_FLAVOR_DISK: "15"
+  HA_OPENSTACK_GPU_FLAVOR_DISK: ${{ vars.OPENSTACK_GPU_FLAVOR_DISK || '40' }}
+  HA_DEVSTACK_CONTROL_FLAVOR_NAME: ha.m1.large
+  HA_DEVSTACK_CONTROL_FLAVOR_RAM: "8192"
+  HA_DEVSTACK_CONTROL_FLAVOR_VCPUS: "4"
+  HA_DEVSTACK_CONTROL_FLAVOR_DISK: "80"
   HA_DEVSTACK_WORKER_FLAVOR_NAME: ha.m1.large
   HA_DEVSTACK_WORKER_FLAVOR_RAM: "8192"
   HA_DEVSTACK_WORKER_FLAVOR_VCPUS: "4"
-  HA_DEVSTACK_WORKER_FLAVOR_DISK: "25"
+  HA_DEVSTACK_WORKER_FLAVOR_DISK: "80"
 
 jobs:
   install-openstack:
@@ -2978,8 +2978,12 @@ jobs:
       - name: Verify cluster
         run: |
           export KUBECONFIG="$HA_OPENSTACK_KUBECONFIG"
+          kubectl get --raw='/readyz?verbose'
           kubectl get nodes -o wide
-          kubectl get pods -A
+          kubectl -n kube-system rollout status daemonset/calico-node --timeout=600s
+          kubectl -n kube-system rollout status deployment/calico-kube-controllers --timeout=600s
+          kubectl -n kube-system rollout status deployment/coredns --timeout=600s
+          kubectl get pods -A -o wide
           echo "k8s cluster is ready!"
 
       - name: Apply Kubernetes baseline
@@ -3012,7 +3016,7 @@ jobs:
         working-directory: private/openstack
     env:
       KUBECONFIG: ${{ github.workspace }}/.ha/openstack/kubeconfig
-      MINIO_VOLUME_SIZE: ${{ inputs.minio_volume_size || '50' }}
+      MINIO_VOLUME_SIZE: ${{ inputs.minio_volume_size || '10' }}
       MINIO_ROOT_USER: ${{ vars.MINIO_ROOT_USER || 'minioadmin' }}
       MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
       HA_OPENSTACK_SSH_USER: ${{ vars.PRIVATE_CLOUD_SSH_USER || 'ubuntu' }}
@@ -3041,7 +3045,7 @@ jobs:
       - name: Validate storage inputs
         run: |
           if ! [[ "${MINIO_VOLUME_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::minio_volume_size must be a positive integer Gi value, for example 50"
+            echo "::error::minio_volume_size must be a positive integer Gi value, for example 10"
             exit 1
           fi
 
@@ -3321,13 +3325,27 @@ jobs:
             --dry-run=client -o yaml | kubectl apply -f -
 
           echo "Installing MinIO tenant with volume size ${MINIO_VOLUME_SIZE}Gi..."
-          sed -e "s/storage: 100Gi/storage: ${MINIO_VOLUME_SIZE}Gi/g" ../storage/minio-tenant.yaml | kubectl apply -f -
+          sed -E "s/storage: [0-9]+Gi/storage: ${MINIO_VOLUME_SIZE}Gi/g" ../storage/minio-tenant.yaml | kubectl apply -f -
           kubectl -n minio-tenant get tenant hybrid-ai
           echo "MinIO tenant applied"
 
       - name: Wait for MinIO Tenant
         timeout-minutes: 20
         run: |
+          collect_minio_diagnostics() {
+            echo "::group::MinIO tenant diagnostics"
+            kubectl get pods -n minio-tenant -o wide || true
+            kubectl describe pod -n minio-tenant -l v1.min.io/tenant=hybrid-ai || true
+            kubectl get pvc -n minio-tenant -o wide || true
+            kubectl describe pvc -n minio-tenant || true
+            kubectl get storageclass -o wide || true
+            kubectl get events -n minio-tenant --sort-by=.lastTimestamp || true
+            kubectl -n local-path-storage logs deployment/local-path-provisioner --tail=200 || true
+            kubectl get --raw='/readyz?verbose' || true
+            kubectl get pods -A -o wide || true
+            echo "::endgroup::"
+          }
+          trap collect_minio_diagnostics ERR
           echo "Waiting for MinIO tenant to be ready..."
           for i in {1..60}; do
             pod_count=$(kubectl get pods -n minio-tenant -l v1.min.io/tenant=hybrid-ai --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')

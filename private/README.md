@@ -218,7 +218,7 @@ credential을 검증합니다.
 
 - `MINIO_ROOT_USER`: 기본 `minioadmin`
 - `CONTROL_PLANE_IMAGE_NAME`: 기본 `ubuntu-22.04`
-- `CONTROL_PLANE_FLAVOR_NAME`: 기본 `m1.medium`
+- `CONTROL_PLANE_FLAVOR_NAME`: 기본 `m1.large`
 - `BUILD_WORKER_IMAGE_NAME`: 기본 `ubuntu-22.04`
 - `BUILD_WORKER_FLAVOR_NAME`: 기본 `m1.large`
 - `GPU_WORKER_IMAGE_NAME`: 기본 `ubuntu-22.04`
@@ -264,4 +264,4 @@ DNS는 Plan/Apply/Destroy workflow 안에서 자동 실행됩니다.
 - `PRIVATE_CLOUD_DNS_TTL`
 - `PRIVATE_CLOUD_DNS_SERVICES`
 
-`PRIVATE_CLOUD_DNS_SERVICES`를 기존 값으로 유지해도 workflow가 `gitlab`을 덧붙이므로 `gitlab.intp.me` DNS가 같이 관리됩니다. 예전 값 `git`은 `gitlab`으로 정규화되어 `git.intp.me`는 생성/수정하지 않습니다.
+`PRIVATE_CLOUD_DNS_SERVICES`를 기존 값으로 유지해도 DNS 스크립트가 `gitlab`을 보장하므로 `gitlab.intp.me` DNS가 같이 관리됩니다. 예전 값 `git`은 `gitlab`으로 정규화되어 `git.intp.me`는 생성/수정하지 않습니다.
