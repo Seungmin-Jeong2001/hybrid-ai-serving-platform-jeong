@@ -1195,6 +1195,280 @@ jobs:
             terraform init
           fi
 
+      - name: Repair local DevStack Terraform drift
+        if: ${{ inputs.action != 'destroy' && env.INSTALL_OPENSTACK == 'true' }}
+        run: |
+          set -euo pipefail
+
+          read_tf_string() {
+            local name="$1"
+            local default_value="$2"
+            python3 - "$name" "$default_value" <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          name, value = sys.argv[1], sys.argv[2]
+          env_value = os.environ.get(f"TF_VAR_{name}")
+          if env_value:
+              print(env_value)
+              raise SystemExit
+
+          pattern = re.compile(rf'^\s*{re.escape(name)}\s*=\s*"([^"]*)"', re.M)
+          for filename in ("private-cloud.auto.tfvars", "zz-local-devstack.auto.tfvars"):
+              path = pathlib.Path(filename)
+              if not path.exists():
+                  continue
+              match = pattern.search(path.read_text(encoding="utf-8"))
+              if match:
+                  value = match.group(1)
+          print(value)
+          PY
+          }
+
+          project_name="$(read_tf_string project_name hybrid-ai-private)"
+          private_network_cidr="$(read_tf_string private_network_cidr 10.42.0.0/24)"
+          target_project_id="$(lxc exec ha-openstack -- sudo -u stack -H bash -s -- \
+            "${OS_PROJECT_NAME}" \
+            "${OS_PROJECT_DOMAIN_NAME}" <<'LOOKUP_PROJECT'
+          set -eo pipefail
+          project_name="$1"
+          project_domain="$2"
+          cd /opt/stack/devstack
+          source openrc admin admin >/dev/null
+          openstack project show --domain "$project_domain" "$project_name" -f value -c id
+          LOOKUP_PROJECT
+          )"
+
+          echo "Repairing local DevStack drift for ${project_name} in project ${OS_PROJECT_NAME} (${target_project_id})"
+
+          lxc exec ha-openstack -- sudo -u stack -H bash -s -- \
+            "$project_name" \
+            "$target_project_id" <<'REPAIR_OPENSTACK_DRIFT'
+          set -eo pipefail
+          project_name="$1"
+          target_project_id="$2"
+
+          cd /opt/stack/devstack
+          source openrc admin admin >/dev/null
+          set -u
+
+          python3 - "$project_name" "$target_project_id" <<'PY'
+          import json
+          import subprocess
+          import sys
+          import time
+
+          project_name, target_project_id = sys.argv[1:3]
+
+          def openstack_json(*args):
+              command = ["openstack", *args, "-f", "json"]
+              output = subprocess.check_output(command, text=True)
+              return json.loads(output)
+
+          def run(*args):
+              subprocess.run(["openstack", *args], check=True)
+
+          def delete_fips_for_port(port_id):
+              fips = openstack_json("floating", "ip", "list", "--port", port_id, "-c", "ID")
+              for fip in fips:
+                  fip_id = fip.get("ID")
+                  if fip_id:
+                      print(f"Deleting floating IP {fip_id} for stale port {port_id}")
+                      run("floating", "ip", "delete", fip_id)
+
+          def wait_for_server_delete(server_id):
+              for _ in range(60):
+                  try:
+                      openstack_json("server", "show", server_id)
+                  except subprocess.CalledProcessError:
+                      return
+                  time.sleep(2)
+              print(f"::warning::Timed out waiting for stale server {server_id} to delete")
+
+          ports = openstack_json(
+              "port",
+              "list",
+              "-c",
+              "ID",
+              "-c",
+              "Name",
+          )
+
+          stale_devices = set()
+          stale_ports = []
+          for port in ports:
+              name = port.get("Name") or ""
+              if not name.startswith(f"{project_name}-"):
+                  continue
+              if not any(role in name for role in ("control", "build", "gpu", "gitlab")):
+                  continue
+              port_id = port.get("ID")
+              if not port_id:
+                  continue
+              try:
+                  port_details = openstack_json("port", "show", port_id)
+              except subprocess.CalledProcessError:
+                  continue
+              port_project_id = port_details.get("project_id") or port_details.get("Project")
+              if port_project_id == target_project_id:
+                  continue
+              device_id = port_details.get("device_id") or port_details.get("Device") or ""
+              if device_id:
+                  stale_devices.add(device_id)
+              stale_ports.append(port_id)
+
+          for port_id in stale_ports:
+              try:
+                  delete_fips_for_port(port_id)
+              except subprocess.CalledProcessError:
+                  pass
+
+          for server_id in sorted(stale_devices):
+              try:
+                  server = openstack_json("server", "show", server_id)
+              except subprocess.CalledProcessError:
+                  continue
+              print(
+                  "Deleting stale server "
+                  f"{server.get('name') or server.get('Name') or server_id} ({server_id}) "
+                  f"from project {server.get('project_id')}"
+              )
+              run("server", "delete", server_id)
+              wait_for_server_delete(server_id)
+
+          for port_id in stale_ports:
+              try:
+                  print(f"Deleting stale port {port_id}")
+                  run("port", "delete", port_id)
+              except subprocess.CalledProcessError:
+                  pass
+
+          PY
+          REPAIR_OPENSTACK_DRIFT
+
+          state_id() {
+            local address="$1"
+            terraform state show -no-color "$address" 2>/dev/null \
+              | awk -F= '/^[[:space:]]*id[[:space:]]*=/{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); gsub(/"/, "", $2); print $2; exit}' \
+              || true
+          }
+
+          port_project_id() {
+            local port_id="$1"
+            lxc exec ha-openstack -- sudo -u stack -H bash -s -- "$port_id" <<'PORT_PROJECT'
+          set -eo pipefail
+          port_id="$1"
+          cd /opt/stack/devstack
+          source openrc admin admin >/dev/null
+          openstack port show "$port_id" -f value -c project_id 2>/dev/null || true
+          PORT_PROJECT
+          }
+
+          fip_project_id() {
+            local fip_id="$1"
+            lxc exec ha-openstack -- sudo -u stack -H bash -s -- "$fip_id" <<'FIP_PROJECT'
+          set -eo pipefail
+          fip_id="$1"
+          cd /opt/stack/devstack
+          source openrc admin admin >/dev/null
+          openstack floating ip show "$fip_id" -f value -c project_id 2>/dev/null || true
+          FIP_PROJECT
+          }
+
+          remove_state_if_project_mismatch() {
+            local address="$1"
+            local kind="$2"
+            local resource_id
+            local resource_project_id
+
+            resource_id="$(state_id "$address")"
+            [[ -n "$resource_id" ]] || return 0
+
+            case "$kind" in
+              port) resource_project_id="$(port_project_id "$resource_id")" ;;
+              fip) resource_project_id="$(fip_project_id "$resource_id")" ;;
+              *) return 0 ;;
+            esac
+
+            if [[ -z "$resource_project_id" || "$resource_project_id" != "$target_project_id" ]]; then
+              echo "Removing stale state ${address} (${resource_id})"
+              terraform state rm "$address" || true
+            fi
+          }
+
+          remove_state_if_project_mismatch 'openstack_networking_port_v2.gitlab[0]' port
+          remove_state_if_project_mismatch 'openstack_networking_floatingip_v2.gitlab[0]' fip
+          remove_state_if_project_mismatch 'openstack_networking_port_v2.control_plane[0]' port
+          remove_state_if_project_mismatch 'openstack_networking_floatingip_v2.control_plane[0]' fip
+
+          if ! terraform state list | grep -qx 'openstack_networking_secgroup_v2.private'; then
+            echo "::notice::Security group is not in Terraform state yet; skipping security group rule import"
+            exit 0
+          fi
+
+          security_group_id="$(state_id openstack_networking_secgroup_v2.private)"
+          if [[ -z "$security_group_id" ]]; then
+            echo "::notice::Could not read security group ID from Terraform state; skipping security group rule import"
+            exit 0
+          fi
+
+          find_rule_id() {
+            local protocol="$1"
+            lxc exec ha-openstack -- sudo -u stack -H bash -s -- \
+              "$security_group_id" \
+              "$protocol" \
+              "$private_network_cidr" <<'FIND_RULE'
+          set -eo pipefail
+          security_group_id="$1"
+          protocol="$2"
+          cidr="$3"
+
+          cd /opt/stack/devstack
+          source openrc admin admin >/dev/null
+          rule_json="$(openstack security group rule list "$security_group_id" -f json)"
+          python3 - "$protocol" "$cidr" "$rule_json" <<'PY'
+          import json
+          import sys
+
+          protocol, cidr = sys.argv[1:3]
+          rules = json.loads(sys.argv[3])
+          for rule in rules:
+              if (
+                  rule.get("Direction") == "ingress"
+                  and rule.get("Ethertype") == "IPv4"
+                  and rule.get("IP Protocol") == protocol
+                  and rule.get("IP Range") == cidr
+              ):
+                  print(rule.get("ID", ""))
+                  break
+          PY
+          FIND_RULE
+          }
+
+          import_rule_if_missing() {
+            local address="$1"
+            local protocol="$2"
+            local rule_id
+
+            if terraform state list | grep -qx "$address"; then
+              return 0
+            fi
+
+            rule_id="$(find_rule_id "$protocol")"
+            if [[ -z "$rule_id" ]]; then
+              echo "No existing ${protocol} internal rule found; Terraform will create ${address}"
+              return 0
+            fi
+
+            echo "Importing existing ${protocol} internal rule ${rule_id} into ${address}"
+            terraform import "$address" "$rule_id"
+          }
+
+          import_rule_if_missing openstack_networking_secgroup_rule_v2.allow_internal_tcp tcp
+          import_rule_if_missing openstack_networking_secgroup_rule_v2.allow_internal_udp udp
+
       - name: Setup kubectl for destroy cleanup
         if: ${{ inputs.action == 'destroy' }}
         uses: azure/setup-kubectl@v4
