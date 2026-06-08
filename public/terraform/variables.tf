@@ -237,7 +237,7 @@ variable "argocd_chart_version" {
 variable "additional_eks_admin_role_arns" {
   description = "Additional IAM role ARNs that should receive EKS cluster admin access"
   type        = list(string)
-  default     = []
+  default     = ["arn:aws:iam::808379768010:role/kt_sgs_eks_admin_role"]
 }
 
 variable "enable_site_to_site_vpn" {
