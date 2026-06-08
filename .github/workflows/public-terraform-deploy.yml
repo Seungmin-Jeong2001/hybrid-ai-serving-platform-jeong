@@ -462,6 +462,12 @@ jobs:
               --network-interface-id "${ENI_ID}" || true
           done
 
+      - name: Force unlock Terraform state before destroy
+        if: ${{ inputs.action == 'destroy' }}
+        run: |
+          aws s3 rm s3://sgs-hasp-tfstate/terraform/terraform.tfstate.tflock \
+            --region ap-northeast-2 || true
+
       - name: Terraform destroy plan
         if: ${{ inputs.action == 'destroy' }}
         working-directory: public/terraform
