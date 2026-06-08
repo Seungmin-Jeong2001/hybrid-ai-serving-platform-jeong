@@ -93,6 +93,26 @@ output "msk_bootstrap_brokers" {
   value       = aws_msk_cluster.main.bootstrap_brokers
 }
 
+output "manage_msk_topics" {
+  description = "Whether MSK topics should be reconciled by the CI workflow"
+  value       = var.manage_msk_topics
+}
+
+output "msk_topic_replication_factor" {
+  description = "Replication factor to use when creating MSK topics"
+  value       = var.msk_topic_replication_factor
+}
+
+output "msk_topic_configs" {
+  description = "Topic-level configuration to apply to managed MSK topics"
+  value       = var.msk_topic_configs
+}
+
+output "msk_topics" {
+  description = "Managed MSK topics and their desired partition counts"
+  value       = var.msk_topics
+}
+
 # S3 outputs
 output "artifacts_s3_bucket_name" {
   description = "Shared artifacts S3 bucket name"

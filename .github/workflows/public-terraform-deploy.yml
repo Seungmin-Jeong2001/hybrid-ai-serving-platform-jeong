@@ -91,6 +91,24 @@ jobs:
         working-directory: public/terraform
         run: terraform apply -auto-approve tfplan
 
+      - name: Sync MSK topics
+        if: ${{ inputs.action == 'apply' }}
+        working-directory: public/terraform
+        run: |
+          MANAGE_MSK_TOPICS=$(terraform output -raw manage_msk_topics)
+          if [[ "${MANAGE_MSK_TOPICS}" != "true" ]]; then
+            echo "MSK topic reconciliation is disabled."
+            exit 0
+          fi
+
+          export AWS_REGION="${AWS_REGION}"
+          export MSK_CLUSTER_ARN="$(terraform output -raw msk_cluster_arn)"
+          export MSK_TOPIC_REPLICATION_FACTOR="$(terraform output -raw msk_topic_replication_factor)"
+          export MSK_TOPIC_CONFIGS_JSON="$(terraform output -json msk_topic_configs)"
+          export MSK_TOPICS_JSON="$(terraform output -json msk_topics)"
+
+          /bin/sh ./scripts/sync-msk-topics.sh
+
       - name: Resolve SSM bootstrap instance
         id: resolve_instance
         run: |
