@@ -82,6 +82,10 @@ spec:
               cpu: 50m
               memory: 64Mi
         prometheusOperator:
+          admissionWebhooks:
+            enabled: true
+            certManager:
+              enabled: true
           resources:
             requests:
               cpu: 100m
