@@ -98,4 +98,6 @@ spec:
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
+      # Prometheus Operator CRDs exceed the client-side apply limit, so sync with server-side apply.
+      - ServerSideApply=true
 
