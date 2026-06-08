@@ -242,8 +242,10 @@ jobs:
               "read AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<< \"$ASSUME_ROLE_OUTPUT\"",
               "export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN",
               f"aws eks update-kubeconfig --region {os.environ['AWS_REGION']} --name {os.environ['EKS_CLUSTER_NAME']} --kubeconfig /tmp/eks-kubeconfig",
-              "kubectl delete application --all -n argocd --wait --timeout=300s || true",
-              "kubectl delete namespace inference --wait --timeout=120s || true",
+              "kubectl get application -n argocd -o name | xargs -I{} kubectl patch {} -n argocd -p '{\"metadata\":{\"finalizers\":[]}}' --type=merge || true",
+              "kubectl delete application --all -n argocd --wait --timeout=120s || true",
+              "kubectl patch namespace inference -p '{\"metadata\":{\"finalizers\":[]}}' --type=merge || true",
+              "kubectl delete namespace inference --wait --timeout=60s || true",
           ]
 
           with open("argocd-cleanup-commands.json", "w") as fp:
