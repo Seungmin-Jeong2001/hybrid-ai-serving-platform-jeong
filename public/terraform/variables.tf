@@ -187,7 +187,7 @@ variable "msk_topic_configs" {
   description = "Topic-level MSK configuration properties to apply when creating or updating topics"
   type        = map(string)
   default = {
-    "min.insync.replicas" = "2"
+    #"min.insync.replicas" = "2" # 임시로 주석
   }
 }
 

@@ -57,6 +57,7 @@ printf '%s\n' "$topic_configs_raw"
 topic_configs_b64="$(printf '%s' "$topic_configs_raw" | base64 | tr -d '\n')"
 
 echo "topic_configs_b64=$topic_configs_b64"
+# -----
 
 printf '%s' "$MSK_TOPICS_JSON" | jq -r 'to_entries[] | @base64' | while IFS= read -r entry; do
   topic_name="$(printf '%s' "$entry" | base64 -d | jq -r '.key')"
@@ -82,8 +83,9 @@ printf '%s' "$MSK_TOPICS_JSON" | jq -r 'to_entries[] | @base64' | while IFS= rea
         --cluster-arn "$MSK_CLUSTER_ARN" \
         --topic-name "$topic_name" \
         --partition-count "$desired_partitions" \
-        --replication-factor "$MSK_TOPIC_REPLICATION_FACTOR" \
-        --configs "$topic_configs_b64" >/dev/null
+        --replication-factor "$MSK_TOPIC_REPLICATION_FACTOR" >/dev/null
+        #--replication-factor "$MSK_TOPIC_REPLICATION_FACTOR" \
+        #--configs "$topic_configs_b64" >/dev/null
 
       wait_topic_active "$topic_name"
       continue
@@ -99,8 +101,9 @@ printf '%s' "$MSK_TOPICS_JSON" | jq -r 'to_entries[] | @base64' | while IFS= rea
       --region "$AWS_REGION" \
       --cluster-arn "$MSK_CLUSTER_ARN" \
       --topic-name "$topic_name" \
-      --partition-count "$desired_partitions" \
-      --configs "$topic_configs_b64" >/dev/null
+      --partition-count "$desired_partitions" >/dev/null
+      #--partition-count "$desired_partitions" \
+      #--configs "$topic_configs_b64" >/dev/null
 
     wait_topic_active "$topic_name"
     continue
@@ -111,11 +114,12 @@ printf '%s' "$MSK_TOPICS_JSON" | jq -r 'to_entries[] | @base64' | while IFS= rea
     exit 1
   fi
 
-  aws kafka update-topic \
-    --region "$AWS_REGION" \
-    --cluster-arn "$MSK_CLUSTER_ARN" \
-    --topic-name "$topic_name" \
-    --configs "$topic_configs_b64" >/dev/null
+  #aws kafka update-topic \
+    #--region "$AWS_REGION" \
+    #--cluster-arn "$MSK_CLUSTER_ARN" \
+    #--topic-name "$topic_name" >/dev/null
+    #--topic-name "$topic_name" \
+    #--configs "$topic_configs_b64" >/dev/null
 
   wait_topic_active "$topic_name"
   echo "Topic '$topic_name' already matches desired partition count $desired_partitions."
