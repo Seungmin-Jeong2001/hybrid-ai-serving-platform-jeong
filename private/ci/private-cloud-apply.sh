@@ -712,7 +712,11 @@ terraform_var_int() {
 }
 
 terraform_apply_prefix() {
-  terraform_var_value project_name hybrid-ai-private private-cloud.auto.tfvars zz-local-devstack.auto.tfvars
+  terraform_var_value \
+    project_name \
+    hybrid-ai-private \
+    "${ROOT}/private/openstack/private-cloud.auto.tfvars" \
+    "${ROOT}/private/openstack/zz-local-devstack.auto.tfvars"
 }
 
 actions_lightweight_stack() {
