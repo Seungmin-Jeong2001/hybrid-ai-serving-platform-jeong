@@ -12,3 +12,4 @@ resources:
   - chaos-mesh-app.yaml
   - kserve-crds-app.yaml
   - kserve-app.yaml
+  - pdm-serving-app.yaml

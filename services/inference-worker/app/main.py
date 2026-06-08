@@ -179,9 +179,9 @@ def _update_job_status(
     }
     update_expression = (
         "SET #status = :status, retry_count = :retry_count, source_topic = :source_topic, "
-        "updated_at = :updated_at, ttl = :ttl"
+        "updated_at = :updated_at, #ttl = :ttl"
     )
-    expression_attribute_names = {"#status": "status"}
+    expression_attribute_names = {"#status": "status", "#ttl": "ttl"}
 
     if last_error is not None:
         expression_attribute_values[":last_error"] = last_error
