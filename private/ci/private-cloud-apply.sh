@@ -896,7 +896,6 @@ print(
     values.get("total_instances_used", 0),
 )
 PY
-)
 }
 
 read -r max_cores used_cores max_ram used_ram max_instances used_instances < <(read_limits "$limits_json")
