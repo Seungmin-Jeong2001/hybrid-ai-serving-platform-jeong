@@ -3,7 +3,7 @@
 
 set -eu
 
-KAFKA_VERSION="3.7.1"
+KAFKA_VERSION="3.9.2"
 KAFKA_SCALA="2.13"
 KAFKA_DIR="/tmp/kafka-${KAFKA_VERSION}"
 KAFKA_TOPICS="${KAFKA_DIR}/bin/kafka-topics.sh"
