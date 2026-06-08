@@ -635,6 +635,270 @@ load_cached_image_overrides() {
   export TF_VAR_control_plane_image_name TF_VAR_build_worker_image_name TF_VAR_gpu_worker_image_name TF_VAR_gitlab_image_name TF_VAR_harbor_image_name
 }
 
+terraform_var_value() {
+  local name="$1"
+  local default_value="$2"
+  shift 2
+  python3 - "$name" "$default_value" "$@" <<'PY'
+import os
+import re
+import sys
+
+name = sys.argv[1]
+value = os.environ.get(f"TF_VAR_{name}", sys.argv[2])
+assignment = re.compile(rf"^\s*{re.escape(name)}\s*=\s*(.*?)\s*$")
+
+
+def parse_scalar(raw):
+    raw = raw.strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        return bytes(raw[1:-1], "utf-8").decode("unicode_escape")
+    if raw.startswith("'") and raw.endswith("'"):
+        return raw[1:-1]
+    return raw
+
+
+for path in sys.argv[3:]:
+    if not os.path.exists(path):
+        continue
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            match = assignment.match(line)
+            if not match:
+                continue
+            value = parse_scalar(match.group(1).split(" #", 1)[0].split(" //", 1)[0])
+
+print(value)
+PY
+}
+
+terraform_var_int() {
+  local name="$1"
+  local default_value="$2"
+  local value
+  value="$(terraform_var_value "$name" "$default_value" private-cloud.auto.tfvars zz-local-devstack.auto.tfvars)"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    printf 'Terraform variable %s must be a non-negative integer, got: %s\n' "$name" "$value" >&2
+    return 1
+  fi
+  printf '%s\n' "$value"
+}
+
+terraform_apply_prefix() {
+  terraform_var_value project_name hybrid-ai-private private-cloud.auto.tfvars zz-local-devstack.auto.tfvars
+}
+
+cleanup_openstack_orphans_before_apply() {
+  local prefix
+
+  [[ "${HA_PRIVATE_CLOUD_CLEANUP_ORPHANS_BEFORE_APPLY:-true}" == "true" ]] || return 0
+  command -v lxc >/dev/null 2>&1 || return 0
+  lxc info ha-openstack >/dev/null 2>&1 || return 0
+
+  prefix="$(terraform_apply_prefix)"
+  log "checking OpenStack orphan resources before apply for prefix ${prefix}"
+  lxc exec ha-openstack -- sudo -u stack -H bash -s -- "$prefix" <<'CLEANUP_OPENSTACK_ORPHANS_BEFORE_APPLY'
+set -euo pipefail
+prefix="$1"
+cd /opt/stack/devstack
+set +u
+source openrc admin admin >/dev/null
+set -u
+
+server_ids="$(openstack server list -f value -c ID -c Name | awk -v p="$prefix" '$2 ~ "^" p {print $1}')"
+if [[ -n "$server_ids" ]]; then
+  echo "existing servers found for ${prefix}; skipping orphan cleanup"
+  exit 0
+fi
+
+network_id="$(openstack network list -f value -c ID -c Name | awk -v n="${prefix}-net" '$2 == n {print $1; exit}')"
+router_id="$(openstack router list -f value -c ID -c Name | awk -v n="${prefix}-router" '$2 == n {print $1; exit}')"
+subnet_id="$(openstack subnet list -f value -c ID -c Name | awk -v n="${prefix}-subnet" '$2 == n {print $1; exit}')"
+sg_id="$(openstack security group list -f value -c ID -c Name | awk -v n="${prefix}-sg" '$2 == n {print $1; exit}')"
+
+if [[ -z "$network_id$router_id$subnet_id$sg_id" ]]; then
+  echo "no orphan OpenStack resources found for ${prefix}"
+  exit 0
+fi
+
+echo "removing orphan OpenStack resources for ${prefix}"
+network_port_ids=""
+if [[ -n "$network_id" ]]; then
+  network_port_ids="$(openstack port list --network "$network_id" -f value -c ID)"
+fi
+if [[ -n "$network_port_ids" ]]; then
+  fip_ids="$(openstack floating ip list -f value -c ID -c Port | awk -v ports="$network_port_ids" '
+    BEGIN {
+      split(ports, lines, "\n")
+      for (idx in lines) {
+        if (lines[idx] != "") {
+          keep[lines[idx]] = 1
+        }
+      }
+    }
+    $2 in keep {print $1}
+  ')"
+  if [[ -n "$fip_ids" ]]; then
+    while IFS= read -r id; do
+      [[ -n "$id" ]] && openstack floating ip delete "$id" || true
+    done <<<"$fip_ids"
+  fi
+fi
+
+if [[ -n "$router_id" && -n "$subnet_id" ]]; then
+  openstack router remove subnet "$router_id" "$subnet_id" || true
+fi
+if [[ -n "$router_id" ]]; then
+  openstack router delete "$router_id" || true
+fi
+
+if [[ -n "$network_id" ]]; then
+  port_ids="$(openstack port list --network "$network_id" -f value -c ID)"
+  if [[ -n "$port_ids" ]]; then
+    while IFS= read -r id; do
+      [[ -n "$id" ]] && openstack port delete "$id" || true
+    done <<<"$port_ids"
+  fi
+fi
+if [[ -n "$subnet_id" ]]; then
+  openstack subnet delete "$subnet_id" || true
+fi
+if [[ -n "$network_id" ]]; then
+  openstack network delete "$network_id" || true
+fi
+if [[ -n "$sg_id" ]]; then
+  openstack security group delete "$sg_id" || true
+fi
+CLEANUP_OPENSTACK_ORPHANS_BEFORE_APPLY
+}
+
+preflight_openstack_quota() {
+  local prefix control_count build_count gpu_count gitlab_count harbor_count
+  local control_flavor build_flavor gpu_flavor gitlab_flavor harbor_flavor
+
+  [[ "${HA_PRIVATE_CLOUD_QUOTA_PREFLIGHT:-true}" == "true" ]] || return 0
+  command -v lxc >/dev/null 2>&1 || return 0
+  lxc info ha-openstack >/dev/null 2>&1 || return 0
+
+  prefix="$(terraform_apply_prefix)"
+  control_count="$(terraform_var_int control_plane_count 1)"
+  build_count="$(terraform_var_int build_worker_count 1)"
+  gpu_count="$(terraform_var_int gpu_worker_count 1)"
+  gitlab_count="$(terraform_var_int gitlab_count 1)"
+  harbor_count="$(terraform_var_int harbor_count 1)"
+  control_flavor="$(terraform_var_value control_plane_flavor_name "${HA_DEVSTACK_CONTROL_FLAVOR_NAME}" private-cloud.auto.tfvars zz-local-devstack.auto.tfvars)"
+  build_flavor="$(terraform_var_value build_worker_flavor_name "${HA_DEVSTACK_WORKER_FLAVOR_NAME}" private-cloud.auto.tfvars zz-local-devstack.auto.tfvars)"
+  gpu_flavor="$(terraform_var_value gpu_worker_flavor_name "${HA_OPENSTACK_GPU_FLAVOR_NAME}" private-cloud.auto.tfvars zz-local-devstack.auto.tfvars)"
+  gitlab_flavor="$(terraform_var_value gitlab_flavor_name "${HA_DEVSTACK_GITLAB_FLAVOR_NAME}" private-cloud.auto.tfvars zz-local-devstack.auto.tfvars)"
+  harbor_flavor="$(terraform_var_value harbor_flavor_name "${HA_DEVSTACK_HARBOR_FLAVOR_NAME}" private-cloud.auto.tfvars zz-local-devstack.auto.tfvars)"
+
+  log "checking OpenStack quota before apply for prefix ${prefix}"
+  lxc exec ha-openstack -- sudo -u stack -H bash -s -- \
+    "$prefix" \
+    control "$control_count" "$control_flavor" \
+    build "$build_count" "$build_flavor" \
+    gpu "$gpu_count" "$gpu_flavor" \
+    gitlab "$gitlab_count" "$gitlab_flavor" \
+    harbor "$harbor_count" "$harbor_flavor" <<'PREFLIGHT_OPENSTACK_QUOTA'
+set -euo pipefail
+prefix="$1"
+shift
+cd /opt/stack/devstack
+set +u
+source openrc admin admin >/dev/null
+set -u
+
+flavor_vcpus() {
+  openstack flavor show "$1" -f value -c vcpus
+}
+
+flavor_ram() {
+  openstack flavor show "$1" -f value -c ram
+}
+
+server_exists() {
+  openstack server show "$1" >/dev/null 2>&1
+}
+
+missing_for_role() {
+  local role="$1" count="$2" missing=0 index name
+  for ((index = 1; index <= count; index += 1)); do
+    printf -v name "%s-%s-%02d" "$prefix" "$role" "$index"
+    if ! server_exists "$name"; then
+      missing=$((missing + 1))
+    fi
+  done
+  printf '%s\n' "$missing"
+}
+
+limits_json="$(openstack limits show --absolute -f json)"
+read -r max_cores used_cores max_ram used_ram max_instances used_instances < <(
+  python3 - "$limits_json" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+values = {item["Name"]: int(item["Value"]) for item in payload}
+print(
+    values.get("max_total_cores", -1),
+    values.get("total_cores_used", 0),
+    values.get("max_total_ram_size", -1),
+    values.get("total_ram_used", 0),
+    values.get("max_total_instances", -1),
+    values.get("total_instances_used", 0),
+)
+PY
+)
+
+need_cores=0
+need_ram=0
+need_instances=0
+summary=()
+while [[ $# -gt 0 ]]; do
+  role="$1"
+  count="$2"
+  flavor="$3"
+  shift 3
+  [[ "$count" -gt 0 ]] || continue
+  missing="$(missing_for_role "$role" "$count")"
+  [[ "$missing" -gt 0 ]] || continue
+  vcpus="$(flavor_vcpus "$flavor")"
+  ram="$(flavor_ram "$flavor")"
+  role_cores=$((missing * vcpus))
+  role_ram=$((missing * ram))
+  need_cores=$((need_cores + role_cores))
+  need_ram=$((need_ram + role_ram))
+  need_instances=$((need_instances + missing))
+  summary+=("${role}: missing=${missing} flavor=${flavor} cores=${role_cores} ram_mb=${role_ram}")
+done
+
+if [[ "$need_instances" -eq 0 ]]; then
+  echo "quota preflight: all requested servers already exist for ${prefix}"
+  exit 0
+fi
+
+available_cores=999999999
+available_ram=999999999
+available_instances=999999999
+[[ "$max_cores" -lt 0 ]] || available_cores=$((max_cores - used_cores))
+[[ "$max_ram" -lt 0 ]] || available_ram=$((max_ram - used_ram))
+[[ "$max_instances" -lt 0 ]] || available_instances=$((max_instances - used_instances))
+
+echo "quota preflight demand for ${prefix}: instances=${need_instances} cores=${need_cores} ram_mb=${need_ram}"
+printf '  %s\n' "${summary[@]}"
+echo "quota preflight available: instances=${available_instances}/${max_instances} cores=${available_cores}/${max_cores} ram_mb=${available_ram}/${max_ram}"
+
+if (( need_instances > available_instances || need_cores > available_cores || need_ram > available_ram )); then
+  cat >&2 <<EOF
+OpenStack quota preflight failed before Terraform apply.
+Requested missing resources for prefix '${prefix}' exceed remaining quota.
+Destroy an existing stack, lower VM counts/flavors, or increase OpenStack quota before rerunning Actions.
+EOF
+  exit 1
+fi
+PREFLIGHT_OPENSTACK_QUOTA
+}
+
 ensure_openstack_user() {
   lxc exec ha-openstack -- sudo -u stack -H bash -s -- \
     "${OS_USERNAME}" "${OS_PROJECT_NAME}" "${OS_PASSWORD}" "${OS_USER_DOMAIN_NAME}" "${OS_PROJECT_DOMAIN_NAME}" <<'ENSURE_OPENSTACK_USER'
@@ -918,6 +1182,8 @@ prepare_noninteractive_backend_init() {
 }
 
 terraform_apply() {
+  local effective_gpu_worker_count effective_gitlab_count effective_harbor_count
+  local key_pair_name
   ensure_ssh_key
   cd "${ROOT}/private/openstack"
   rm -f backend.generated.tf backend.hcl private-cloud.auto.tfvars zz-local-devstack.auto.tfvars private-cloud.tfplan
@@ -932,6 +1198,9 @@ terraform_apply() {
   if [[ -n "${PRIVATE_CLOUD_TFVARS:-}" ]]; then
     printf '%s' "${PRIVATE_CLOUD_TFVARS}" > private-cloud.auto.tfvars
   fi
+  effective_gpu_worker_count="$(terraform_var_value gpu_worker_count "${TF_VAR_gpu_worker_count}" private-cloud.auto.tfvars)"
+  effective_gitlab_count="$(terraform_var_value gitlab_count "${TF_VAR_gitlab_count}" private-cloud.auto.tfvars)"
+  effective_harbor_count="$(terraform_var_value harbor_count "${TF_VAR_harbor_count}" private-cloud.auto.tfvars)"
   public_network_id="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc 'cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack network show public -f value -c id')"
   public_subnet_id="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc 'cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack subnet list --network public --ip-version 4 -f value -c ID | head -n 1')"
   public_subnet_cidr="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc "cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack subnet show '${public_subnet_id}' -f value -c cidr")"
@@ -945,18 +1214,20 @@ terraform_apply() {
     printf 'control_plane_flavor_name = "%s"\n' "${HA_DEVSTACK_CONTROL_FLAVOR_NAME}"
     printf 'build_worker_image_name = "%s"\n' "${TF_VAR_build_worker_image_name}"
     printf 'build_worker_flavor_name = "%s"\n' "${HA_DEVSTACK_WORKER_FLAVOR_NAME}"
-    printf 'gpu_worker_count = %s\n' "${TF_VAR_gpu_worker_count}"
+    printf 'gpu_worker_count = %s\n' "${effective_gpu_worker_count}"
     printf 'gpu_worker_image_name = "%s"\n' "${TF_VAR_gpu_worker_image_name}"
     printf 'gpu_worker_flavor_name = "%s"\n' "${HA_OPENSTACK_GPU_FLAVOR_NAME}"
-    printf 'gitlab_count = %s\n' "${TF_VAR_gitlab_count}"
+    printf 'gitlab_count = %s\n' "${effective_gitlab_count}"
     printf 'gitlab_image_name = "%s"\n' "${TF_VAR_gitlab_image_name}"
     printf 'gitlab_flavor_name = "%s"\n' "${HA_DEVSTACK_GITLAB_FLAVOR_NAME}"
     printf 'gitlab_container_image = "%s"\n' "${TF_VAR_gitlab_container_image}"
-    printf 'harbor_count = %s\n' "${TF_VAR_harbor_count}"
+    printf 'harbor_count = %s\n' "${effective_harbor_count}"
     printf 'harbor_image_name = "%s"\n' "${TF_VAR_harbor_image_name}"
     printf 'harbor_flavor_name = "%s"\n' "${HA_DEVSTACK_HARBOR_FLAVOR_NAME}"
     printf 'harbor_http_allowed_cidrs = ["%s"]\n' "$public_subnet_cidr"
   } >zz-local-devstack.auto.tfvars
+  cleanup_openstack_orphans_before_apply
+  preflight_openstack_quota
   local backend_config="${TF_BACKEND_CONFIG:-}"
   local backend_config_compact="${backend_config//[[:space:]]/}"
 
@@ -983,8 +1254,9 @@ terraform_apply() {
       [[ -n "${address}" ]] && terraform state rm "${address}"
     done <<<"${legacy_addresses}"
   fi
+  key_pair_name="$(terraform_var_value key_pair_name hybrid-ai-private-admin private-cloud.auto.tfvars zz-local-devstack.auto.tfvars)"
   if ! terraform state show -no-color openstack_compute_keypair_v2.admin >/dev/null 2>&1; then
-    terraform import openstack_compute_keypair_v2.admin hybrid-ai-private-admin >/dev/null 2>&1 || true
+    terraform import openstack_compute_keypair_v2.admin "${key_pair_name}" >/dev/null 2>&1 || true
   fi
   terraform plan -input=false -out=private-cloud.tfplan
   terraform apply -input=false -auto-approve private-cloud.tfplan
