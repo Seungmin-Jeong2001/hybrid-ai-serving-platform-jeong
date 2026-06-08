@@ -4,7 +4,7 @@
 set -eu
 
 require_env() {
-  var_name="$1"
+  var_name="$1" 
   eval "var_value=\${$var_name:-}"
   if [ -z "$var_value" ]; then
     echo "$var_name must be set." >&2
@@ -47,7 +47,16 @@ if [ "${MSK_TOPIC_REPLICATION_FACTOR}" -lt 1 ]; then
   exit 1
 fi
 
-topic_configs_b64="$(printf '%s' "$MSK_TOPIC_CONFIGS_JSON" | jq -r 'to_entries | map("\(.key)=\(.value)") | join("\n")' | base64 | tr -d '\n')"
+#topic_configs_b64="$(printf '%s' "$MSK_TOPIC_CONFIGS_JSON" | jq -r 'to_entries | map("\(.key)=\(.value)") | join("\n")' | base64 | tr -d '\n')"
+topic_configs_raw="$(printf '%s' "$MSK_TOPIC_CONFIGS_JSON" \
+  | jq -r 'to_entries | map("\(.key)=\(.value|tostring)") | join("\n")')"
+
+echo "topic_configs_raw:"
+printf '%s\n' "$topic_configs_raw"
+
+topic_configs_b64="$(printf '%s' "$topic_configs_raw" | base64 | tr -d '\n')"
+
+echo "topic_configs_b64=$topic_configs_b64"
 
 printf '%s' "$MSK_TOPICS_JSON" | jq -r 'to_entries[] | @base64' | while IFS= read -r entry; do
   topic_name="$(printf '%s' "$entry" | base64 -d | jq -r '.key')"
