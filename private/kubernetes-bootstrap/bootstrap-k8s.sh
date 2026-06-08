@@ -250,6 +250,27 @@ kubernetes_server_ready() {
   ssh_node "$host" 'test -f /etc/kubernetes/admin.conf && sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw=/readyz >/dev/null 2>&1'
 }
 
+kubernetes_worker_active() {
+  local host="$1"
+
+  ssh_node "$host" 'test -f /etc/kubernetes/kubelet.conf && systemctl is-active --quiet kubelet'
+}
+
+reboot_node_if_required() {
+  local host="$1"
+  local name="$2"
+
+  if ! ssh_node "$host" 'test -f /var/run/reboot-required'; then
+    return
+  fi
+
+  info "Rebooting ${name} to load provisioned kernel before Kubernetes join"
+  ssh_node "$host" 'sudo nohup sh -c "sleep 2; reboot" >/dev/null 2>&1 &' || true
+  sleep 10
+  wait_for_ssh "$host" "$name"
+  ssh_node "$host" 'cloud-init status --wait >/dev/null 2>&1 || true'
+}
+
 prepare_kubernetes_node() {
   local host="$1"
   local name="$2"
@@ -399,7 +420,13 @@ install_k8s_control_plane_init() {
   local api_endpoint="$4"
   local api_san
 
+  if kubernetes_server_ready "$host"; then
+    info "ok: Kubernetes already installed on ${name}"
+    return
+  fi
+
   prepare_kubernetes_node "$host" "$name"
+  reboot_node_if_required "$host" "$name"
   if kubernetes_server_ready "$host"; then
     info "ok: Kubernetes already installed on ${name}"
     return
@@ -447,14 +474,119 @@ REMOTE
 create_worker_join_command() {
   local host="$1"
 
-  ssh_node "$host" 'sudo kubeadm token create --print-join-command'
+  create_join_command_with_retry "$host" worker
 }
 
 create_control_plane_join_command() {
   local host="$1"
 
-  # shellcheck disable=SC2016
-  ssh_node "$host" 'certificate_key="$(sudo kubeadm init phase upload-certs --upload-certs | tail -n 1)"; sudo kubeadm token create --print-join-command --certificate-key "$certificate_key"'
+  create_join_command_with_retry "$host" control-plane
+}
+
+extract_kubeadm_join_command() {
+  awk '/^kubeadm[[:space:]]+join[[:space:]]/ { line=$0 } END { print line }'
+}
+
+redact_join_output() {
+  sed -E \
+    -e 's/(--token )[[:alnum:]._-]+/\1<redacted>/g' \
+    -e 's/(--certificate-key )[[:xdigit:]]+/\1<redacted>/g' \
+    -e 's/(sha256:)[[:xdigit:]]+/\1<redacted>/g'
+}
+
+base64_one_line() {
+  printf '%s' "$1" | base64 | tr -d '\n'
+}
+
+is_valid_worker_join_command() {
+  local join_command="$1"
+
+  [[ "$join_command" == kubeadm\ join\ * ]] || return 1
+  [[ "$join_command" == *" --token "* ]] || return 1
+  [[ "$join_command" == *" --discovery-token-ca-cert-hash "* ]] || return 1
+}
+
+is_valid_control_plane_join_command() {
+  local join_command="$1"
+
+  is_valid_worker_join_command "$join_command" || return 1
+  [[ "$join_command" == *" --control-plane"* ]] || return 1
+  [[ "$join_command" == *" --certificate-key "* ]] || return 1
+}
+
+request_join_command() {
+  local host="$1"
+  local role="$2"
+
+  case "$role" in
+    worker)
+      ssh_node "$host" 'sudo kubeadm token create --ttl 2h --print-join-command'
+      ;;
+    control-plane)
+      # shellcheck disable=SC2016
+      ssh_node "$host" 'certificate_key="$(sudo kubeadm init phase upload-certs --upload-certs | awk '"'"'NF { line=$0 } END { print line }'"'"')"; test -n "$certificate_key"; sudo kubeadm token create --ttl 2h --print-join-command --certificate-key "$certificate_key"'
+      ;;
+    *)
+      die "unknown Kubernetes join command role: ${role}"
+      ;;
+  esac
+}
+
+create_join_command_with_retry() {
+  local host="$1"
+  local role="$2"
+  local attempt
+  local output
+  local join_command
+  local attempts="${HA_K8S_JOIN_COMMAND_ATTEMPTS:-12}"
+  local retry_seconds="${HA_K8S_JOIN_COMMAND_RETRY_SECONDS:-10}"
+
+  if ! [[ "$attempts" =~ ^[0-9]+$ ]] || [[ "$attempts" -lt 1 ]]; then
+    attempts=12
+  fi
+  if ! [[ "$retry_seconds" =~ ^[0-9]+$ ]] || [[ "$retry_seconds" -lt 1 ]]; then
+    retry_seconds=10
+  fi
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    output="$(request_join_command "$host" "$role" 2>&1 || true)"
+    join_command="$(printf '%s\n' "$output" | extract_kubeadm_join_command)"
+
+    case "$role" in
+      worker)
+        if is_valid_worker_join_command "$join_command"; then
+          printf '%s\n' "$join_command"
+          return 0
+        fi
+        ;;
+      control-plane)
+        if is_valid_control_plane_join_command "$join_command"; then
+          printf '%s\n' "$join_command"
+          return 0
+        fi
+        ;;
+    esac
+
+    printf 'Waiting for valid Kubernetes %s join command from %s (%s/%s)\n' "$role" "$host" "$attempt" "$attempts" >&2
+    if [[ -n "$output" ]]; then
+      printf '%s\n' "$output" | redact_join_output | sed 's/^/  /' >&2
+    fi
+    sleep "$retry_seconds"
+  done
+
+  ssh_node "$host" 'sudo kubeadm token list || true; sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide || true' >&2 || true
+  die "failed to create a valid Kubernetes ${role} join command from ${host}"
+}
+
+forget_kubernetes_node() {
+  local host="$1"
+  local name="$2"
+
+  ssh_node "$host" bash -s -- "$name" <<'REMOTE'
+set -euo pipefail
+node_name="$1"
+sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf delete node "$node_name" --ignore-not-found --wait=false >/dev/null
+REMOTE
 }
 
 install_k8s_control_plane_join() {
@@ -462,30 +594,45 @@ install_k8s_control_plane_join() {
   local name="$2"
   local advertise_ip="$3"
   local join_command="$4"
+  local join_command_b64
+
+  is_valid_control_plane_join_command "$join_command" || die "invalid Kubernetes control-plane join command for ${name}"
+  join_command_b64="$(base64_one_line "$join_command")"
+  if kubernetes_server_ready "$host"; then
+    info "ok: Kubernetes already installed on ${name}"
+    return
+  fi
 
   prepare_kubernetes_node "$host" "$name"
+  reboot_node_if_required "$host" "$name"
   if kubernetes_server_ready "$host"; then
     info "ok: Kubernetes already installed on ${name}"
     return
   fi
 
   info "Joining Kubernetes control-plane: ${name}"
-  ssh_node "$host" bash -s -- "$name" "$advertise_ip" "$join_command" "$(ignore_preflight_arg)" <<'REMOTE'
+  ssh_node "$host" bash -s -- "$name" "$advertise_ip" "$join_command_b64" "$(ignore_preflight_arg)" <<'REMOTE'
 set -euo pipefail
 node_name="$1"
 advertise_ip="$2"
-join_command="$3"
+join_command="$(printf '%s' "$3" | base64 -d)"
 ignore_preflight="$4"
+read -r -a join_args <<<"$join_command"
+
+if [[ "${#join_args[@]}" -lt 2 || "${join_args[0]}" != "kubeadm" || "${join_args[1]}" != "join" ]]; then
+  echo "invalid Kubernetes control-plane join command for ${node_name}" >&2
+  exit 1
+fi
 
 if [[ -f /etc/kubernetes/kubelet.conf || -f /etc/kubernetes/admin.conf ]]; then
   sudo kubeadm reset -f || true
 fi
 
+join_args+=(--node-name "$node_name" --apiserver-advertise-address "$advertise_ip")
 if [[ -n "$ignore_preflight" ]]; then
-  sudo ${join_command} --control-plane --node-name "$node_name" --apiserver-advertise-address "$advertise_ip" "$ignore_preflight"
-else
-  sudo ${join_command} --control-plane --node-name "$node_name" --apiserver-advertise-address "$advertise_ip"
+  join_args+=("$ignore_preflight")
 fi
+sudo "${join_args[@]}"
 REMOTE
 }
 
@@ -494,30 +641,45 @@ install_k8s_worker() {
   local name="$2"
   local role="$3"
   local join_command="$4"
+  local join_command_b64
+
+  is_valid_worker_join_command "$join_command" || die "invalid Kubernetes worker join command for ${name}"
+  join_command_b64="$(base64_one_line "$join_command")"
+  if kubernetes_worker_active "$host"; then
+    info "ok: Kubernetes worker already joined on ${name}"
+    return
+  fi
 
   prepare_kubernetes_node "$host" "$name"
-  if ssh_node "$host" 'test -f /etc/kubernetes/kubelet.conf && systemctl is-active --quiet kubelet'; then
+  reboot_node_if_required "$host" "$name"
+  if kubernetes_worker_active "$host"; then
     info "ok: Kubernetes worker already joined on ${name}"
     return
   fi
 
   info "Joining Kubernetes worker: ${name}"
-  ssh_node "$host" bash -s -- "$name" "$role" "$join_command" "$(ignore_preflight_arg)" <<'REMOTE'
+  ssh_node "$host" bash -s -- "$name" "$role" "$join_command_b64" "$(ignore_preflight_arg)" <<'REMOTE'
 set -euo pipefail
 node_name="$1"
 role="$2"
-join_command="$3"
+join_command="$(printf '%s' "$3" | base64 -d)"
 ignore_preflight="$4"
+read -r -a join_args <<<"$join_command"
+
+if [[ "${#join_args[@]}" -lt 2 || "${join_args[0]}" != "kubeadm" || "${join_args[1]}" != "join" ]]; then
+  echo "invalid Kubernetes worker join command for ${node_name}" >&2
+  exit 1
+fi
 
 if [[ -f /etc/kubernetes/kubelet.conf ]]; then
   sudo kubeadm reset -f || true
 fi
 
+join_args+=(--node-name "$node_name")
 if [[ -n "$ignore_preflight" ]]; then
-  sudo ${join_command} --node-name "$node_name" "$ignore_preflight"
-else
-  sudo ${join_command} --node-name "$node_name"
+  join_args+=("$ignore_preflight")
 fi
+sudo "${join_args[@]}"
 REMOTE
 }
 
@@ -594,6 +756,14 @@ write_handoff() {
 
 wait_for_kubernetes() {
   local host="$1"
+
+  wait_for_kubernetes_api "$host"
+  ssh_node "$host" 'sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf wait --for=condition=Ready nodes --all --timeout=300s'
+  ssh_node "$host" 'if sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system --no-headers 2>/dev/null | grep -q .; then sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf wait --for=condition=Ready pods --all -n kube-system --timeout=300s; fi'
+}
+
+wait_for_kubernetes_api() {
+  local host="$1"
   local deadline=$((SECONDS + 420))
 
   while (( SECONDS < deadline )); do
@@ -604,8 +774,6 @@ wait_for_kubernetes() {
   done
 
   ssh_node "$host" 'sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw=/readyz >/dev/null'
-  ssh_node "$host" 'sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf wait --for=condition=Ready nodes --all --timeout=300s'
-  ssh_node "$host" 'if sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system --no-headers 2>/dev/null | grep -q .; then sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf wait --for=condition=Ready pods --all -n kube-system --timeout=300s; fi'
 }
 
 main() {
@@ -617,6 +785,8 @@ main() {
   local control_plane_join_command
   local worker_join_command
   local index
+  local needs_control_plane_join=0
+  local needs_worker_join=0
 
   if [[ -z "$OPENSTACK_TF_OUTPUT_JSON" ]]; then
     require_tool terraform
@@ -642,19 +812,41 @@ main() {
 
   wait_for_ssh "$server_target_ip" "$server_name"
   install_k8s_control_plane_init "$server_target_ip" "$server_name" "$server_private_ip" "$api_endpoint"
-  wait_for_kubernetes "$server_target_ip"
+  wait_for_kubernetes_api "$server_target_ip"
 
-  control_plane_join_command="$(create_control_plane_join_command "$server_target_ip")"
-  worker_join_command="$(create_worker_join_command "$server_target_ip")"
+  for index in "${!NODE_ROLES[@]}"; do
+    [[ "$index" != "$first_index" ]] || continue
+    case "${NODE_ROLES[$index]}" in
+      control-plane)
+        needs_control_plane_join=1
+        ;;
+      build-worker|gpu-worker)
+        needs_worker_join=1
+        ;;
+    esac
+  done
+
+  if [[ "$needs_control_plane_join" -eq 1 ]]; then
+    control_plane_join_command="$(create_control_plane_join_command "$server_target_ip")"
+  fi
+  if [[ "$needs_worker_join" -eq 1 ]]; then
+    worker_join_command="$(create_worker_join_command "$server_target_ip")"
+  fi
 
   for index in "${!NODE_ROLES[@]}"; do
     [[ "$index" != "$first_index" ]] || continue
     wait_for_ssh "${NODE_TARGET_IPS[$index]}" "${NODE_NAMES[$index]}"
     case "${NODE_ROLES[$index]}" in
       control-plane)
+        if ! kubernetes_server_ready "${NODE_TARGET_IPS[$index]}"; then
+          forget_kubernetes_node "$server_target_ip" "${NODE_NAMES[$index]}"
+        fi
         install_k8s_control_plane_join "${NODE_TARGET_IPS[$index]}" "${NODE_NAMES[$index]}" "${NODE_PRIVATE_IPS[$index]:-${NODE_TARGET_IPS[$index]}}" "$control_plane_join_command"
         ;;
       build-worker|gpu-worker)
+        if ! kubernetes_worker_active "${NODE_TARGET_IPS[$index]}"; then
+          forget_kubernetes_node "$server_target_ip" "${NODE_NAMES[$index]}"
+        fi
         install_k8s_worker "${NODE_TARGET_IPS[$index]}" "${NODE_NAMES[$index]}" "${NODE_ROLES[$index]}" "$worker_join_command"
         ;;
     esac

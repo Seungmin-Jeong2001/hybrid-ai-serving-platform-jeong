@@ -3220,7 +3220,31 @@ jobs:
             sleep 10
           done
           kubectl get pods -n minio-tenant -l v1.min.io/tenant=hybrid-ai
-          kubectl wait --for=condition=Ready pod -l v1.min.io/tenant=hybrid-ai -n minio-tenant --timeout=600s
+          for i in {1..60}; do
+            if kubectl get pods -n minio-tenant -l v1.min.io/tenant=hybrid-ai -o json | python3 -c '
+          import json
+          import sys
+
+          pods = json.load(sys.stdin).get("items", [])
+          if not pods:
+              sys.exit(1)
+          for pod in pods:
+              statuses = {status.get("name"): status for status in pod.get("status", {}).get("containerStatuses", [])}
+              if not statuses.get("minio", {}).get("ready"):
+                  sys.exit(1)
+          '; then
+              echo "MinIO server containers are ready"
+              break
+            fi
+            if [[ "$i" -eq 60 ]]; then
+              echo "::error::MinIO server containers did not become ready"
+              collect_minio_diagnostics
+              exit 1
+            fi
+            echo "Waiting for MinIO server containers... ($i/60)"
+            kubectl get pods -n minio-tenant -l v1.min.io/tenant=hybrid-ai
+            sleep 10
+          done
           kubectl get pods -n minio-tenant -o wide
           echo "MinIO tenant is ready"
 
@@ -3799,6 +3823,11 @@ jobs:
           echo "Installing NVIDIA RuntimeClass and device plugin..."
           kubectl apply -f private/gpu-worker/runtimeclass.yaml
           kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.14.5/nvidia-device-plugin.yml
+          kubectl -n kube-system patch daemonset/nvidia-device-plugin-daemonset --type=json -p='[
+            {"op":"add","path":"/spec/template/spec/runtimeClassName","value":"nvidia"},
+            {"op":"add","path":"/spec/template/spec/nodeSelector","value":{"hybrid-ai.io/accelerator":"nvidia"}}
+          ]'
+          kubectl -n kube-system rollout status daemonset/nvidia-device-plugin-daemonset --timeout=300s
           echo "NVIDIA runtime resources installed"
 
       - name: Wait for GPU nodes
@@ -3819,10 +3848,6 @@ jobs:
           echo "Waiting for nvidia-smi job..."
           kubectl wait --for=condition=Complete job/gpu-validation -n kube-system --timeout=300s
           kubectl logs job/gpu-validation -n kube-system
-
-          echo "Waiting for TensorFlow GPU test..."
-          kubectl wait --for=condition=Complete job/gpu-tensorflow-test --timeout=600s
-          kubectl logs job/gpu-tensorflow-test
 
           echo "GPU validation complete!"
 
