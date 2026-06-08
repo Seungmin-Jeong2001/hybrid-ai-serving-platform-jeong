@@ -22,16 +22,10 @@ permissions:
 
 jobs:
   apply:
-    name: Apply Foundation
-    uses: ./.github/workflows/private-cloud-foundation.yml
+    name: Remote Apply
+    uses: ./.github/workflows/private-cloud-remote.yml
     with:
-      action: apply
-      install_openstack: true
-      devstack_mode: ${{ inputs.run_mode }}
-      bootstrap_kubernetes: true
-      apply_kubernetes: true
-      setup_storage: true
+      command: apply
+      run_mode: ${{ inputs.run_mode }}
       validate_gpu: ${{ inputs.validate_gpu }}
-      minio_volume_size: "10"
-      force_cleanup: ${{ inputs.run_mode == 'reinstall' }}
     secrets: inherit

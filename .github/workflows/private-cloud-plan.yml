@@ -1,4 +1,4 @@
-name: Private Cloud Plan
+name: Private Cloud CI
 
 on:
   push:
@@ -6,9 +6,12 @@ on:
       - feature/private
     paths:
       - .github/workflows/private-cloud-foundation.yml
+      - .github/workflows/private-cloud-remote.yml
       - .github/workflows/private-cloud-plan.yml
       - .github/workflows/private-cloud-apply.yml
       - .github/workflows/private-cloud-destroy.yml
+      - ha
+      - private/ci/**
       - private/openstack/**
       - private/kubernetes-bootstrap/**
       - private/storage/**
@@ -20,16 +23,9 @@ permissions:
   contents: read
 
 jobs:
-  plan:
-    name: Plan Foundation
-    uses: ./.github/workflows/private-cloud-foundation.yml
+  ci:
+    name: Remote CI
+    uses: ./.github/workflows/private-cloud-remote.yml
     with:
-      action: plan
-      install_openstack: true
-      bootstrap_kubernetes: false
-      apply_kubernetes: false
-      setup_storage: false
-      validate_gpu: false
-      minio_volume_size: "10"
-      force_cleanup: false
+      command: ci
     secrets: inherit

@@ -69,7 +69,10 @@ usage() {
 Usage:
   ./ha install [--bin-dir DIR] [--force] [--no-shell-config] [--with-deps]
   ha doctor
+  ha ci
   ha test [--strict] [--terraform-init] [--integration]
+  ha apply [--run-mode apply|reinstall] [--validate-gpu]
+  ha destroy [--cleanup-devstack]
   ha up local|lxd|openstack-local|openstack|openstack-kubernetes|kubernetes|storage|gpu|all [--auto-approve]
   ha prod check
   ha env init|check|path|example|secret-example
@@ -85,7 +88,10 @@ Commands:
   install    Install the Hybrid AI project CLI launcher in the first writable PATH location
   uninstall  Remove the managed launcher
   doctor     Check project layout and local tool availability
+  ci         Run the private-cloud CI script used by GitHub Actions
   test       Run smoke/integration validation without applying changes
+  apply      Run the private-cloud apply script used by GitHub Actions
+  destroy    Run the private-cloud destroy script used by GitHub Actions
   up         Provision local Kubernetes or apply OpenStack/Kubernetes targets
   prod       Check production readiness of the active Kubernetes target
   env        Create or check the local private-cloud env file
@@ -103,6 +109,7 @@ Examples:
   ./ha install --with-deps
   ./ha install --bin-dir /opt/homebrew/bin
   ha doctor
+  ha ci
   ha test
   ha env init
   vi .env
@@ -112,6 +119,9 @@ Examples:
   ha prod check
   ha explain
   ha completion zsh
+  ha apply --run-mode apply
+  ha apply --run-mode reinstall
+  ha destroy
   ha up all --auto-approve
   ha prod check
   ha up openstack-local --auto-approve
@@ -233,6 +243,9 @@ required_project_paths() {
   printf '%s\n' \
     "${HA_OPENSTACK_DIR}/main.tf" \
     "${HA_OPENSTACK_DIR}/variables.tf" \
+    "${HA_PROJECT_ROOT}/private/ci/private-cloud-ci.sh" \
+    "${HA_PROJECT_ROOT}/private/ci/private-cloud-apply.sh" \
+    "${HA_PROJECT_ROOT}/private/ci/private-cloud-destroy.sh" \
     "${HA_OPENSTACK_BOOTSTRAP_DIR}/bootstrap-k8s.sh" \
     "${HA_REVERSE_PROXY_DIR}/Caddyfile" \
     "${HA_REVERSE_PROXY_DIR}/cloudflare_dns.py" \
@@ -400,13 +413,16 @@ zstyle ':completion:*' verbose yes
 bindkey '^I' complete-word 2>/dev/null || true
 
 _ha() {
-  local -a commands install_opts uninstall_opts test_opts up_targets up_opts prod_actions k8s_actions k8s_targets completion_shells env_actions proxy_actions proxy_profiles terraform_commands
+  local -a commands install_opts uninstall_opts test_opts apply_opts destroy_opts up_targets up_opts prod_actions k8s_actions k8s_targets completion_shells env_actions proxy_actions proxy_profiles terraform_commands
 
   commands=(
     'install:install launcher and optional dependencies'
     'uninstall:remove managed launcher'
     'doctor:check project layout and local tools'
+    'ci:run GitHub Actions private-cloud CI script'
     'test:run smoke or integration validation'
+    'apply:run GitHub Actions private-cloud apply script'
+    'destroy:run GitHub Actions private-cloud destroy script'
     'up:apply OpenStack Terraform or Kubernetes manifests'
     'prod:check production readiness'
     'production:alias for prod'
@@ -438,6 +454,11 @@ _ha() {
     '--terraform-init:download providers and run terraform validate'
     '--integration:run terraform plan and Kubernetes server dry-run'
   )
+  apply_opts=(
+    '--run-mode:apply from existing DevStack or reinstall DevStack first'
+    '--validate-gpu:run GPU validation after apply'
+  )
+  destroy_opts=('--cleanup-devstack:remove local DevStack container after Terraform destroy')
   up_targets=(local lxd server openstack-local devstack openstack openstack-kubernetes openstack-k8s terraform kubernetes foundation base storage gpu gpu-worker k8s all)
   up_opts=('--auto-approve:apply OpenStack Terraform without prompting')
   prod_actions=(check)
@@ -471,6 +492,19 @@ _ha() {
       ;;
     test)
       _describe -t options 'test option' test_opts
+      ;;
+    ci)
+      _describe -t options 'ci option' test_opts
+      ;;
+    apply)
+      if [[ "${words[CURRENT-1]}" == "--run-mode" ]]; then
+        _values 'run mode' apply reinstall
+      else
+        _describe -t options 'apply option' apply_opts
+      fi
+      ;;
+    destroy)
+      _describe -t options 'destroy option' destroy_opts
       ;;
     up)
       if (( CURRENT == 3 )); then
@@ -2602,6 +2636,31 @@ run_tests() {
   die "local tests failed"
 }
 
+run_private_cloud_ci() {
+  local script="${HA_PROJECT_ROOT}/private/ci/private-cloud-ci.sh"
+
+  if [[ -x "$script" ]]; then
+    "$script" "$@"
+    return
+  fi
+
+  run_tests --terraform-init "$@"
+}
+
+run_private_cloud_apply() {
+  local script="${HA_PROJECT_ROOT}/private/ci/private-cloud-apply.sh"
+
+  [[ -x "$script" ]] || die "missing executable private cloud apply script: ${script#${HA_PROJECT_ROOT}/}"
+  "$script" "$@"
+}
+
+run_private_cloud_destroy() {
+  local script="${HA_PROJECT_ROOT}/private/ci/private-cloud-destroy.sh"
+
+  [[ -x "$script" ]] || die "missing executable private cloud destroy script: ${script#${HA_PROJECT_ROOT}/}"
+  "$script" "$@"
+}
+
 require_openstack_env() {
   if ! test_integration_env; then
     cat >&2 <<'EOF'
@@ -3195,6 +3254,9 @@ main() {
     doctor)
       doctor
       ;;
+    ci)
+      run_private_cloud_ci "$@"
+      ;;
     explain|guide)
       explain
       ;;
@@ -3203,6 +3265,12 @@ main() {
       ;;
     test)
       run_tests "$@"
+      ;;
+    apply)
+      run_private_cloud_apply "$@"
+      ;;
+    destroy)
+      run_private_cloud_destroy "$@"
       ;;
     up)
       run_up "$@"

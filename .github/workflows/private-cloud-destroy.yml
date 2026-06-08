@@ -14,15 +14,9 @@ permissions:
 
 jobs:
   destroy:
-    name: Destroy Foundation
-    uses: ./.github/workflows/private-cloud-foundation.yml
+    name: Remote Destroy
+    uses: ./.github/workflows/private-cloud-remote.yml
     with:
-      action: destroy
-      install_openstack: true
-      bootstrap_kubernetes: false
-      apply_kubernetes: false
-      setup_storage: false
-      validate_gpu: false
-      minio_volume_size: "10"
-      force_cleanup: ${{ inputs.cleanup_devstack }}
+      command: destroy
+      cleanup_devstack: ${{ inputs.cleanup_devstack }}
     secrets: inherit
