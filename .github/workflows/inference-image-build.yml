@@ -1,3 +1,5 @@
+# inference-api와 inference-worker 이미지를 빌드하고 Amazon ECR에 푸시하는 워크플로우
+
 name: Inference Image Build
 
 on:

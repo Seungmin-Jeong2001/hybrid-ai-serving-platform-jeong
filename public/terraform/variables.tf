@@ -127,7 +127,7 @@ variable "eks_node_groups" {
       instance_types = ["m7i-flex.large"] # ["t3.medium"]
       az_count       = 2
       desired_size   = 1 # original: 2
-      min_size       = 2
+      min_size       = 1 # original: 2
       max_size       = 3
       labels         = { workload = "system" }
       taints         = []
