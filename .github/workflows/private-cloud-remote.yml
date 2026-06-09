@@ -22,17 +22,28 @@ on:
         required: false
         type: boolean
         default: false
+      phases:
+        description: Which apply phase group to run (provision|platform|registry|finalize|all)
+        required: false
+        type: string
+        default: all
+      do_checkout:
+        description: Fetch and checkout the target commit on the host (entry job only)
+        required: false
+        type: boolean
+        default: true
+      do_cleanup:
+        description: Restore the original git ref and remove env files after run (final job only)
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
-concurrency:
-  group: private-cloud-foundation
-  cancel-in-progress: false
-
 jobs:
   remote:
-    name: Run ha ${{ inputs.command }} over SSH
+    name: ${{ inputs.phases }} (${{ inputs.command }})
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
@@ -139,6 +150,8 @@ jobs:
             dns_services="${dns_services},harbor"
           fi
           write_env PRIVATE_CLOUD_DNS_SERVICES "$dns_services"
+          write_env PRIVATE_CLOUD_PROXY_ENABLED "$PRIVATE_CLOUD_PROXY_ENABLED"
+          write_env PRIVATE_CLOUD_PROXY_TLS_MODE "$PRIVATE_CLOUD_PROXY_TLS_MODE"
 
           write_env TF_BACKEND_CONFIG "$TF_BACKEND_CONFIG"
           write_env TF_BACKEND_TYPE "$TF_BACKEND_TYPE"
@@ -148,6 +161,11 @@ jobs:
           write_env PRIVATE_CLOUD_SSH_USER "$PRIVATE_CLOUD_SSH_USER"
           write_env PRIVATE_CLOUD_KUBECONFIG_B64 "$PRIVATE_CLOUD_KUBECONFIG_B64"
           write_env GITLAB_ROOT_PASSWORD "$GITLAB_ROOT_PASSWORD"
+          write_env GITLAB_LOGS_TMPFS "$GITLAB_LOGS_TMPFS"
+          write_env GITLAB_LOGS_TMPFS_SIZE "$GITLAB_LOGS_TMPFS_SIZE"
+          write_env GITLAB_TMPFS_SIZE "$GITLAB_TMPFS_SIZE"
+          write_env GITLAB_DOCKER_LOG_MAX_SIZE "$GITLAB_DOCKER_LOG_MAX_SIZE"
+          write_env GITLAB_DOCKER_LOG_MAX_FILE "$GITLAB_DOCKER_LOG_MAX_FILE"
           write_env HARBOR_ADMIN_PASSWORD "$HARBOR_ADMIN_PASSWORD"
           write_env MINIO_ROOT_PASSWORD "$MINIO_ROOT_PASSWORD"
 
@@ -207,6 +225,8 @@ jobs:
           PRIVATE_CLOUD_TAILSCALE_IP: ${{ vars.PRIVATE_CLOUD_TAILSCALE_IP }}
           PRIVATE_CLOUD_DNS_TTL: ${{ vars.PRIVATE_CLOUD_DNS_TTL || '120' }}
           PRIVATE_CLOUD_DNS_SERVICES: ${{ vars.PRIVATE_CLOUD_DNS_SERVICES || 'openstack,k8s,grafana,argocd,gitlab,harbor' }}
+          PRIVATE_CLOUD_PROXY_ENABLED: ${{ vars.PRIVATE_CLOUD_PROXY_ENABLED || 'true' }}
+          PRIVATE_CLOUD_PROXY_TLS_MODE: ${{ vars.PRIVATE_CLOUD_PROXY_TLS_MODE || 'auto' }}
           TF_BACKEND_CONFIG: ${{ secrets.TF_BACKEND_CONFIG }}
           TF_BACKEND_TYPE: ${{ vars.TF_BACKEND_TYPE || 'local' }}
           PRIVATE_CLOUD_TFVARS: ${{ secrets.PRIVATE_CLOUD_TFVARS }}
@@ -215,6 +235,11 @@ jobs:
           PRIVATE_CLOUD_SSH_USER: ${{ vars.PRIVATE_CLOUD_SSH_USER || 'ubuntu' }}
           PRIVATE_CLOUD_KUBECONFIG_B64: ${{ secrets.PRIVATE_CLOUD_KUBECONFIG_B64 }}
           GITLAB_ROOT_PASSWORD: ${{ secrets.GITLAB_ROOT_PASSWORD }}
+          GITLAB_LOGS_TMPFS: ${{ vars.GITLAB_LOGS_TMPFS || 'true' }}
+          GITLAB_LOGS_TMPFS_SIZE: ${{ vars.GITLAB_LOGS_TMPFS_SIZE || '512m' }}
+          GITLAB_TMPFS_SIZE: ${{ vars.GITLAB_TMPFS_SIZE || '1g' }}
+          GITLAB_DOCKER_LOG_MAX_SIZE: ${{ vars.GITLAB_DOCKER_LOG_MAX_SIZE || '10m' }}
+          GITLAB_DOCKER_LOG_MAX_FILE: ${{ vars.GITLAB_DOCKER_LOG_MAX_FILE || '3' }}
           HARBOR_ADMIN_PASSWORD: ${{ secrets.HARBOR_ADMIN_PASSWORD }}
           MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
           CONTROL_PLANE_IMAGE_NAME: ${{ vars.CONTROL_PLANE_IMAGE_NAME || 'ubuntu-22.04' }}
@@ -262,7 +287,8 @@ jobs:
           if [[ -z "$remote_repo" ]]; then
             remote_repo="/home/${REMOTE_USER}/project/hybrid-ai-serving-platform"
           fi
-          remote_env="${remote_repo}/.ha/ci/github-actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.env"
+          run_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          remote_env="${remote_repo}/.ha/ci/github-actions-${run_id}-${{ inputs.phases }}.env"
 
           ssh_base=(
             ssh
@@ -295,7 +321,11 @@ jobs:
             "${{ inputs.command }}" \
             "${{ inputs.run_mode }}" \
             "${{ inputs.validate_gpu && 'true' || 'false' }}" \
-            "${{ inputs.cleanup_devstack && 'true' || 'false' }}" <<'REMOTE'
+            "${{ inputs.cleanup_devstack && 'true' || 'false' }}" \
+            "${{ inputs.phases }}" \
+            "${{ inputs.do_checkout && 'true' || 'false' }}" \
+            "${{ inputs.do_cleanup && 'true' || 'false' }}" \
+            "$run_id" <<'REMOTE'
           set -euo pipefail
 
           repo="$1"
@@ -306,41 +336,73 @@ jobs:
           run_mode="$6"
           validate_gpu="$7"
           cleanup_devstack="$8"
+          phases="$9"
+          do_checkout="${10}"
+          do_cleanup="${11}"
+          run_id="${12}"
 
           cd "$repo"
-          original_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
-          original_commit="$(git rev-parse HEAD)"
+          ref_file="${repo}/.ha/ci/${run_id}.original-ref"
 
           cleanup() {
             rm -f "$env_file"
-            if [[ -n "$original_branch" ]]; then
-              git checkout -q "$original_branch" >/dev/null 2>&1 || true
-            else
-              git checkout -q "$original_commit" >/dev/null 2>&1 || true
+            if [[ "$do_cleanup" == "true" ]]; then
+              local target=""
+              [[ -f "$ref_file" ]] && target="$(cat "$ref_file" 2>/dev/null || true)"
+              if [[ -n "$target" ]]; then
+                git checkout -q "$target" >/dev/null 2>&1 || true
+              fi
+              rm -f "$ref_file"
+              rm -f "${repo}/.ha/ci/github-actions-${run_id}-"*.env 2>/dev/null || true
             fi
           }
           trap cleanup EXIT
 
-          if ! git diff --quiet || ! git diff --cached --quiet; then
-            git status --short
-            echo "tracked working tree is dirty on the private cloud host; commit or stash before running Actions" >&2
-            exit 1
+          if [[ "$do_checkout" == "true" ]]; then
+            # Entry job: pin the host working tree to the target commit and record
+            # the original ref so the final job can restore it.
+            if ! git diff --quiet || ! git diff --cached --quiet; then
+              git status --short
+              echo "tracked working tree is dirty on the private cloud host; commit or stash before running Actions" >&2
+              exit 1
+            fi
+            mkdir -p "${repo}/.ha/ci"
+            if [[ ! -f "$ref_file" ]]; then
+              original_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+              if [[ -n "$original_branch" ]]; then
+                printf '%s\n' "$original_branch" > "$ref_file"
+              else
+                git rev-parse HEAD > "$ref_file"
+              fi
+            fi
+            git fetch --prune origin "$ref" || git fetch --prune origin "$sha"
+            git checkout -q --detach "$sha"
+          elif [[ "$do_cleanup" == "true" ]]; then
+            # Final job: its purpose is cleanup (runs even if earlier jobs failed),
+            # so do not move or verify the commit — just proceed and clean up on exit.
+            :
+          else
+            # Dependent job: the entry job already pinned the commit. Verify, do not move.
+            current="$(git rev-parse HEAD 2>/dev/null || true)"
+            if [[ "$current" != "$sha" ]]; then
+              echo "host is not on expected commit $sha (HEAD=$current); the provision job must run first" >&2
+              exit 1
+            fi
           fi
-
-          git fetch --prune origin "$ref" || git fetch --prune origin "$sha"
-          git checkout -q --detach "$sha"
 
           set -a
           # shellcheck source=/dev/null
           . "$env_file"
           set +a
 
+          export RUN_ID="${run_id}-${phases}-${command}"
+
           case "$command" in
             ci)
               ./ha ci
               ;;
             apply)
-              args=(apply --run-mode "$run_mode" --require-backend-config)
+              args=(apply --run-mode "$run_mode" --phases "$phases" --require-backend-config)
               if [[ "$validate_gpu" == "true" ]]; then
                 args+=(--validate-gpu)
               fi

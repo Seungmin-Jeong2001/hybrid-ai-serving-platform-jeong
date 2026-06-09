@@ -12,6 +12,12 @@ on:
 permissions:
   contents: read
 
+# Shared with apply so destroy and apply never run against the host at the same
+# time. Destroy is not auto-cancelled (a half-finished destroy is risky).
+concurrency:
+  group: private-cloud-foundation
+  cancel-in-progress: false
+
 jobs:
   destroy:
     name: Remote Destroy

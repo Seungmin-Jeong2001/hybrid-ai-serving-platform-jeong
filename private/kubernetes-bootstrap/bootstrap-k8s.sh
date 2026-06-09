@@ -344,7 +344,9 @@ apt_get() {
     -o Dpkg::Lock::Timeout=900
   )
   for attempt in {1..12}; do
-    wait_for_apt_locks
+    # Best-effort lock wait; do not abort under set -e if it times out, because
+    # apt-get itself waits up to Dpkg::Lock::Timeout for the lock.
+    wait_for_apt_locks || true
     if apt-get "${apt_opts[@]}" "$@"; then
       return 0
     fi
@@ -357,6 +359,13 @@ apt_get() {
 }
 
 wait_for_cloud_init
+
+# Ubuntu's apt-daily / apt-daily-upgrade / unattended-upgrades grab the dpkg lock
+# right after first boot. On a freshly created VM they can hold it for 15+ minutes,
+# which blocks the kubeadm package installs below. Stop them up front so the lock
+# clears quickly (apt_get still tolerates a transient lock via Dpkg::Lock::Timeout).
+systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service >/dev/null 2>&1 || true
 
 cat >/etc/apt/apt.conf.d/99hybrid-ai-force-ipv4 <<'EOF'
 Acquire::ForceIPv4 "true";

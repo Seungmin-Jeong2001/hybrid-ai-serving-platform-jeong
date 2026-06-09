@@ -50,7 +50,15 @@ fail_status() {
 }
 trap fail_status EXIT
 
+stop_periodic_apt() {
+  # Ubuntu's apt-daily / apt-daily-upgrade / unattended-upgrades hold the dpkg
+  # lock right after boot; stop them so this bootstrap's apt calls are not blocked.
+  systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+  systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service >/dev/null 2>&1 || true
+}
+
 wait_for_apt_locks() {
+  stop_periodic_apt
   local deadline=$((SECONDS + 900))
   local locks=(
     /var/lib/dpkg/lock
@@ -132,7 +140,8 @@ ensure_packages() {
   )
   if ! has_required_packages; then
     wait_for_install_egress
-    wait_for_apt_locks
+    # Best-effort lock wait; apt-get itself waits up to Dpkg::Lock::Timeout.
+    wait_for_apt_locks || true
     apt-get "${apt_get_common[@]}" update -qq
     apt-get "${apt_get_common[@]}" install -y -qq ca-certificates curl docker.io openssh-server python3 tzdata
   fi
@@ -182,6 +191,23 @@ ensure_swap() {
   fi
 }
 
+ensure_gitlab_io_layout() {
+  local logs_tmpfs="${GITLAB_LOGS_TMPFS:-true}"
+  local logs_tmpfs_size="${GITLAB_LOGS_TMPFS_SIZE:-512m}"
+
+  install -d -m 0755 /srv/gitlab/config /srv/gitlab/logs /srv/gitlab/data
+  if [[ "$logs_tmpfs" == "true" ]]; then
+    if ! mountpoint -q /srv/gitlab/logs; then
+      mount -t tmpfs -o "rw,nosuid,nodev,noatime,size=${logs_tmpfs_size},mode=0755" tmpfs /srv/gitlab/logs
+    fi
+    if grep -qE '^[^#][[:space:]]+/srv/gitlab/logs[[:space:]]+tmpfs[[:space:]]+' /etc/fstab; then
+      sed -i "s|^[^#][[:space:]]\\+/srv/gitlab/logs[[:space:]]\\+tmpfs[[:space:]].*|tmpfs /srv/gitlab/logs tmpfs rw,nosuid,nodev,noatime,size=${logs_tmpfs_size},mode=0755 0 0|" /etc/fstab
+    else
+      printf 'tmpfs /srv/gitlab/logs tmpfs rw,nosuid,nodev,noatime,size=%s,mode=0755 0 0\n' "$logs_tmpfs_size" >> /etc/fstab
+    fi
+  fi
+}
+
 write_omnibus_config() {
   install -d -m 0755 /srv/gitlab/config /srv/gitlab/logs /srv/gitlab/data
   if [[ -s "${GITLAB_ROOT_PASSWORD_FILE:-}" && ! -s /srv/gitlab/config/root_password ]]; then
@@ -198,11 +224,26 @@ nginx['listen_port'] = 80
 nginx['listen_https'] = false
 gitlab_rails['gitlab_shell_ssh_port'] = 2222
 gitlab_rails['usage_ping_enabled'] = false
+gitlab_rails['log_level'] = 'warn'
 gitlab_rails['time_zone'] = 'UTC'
 puma['worker_processes'] = 1
 puma['min_threads'] = 2
 puma['max_threads'] = 3
 sidekiq['concurrency'] = 1
+logging['svlogd_size'] = 10 * 1024 * 1024
+logging['svlogd_num'] = 3
+logging['svlogd_timeout'] = 24 * 60 * 60
+nginx['access_log_enabled'] = false
+nginx['error_log_level'] = 'warn'
+postgresql['shared_buffers'] = '256MB'
+postgresql['checkpoint_timeout'] = '15min'
+postgresql['checkpoint_completion_target'] = 0.9
+postgresql['max_wal_size'] = '1GB'
+postgresql['min_wal_size'] = '80MB'
+postgresql['log_checkpoints'] = false
+postgresql['log_statement'] = 'none'
+postgresql['log_min_duration_statement'] = -1
+redis['loglevel'] = 'warning'
 prometheus_monitoring['enable'] = false
 prometheus['enable'] = false
 alertmanager['enable'] = false
@@ -278,6 +319,10 @@ ensure_container() {
       --publish 2222:22 \
       --name gitlab \
       --restart unless-stopped \
+      --log-driver local \
+      --log-opt "max-size=${GITLAB_DOCKER_LOG_MAX_SIZE:-10m}" \
+      --log-opt "max-file=${GITLAB_DOCKER_LOG_MAX_FILE:-3}" \
+      --tmpfs "/tmp:rw,nosuid,nodev,size=${GITLAB_TMPFS_SIZE:-1g}" \
       --volume /srv/gitlab/config:/etc/gitlab \
       --volume /srv/gitlab/logs:/var/log/gitlab \
       --volume /srv/gitlab/data:/var/opt/gitlab \
@@ -718,6 +763,7 @@ main() {
   ensure_apt_config
   ensure_packages
   ensure_swap
+  ensure_gitlab_io_layout
   for package in gitlab-ce gitlab-ee; do
     local package_status=""
     package_status="$(dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null || true)"

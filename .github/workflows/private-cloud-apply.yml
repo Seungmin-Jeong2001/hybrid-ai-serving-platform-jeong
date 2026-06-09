@@ -20,12 +20,63 @@ on:
 permissions:
   contents: read
 
+# Run-level exclusivity (shared with destroy). A newer apply cancels a stalled
+# older run; the provision job additionally clears any orphaned host processes.
+concurrency:
+  group: private-cloud-foundation
+  cancel-in-progress: true
+
 jobs:
-  apply:
-    name: Remote Apply
+  # Entry job: pins the host commit, then runs tools/devstack/images/terraform.
+  provision:
+    name: Provision
     uses: ./.github/workflows/private-cloud-remote.yml
     with:
       command: apply
       run_mode: ${{ inputs.run_mode }}
+      phases: provision
+      do_checkout: true
+      do_cleanup: false
+    secrets: inherit
+
+  # Kubernetes chain: bootstrap → storage → model-build platform.
+  platform:
+    name: Platform (k8s)
+    needs: provision
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.run_mode }}
+      phases: platform
+      do_checkout: false
+      do_cleanup: false
+    secrets: inherit
+
+  # Registry services: gitlab and harbor (parallel internally). Independent of k8s,
+  # so it runs in parallel with the platform job.
+  registry:
+    name: Registry (gitlab + harbor)
+    needs: provision
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.run_mode }}
+      phases: registry
+      do_checkout: false
+      do_cleanup: false
+    secrets: inherit
+
+  # Final job: optional GPU validation, then restore the host git ref and clean env files.
+  finalize:
+    name: Finalize
+    needs: [platform, registry]
+    if: always()
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.run_mode }}
+      phases: finalize
       validate_gpu: ${{ inputs.validate_gpu }}
+      do_checkout: false
+      do_cleanup: true
     secrets: inherit

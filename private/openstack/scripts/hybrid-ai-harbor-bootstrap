@@ -45,7 +45,15 @@ fail_status() {
 }
 trap fail_status EXIT
 
+stop_periodic_apt() {
+  # Ubuntu's apt-daily / apt-daily-upgrade / unattended-upgrades hold the dpkg
+  # lock right after boot; stop them so this bootstrap's apt calls are not blocked.
+  systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+  systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service >/dev/null 2>&1 || true
+}
+
 wait_for_apt_locks() {
+  stop_periodic_apt
   local deadline=$((SECONDS + 900))
   local locks=(
     /var/lib/dpkg/lock
@@ -87,7 +95,8 @@ apt_get() {
   )
 
   for attempt in {1..12}; do
-    wait_for_apt_locks
+    # Best-effort lock wait; apt-get itself waits up to Dpkg::Lock::Timeout.
+    wait_for_apt_locks || true
     if apt-get "${apt_opts[@]}" "$@"; then
       return 0
     fi

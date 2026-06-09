@@ -71,7 +71,7 @@ Usage:
   ha doctor
   ha ci
   ha test [--strict] [--terraform-init] [--integration]
-  ha apply [--run-mode apply|reinstall] [--validate-gpu] [--require-backend-config]
+  ha apply [--run-mode apply|reinstall] [--phases provision|platform|registry|finalize|all] [--validate-gpu] [--require-backend-config]
   ha destroy [--cleanup-devstack] [--require-backend-config]
   ha up local|lxd|openstack-local|openstack|openstack-kubernetes|kubernetes|storage|gpu|all [--auto-approve]
   ha prod check
@@ -248,6 +248,7 @@ required_project_paths() {
     "${HA_PROJECT_ROOT}/private/ci/private-cloud-destroy.sh" \
     "${HA_OPENSTACK_BOOTSTRAP_DIR}/bootstrap-k8s.sh" \
     "${HA_REVERSE_PROXY_DIR}/Caddyfile" \
+    "${HA_REVERSE_PROXY_DIR}/Caddyfile.internal-tls" \
     "${HA_REVERSE_PROXY_DIR}/cloudflare_dns.py" \
     "${HA_PROJECT_ROOT}/private/kubernetes/kustomization.yaml" \
     "${HA_PROJECT_ROOT}/private/storage/kustomization.yaml" \

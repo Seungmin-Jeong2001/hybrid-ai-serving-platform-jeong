@@ -5,6 +5,7 @@ IFS=$'\n\t'
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MODE="${HA_PRIVATE_CLOUD_RUN_MODE:-apply}"
 VALIDATE_GPU="${HA_PRIVATE_CLOUD_VALIDATE_GPU:-false}"
+PHASES="${HA_PRIVATE_CLOUD_PHASES:-all}"
 REQUIRE_BACKEND_CONFIG=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -17,6 +18,11 @@ while [[ $# -gt 0 ]]; do
       MODE="$2"
       shift 2
       ;;
+    --phases)
+      [[ $# -ge 2 ]] || { printf 'missing value for --phases\n' >&2; exit 64; }
+      PHASES="$2"
+      shift 2
+      ;;
     --validate-gpu)
       VALIDATE_GPU=true
       shift
@@ -26,7 +32,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     -h|--help)
-      printf 'usage: ha apply [--run-mode apply|reinstall] [--validate-gpu] [--require-backend-config]\n'
+      printf 'usage: ha apply [--run-mode apply|reinstall] [--phases provision|platform|registry|finalize|all] [--validate-gpu] [--require-backend-config]\n'
       exit 0
       ;;
     *)
@@ -40,6 +46,14 @@ case "$MODE" in
   apply|reinstall) ;;
   *)
     printf 'run mode must be apply or reinstall\n' >&2
+    exit 64
+    ;;
+esac
+
+case "$PHASES" in
+  provision|platform|registry|finalize|all) ;;
+  *)
+    printf 'phases must be one of: provision, platform, registry, finalize, all\n' >&2
     exit 64
     ;;
 esac
@@ -129,6 +143,11 @@ GITLAB_ADMIN_USERNAME="${GITLAB_ADMIN_USERNAME:-root}"
 GITLAB_GPU_RUNNER_NAME_PREFIX="${GITLAB_GPU_RUNNER_NAME_PREFIX:-hybrid-ai-gpu}"
 GITLAB_GPU_RUNNER_TAGS="${GITLAB_GPU_RUNNER_TAGS:-gpu-worker}"
 GITLAB_UPSTREAM_PORT="${GITLAB_UPSTREAM_PORT:-18083}"
+GITLAB_LOGS_TMPFS="${GITLAB_LOGS_TMPFS:-true}"
+GITLAB_LOGS_TMPFS_SIZE="${GITLAB_LOGS_TMPFS_SIZE:-512m}"
+GITLAB_TMPFS_SIZE="${GITLAB_TMPFS_SIZE:-1g}"
+GITLAB_DOCKER_LOG_MAX_SIZE="${GITLAB_DOCKER_LOG_MAX_SIZE:-10m}"
+GITLAB_DOCKER_LOG_MAX_FILE="${GITLAB_DOCKER_LOG_MAX_FILE:-3}"
 HARBOR_INSTALL_ENABLED="${HARBOR_INSTALL_ENABLED:-true}"
 HARBOR_DOMAIN="${HARBOR_DOMAIN:-harbor.${PRIVATE_CLOUD_BASE_DOMAIN}}"
 HARBOR_EXTERNAL_URL="${HARBOR_EXTERNAL_URL:-https://${HARBOR_DOMAIN}}"
@@ -139,6 +158,8 @@ HARBOR_HTTP_PORT="${HARBOR_HTTP_PORT:-80}"
 HARBOR_UPSTREAM_PORT="${HARBOR_UPSTREAM_PORT:-18084}"
 HARBOR_BOOTSTRAP_WAIT_SECONDS="${HARBOR_BOOTSTRAP_WAIT_SECONDS:-1800}"
 HARBOR_ADMIN_PASSWORD="${HARBOR_ADMIN_PASSWORD:-}"
+PRIVATE_CLOUD_PROXY_ENABLED="${PRIVATE_CLOUD_PROXY_ENABLED:-true}"
+PRIVATE_CLOUD_PROXY_TLS_MODE="${PRIVATE_CLOUD_PROXY_TLS_MODE:-auto}"
 ARGO_WORKFLOWS_INSTALL_ENABLED="${ARGO_WORKFLOWS_INSTALL_ENABLED:-true}"
 ARGO_WORKFLOWS_INSTALL_MANIFEST="${ARGO_WORKFLOWS_INSTALL_MANIFEST:-https://github.com/argoproj/argo-workflows/releases/download/v3.7.14/install.yaml}"
 MINIO_VOLUME_SIZE="${MINIO_VOLUME_SIZE:-10}"
@@ -184,31 +205,47 @@ write_systemd_env_line() {
 phase() {
   local name="$1"
   shift
-  local start end rc log_file
+  local start end rc log_file parallel grouped
   log_file="${LOG_DIR}/${name}.log"
+  parallel="${_PHASE_PARALLEL:-0}"
+  grouped=0
+  [[ "${GITHUB_ACTIONS:-}" == "true" && "${parallel}" != "1" ]] && grouped=1
   start="$(date +%s)"
+  if [[ "${grouped}" -eq 1 ]]; then
+    printf '::group::%s\n' "${name}"
+  fi
   log "START ${name}"
+  # Stream phase output to both the console (live progress) and the per-phase log.
+  # Parallel phases prefix each line with the phase name so interleaved output stays readable.
   set +e
-  ( set -Eeuo pipefail; "$@" ) >"${log_file}" 2>&1
-  rc="$?"
+  if [[ "${parallel}" == "1" ]]; then
+    ( set -Eeuo pipefail; "$@" ) 2>&1 | sed "s/^/[${name}] /" | tee "${log_file}"
+  else
+    ( set -Eeuo pipefail; "$@" ) 2>&1 | tee "${log_file}"
+  fi
+  rc="${PIPESTATUS[0]}"
   set -e
+  end="$(date +%s)"
   if [[ "${rc}" -eq 0 ]]; then
-    end="$(date +%s)"
     printf '%s\t%s\tok\n' "${name}" "$((end - start))" >>"${TIMINGS}"
     log "OK ${name} ($((end - start))s)"
-  else
-    end="$(date +%s)"
-    printf '%s\t%s\tfailed\n' "${name}" "$((end - start))" >>"${TIMINGS}"
-    log "FAILED ${name} ($((end - start))s); tail follows from ${log_file}"
-    tail -n 160 "${log_file}" || true
-    return "${rc}"
+    if [[ "${grouped}" -eq 1 ]]; then
+      printf '::endgroup::\n'
+    fi
+    return 0
   fi
+  printf '%s\t%s\tfailed\n' "${name}" "$((end - start))" >>"${TIMINGS}"
+  log "FAILED ${name} ($((end - start))s); see ${log_file}"
+  if [[ "${grouped}" -eq 1 ]]; then
+    printf '::endgroup::\n'
+  fi
+  return "${rc}"
 }
 
 phase_bg() {
   local name="$1"
   shift
-  ( phase "${name}" "$@" ) &
+  ( _PHASE_PARALLEL=1 phase "${name}" "$@" ) &
   printf '%s\n' "$!" >"${LOG_DIR}/${name}.pid"
 }
 
@@ -1396,6 +1433,112 @@ systemctl reload apache2
 CONFIGURE_HORIZON
 }
 
+host_has_caddy_cloudflare_dns() {
+  command -v caddy >/dev/null 2>&1 || return 1
+  caddy list-modules 2>/dev/null | grep -qx 'dns.providers.cloudflare'
+}
+
+install_host_caddy_if_needed() {
+  if command -v caddy >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  sudo systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service >/dev/null 2>&1 || true
+  sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Lock::Timeout=900 update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Lock::Timeout=900 install -y -qq caddy openssl
+}
+
+ensure_internal_tls_certificate() {
+  sudo install -d -m 0755 /etc/hybrid-ai/caddy
+  if sudo test -s /etc/hybrid-ai/caddy/intp.me.crt && sudo test -s /etc/hybrid-ai/caddy/intp.me.key; then
+    return 0
+  fi
+
+  sudo openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+    -keyout /etc/hybrid-ai/caddy/intp.me.key \
+    -out /etc/hybrid-ai/caddy/intp.me.crt \
+    -subj "/CN=*.${PRIVATE_CLOUD_BASE_DOMAIN}" \
+    -addext "subjectAltName=DNS:${PRIVATE_CLOUD_BASE_DOMAIN},DNS:*.${PRIVATE_CLOUD_BASE_DOMAIN}" >/dev/null 2>&1
+  sudo chmod 0644 /etc/hybrid-ai/caddy/intp.me.crt
+  sudo chmod 0640 /etc/hybrid-ai/caddy/intp.me.key
+  sudo chgrp caddy /etc/hybrid-ai/caddy/intp.me.key >/dev/null 2>&1 || true
+}
+
+write_caddy_environment() {
+  local env_file="${LOG_DIR}/caddy.env"
+
+  : >"${env_file}"
+  write_systemd_env_line "${env_file}" HA_CADDY_ACME_EMAIL "admin@${PRIVATE_CLOUD_BASE_DOMAIN}"
+  write_systemd_env_line "${env_file}" HA_OPENSTACK_DOMAIN "openstack.${PRIVATE_CLOUD_BASE_DOMAIN}"
+  write_systemd_env_line "${env_file}" HA_K8S_DOMAIN "k8s.${PRIVATE_CLOUD_BASE_DOMAIN}"
+  write_systemd_env_line "${env_file}" HA_GRAFANA_DOMAIN "grafana.${PRIVATE_CLOUD_BASE_DOMAIN}"
+  write_systemd_env_line "${env_file}" HA_ARGOCD_DOMAIN "argocd.${PRIVATE_CLOUD_BASE_DOMAIN}"
+  write_systemd_env_line "${env_file}" HA_GIT_DOMAIN "${GITLAB_DOMAIN}"
+  write_systemd_env_line "${env_file}" HA_HARBOR_DOMAIN "${HARBOR_DOMAIN}"
+  write_systemd_env_line "${env_file}" HA_OPENSTACK_HORIZON_UPSTREAM "127.0.0.1:18081"
+  write_systemd_env_line "${env_file}" HA_K8S_DASHBOARD_UPSTREAM "127.0.0.1:18082"
+  write_systemd_env_line "${env_file}" HA_GRAFANA_UPSTREAM "127.0.0.1:3000"
+  write_systemd_env_line "${env_file}" HA_ARGOCD_UPSTREAM "127.0.0.1:8080"
+  write_systemd_env_line "${env_file}" HA_GITLAB_UPSTREAM "127.0.0.1:${GITLAB_UPSTREAM_PORT}"
+  write_systemd_env_line "${env_file}" HA_HARBOR_UPSTREAM "127.0.0.1:${HARBOR_UPSTREAM_PORT}"
+  write_systemd_env_line "${env_file}" CLOUDFLARE_API_TOKEN "${CLOUDFLARE_API_TOKEN:-}"
+  sudo install -d -m 0755 /etc/hybrid-ai /etc/systemd/system/caddy.service.d
+  sudo install -m 0640 -o root -g root "${env_file}" /etc/hybrid-ai/caddy.env
+  sudo tee /etc/systemd/system/caddy.service.d/hybrid-ai-env.conf >/dev/null <<'EOF'
+[Service]
+EnvironmentFile=/etc/hybrid-ai/caddy.env
+EOF
+}
+
+setup_reverse_proxy() {
+  local config_path mode
+
+  [[ "${PRIVATE_CLOUD_PROXY_ENABLED}" == "true" ]] || return 0
+  install_host_caddy_if_needed
+  write_caddy_environment
+
+  mode="${PRIVATE_CLOUD_PROXY_TLS_MODE}"
+  if [[ "$mode" == "auto" ]]; then
+    if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] && host_has_caddy_cloudflare_dns; then
+      mode="cloudflare"
+    else
+      mode="internal"
+    fi
+  fi
+
+  case "$mode" in
+    cloudflare)
+      if ! host_has_caddy_cloudflare_dns; then
+        log "warning: Caddy lacks dns.providers.cloudflare; falling back to internal TLS"
+        mode="internal"
+      fi
+      ;;
+    internal)
+      ;;
+    *)
+      printf 'PRIVATE_CLOUD_PROXY_TLS_MODE must be auto, cloudflare, or internal; got: %s\n' "$mode" >&2
+      return 64
+      ;;
+  esac
+
+  if [[ "$mode" == "cloudflare" ]]; then
+    config_path="${ROOT}/private/reverse-proxy/Caddyfile.cloudflare"
+  else
+    ensure_internal_tls_certificate
+    config_path="${ROOT}/private/reverse-proxy/Caddyfile.internal-tls"
+  fi
+
+  sudo install -m 0644 -o root -g root "${config_path}" /etc/caddy/Caddyfile
+  sudo systemctl daemon-reload
+  # shellcheck disable=SC1090
+  set -a; source "${LOG_DIR}/caddy.env"; set +a
+  sudo --preserve-env=HA_CADDY_ACME_EMAIL,HA_OPENSTACK_DOMAIN,HA_K8S_DOMAIN,HA_GRAFANA_DOMAIN,HA_ARGOCD_DOMAIN,HA_GIT_DOMAIN,HA_HARBOR_DOMAIN,HA_OPENSTACK_HORIZON_UPSTREAM,HA_K8S_DASHBOARD_UPSTREAM,HA_GRAFANA_UPSTREAM,HA_ARGOCD_UPSTREAM,HA_GITLAB_UPSTREAM,HA_HARBOR_UPSTREAM,CLOUDFLARE_API_TOKEN \
+    caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+  sudo systemctl enable --now caddy
+  sudo systemctl restart caddy
+  log "reverse proxy ready with ${mode} TLS profile"
+}
+
 devstack_reinstall() {
   local product_id
   create_devstack_container
@@ -2036,6 +2179,11 @@ write_env_line GITLAB_ROOT_PASSWORD_FILE /etc/hybrid-ai/gitlab-root-password
 write_env_line GITLAB_GPU_RUNNER_NAME_PREFIX "$runner_name_prefix"
 write_env_line GITLAB_GPU_RUNNER_TAGS "$runner_tags"
 write_env_line GITLAB_BOOTSTRAP_WAIT_SECONDS "$gitlab_bootstrap_wait_seconds"
+write_env_line GITLAB_LOGS_TMPFS "${GITLAB_LOGS_TMPFS}"
+write_env_line GITLAB_LOGS_TMPFS_SIZE "${GITLAB_LOGS_TMPFS_SIZE}"
+write_env_line GITLAB_TMPFS_SIZE "${GITLAB_TMPFS_SIZE}"
+write_env_line GITLAB_DOCKER_LOG_MAX_SIZE "${GITLAB_DOCKER_LOG_MAX_SIZE}"
+write_env_line GITLAB_DOCKER_LOG_MAX_FILE "${GITLAB_DOCKER_LOG_MAX_FILE}"
 sudo install -m 0644 -o root -g root "$env_file_tmp" /etc/hybrid-ai/gitlab-bootstrap.env
 rm -f "$env_file_tmp"
 sudo tee /etc/systemd/system/hybrid-ai-gitlab-bootstrap.service >/dev/null <<'EOF'
@@ -2132,10 +2280,12 @@ setup_harbor() {
 
   ssh -F "${SSH_CONFIG}" "${target}" bash -s -- \
     "${harbor_env_payload}" \
-    "${admin_password_file}" <<'REMOTE'
+    "${admin_password_file}" \
+    "${HARBOR_HTTP_PORT}" <<'REMOTE'
 set -euo pipefail
 harbor_env_payload="$1"
 harbor_admin_password_file="${2:-}"
+harbor_http_port="${3:-80}"
 
 cleanup() {
   if [[ -n "$harbor_admin_password_file" ]]; then
@@ -2186,9 +2336,10 @@ if ! sudo systemctl start hybrid-ai-harbor-bootstrap.service; then
   exit 1
 fi
 
-source /etc/hybrid-ai/harbor-bootstrap.env
-curl -fsS "http://127.0.0.1:${HARBOR_HTTP_PORT}/api/v2.0/ping" >/dev/null 2>&1 \
-  || curl -fsS "http://127.0.0.1:${HARBOR_HTTP_PORT}/api/v2.0/health" >/dev/null
+# HARBOR_HTTP_PORT comes from the heredoc argument (the env file lives under the
+# root-only 0700 /etc/hybrid-ai and cannot be sourced as the SSH login user).
+curl -fsS "http://127.0.0.1:${harbor_http_port}/api/v2.0/ping" >/dev/null 2>&1 \
+  || curl -fsS "http://127.0.0.1:${harbor_http_port}/api/v2.0/health" >/dev/null
 sudo cat /var/lib/hybrid-ai/harbor-bootstrap/status.env 2>/dev/null || true
 REMOTE
 
@@ -2199,11 +2350,13 @@ REMOTE
   curl -fsS "http://127.0.0.1:${HARBOR_UPSTREAM_PORT}/api/v2.0/ping" >/dev/null 2>&1 \
     || curl -fsS "http://127.0.0.1:${HARBOR_UPSTREAM_PORT}/api/v2.0/health" >/dev/null
 
-  start_kubectl_tunnel
-  export KUBECONFIG="${KUBECONFIG_PATH}"
+  # Persist the kaniko robot credentials to a run-independent path. The k8s pull
+  # secret is created later by the platform phase (setup_model_build_platform),
+  # NOT here: the registry phase runs in parallel with the k8s bootstrap, so it
+  # must not touch the cluster (kubectl would hang waiting for an absent API).
   robot_json="$(ssh -F "${SSH_CONFIG}" "${target}" 'sudo cat /var/lib/hybrid-ai/harbor-bootstrap/kaniko-robot.json')"
-  printf '%s\n' "${robot_json}" >"${LOG_DIR}/harbor-kaniko-robot.json"
-  python3 - "${LOG_DIR}/harbor-kaniko-robot.json" "${HARBOR_EXTERNAL_URL}" >"${LOG_DIR}/harbor-kaniko-robot.env" <<'PY'
+  printf '%s\n' "${robot_json}" >"${ROOT}/.ha/openstack/harbor-kaniko-robot.json"
+  python3 - "${ROOT}/.ha/openstack/harbor-kaniko-robot.json" "${HARBOR_EXTERNAL_URL}" >"${ROOT}/.ha/openstack/harbor-kaniko-robot.env" <<'PY'
 import json
 import shlex
 import sys
@@ -2222,20 +2375,38 @@ print(f"HARBOR_REGISTRY_SERVER={shlex.quote(registry)}")
 print(f"HARBOR_ROBOT_USERNAME={shlex.quote(name)}")
 print(f"HARBOR_ROBOT_TOKEN={shlex.quote(token)}")
 PY
-  # shellcheck disable=SC1090
-  source "${LOG_DIR}/harbor-kaniko-robot.env"
-  kubectl create namespace model-build --dry-run=client -o yaml | kubectl apply -f -
-  kubectl -n model-build create secret docker-registry harbor-kaniko-push \
-    --docker-server="${HARBOR_REGISTRY_SERVER}" \
-    --docker-username="${HARBOR_ROBOT_USERNAME}" \
-    --docker-password="${HARBOR_ROBOT_TOKEN}" \
-    --dry-run=client -o yaml | kubectl apply -f -
 }
 
 setup_model_build_platform() {
   start_kubectl_tunnel
   export KUBECONFIG="${KUBECONFIG_PATH}"
   kubectl apply -k "${ROOT}/private/kubernetes"
+
+  # Create the Harbor kaniko pull/push secret from credentials saved by the
+  # registry phase (setup_harbor). Done here because this is where the cluster
+  # is guaranteed to exist; the registry phase runs in parallel and cannot.
+  local robot_env="${ROOT}/.ha/openstack/harbor-kaniko-robot.env"
+  if optional_apply_phase_enabled "${HA_PRIVATE_CLOUD_SETUP_REGISTRY}"; then
+    # The registry phase runs in parallel with this one; wait up to ~10m for it
+    # to publish the harbor robot credentials before creating the pull secret.
+    local _i
+    for _i in $(seq 1 60); do
+      [[ -f "${robot_env}" ]] && break
+      sleep 10
+    done
+  fi
+  if [[ -f "${robot_env}" ]]; then
+    # shellcheck disable=SC1090
+    source "${robot_env}"
+    kubectl create namespace model-build --dry-run=client -o yaml | kubectl apply -f -
+    kubectl -n model-build create secret docker-registry harbor-kaniko-push \
+      --docker-server="${HARBOR_REGISTRY_SERVER}" \
+      --docker-username="${HARBOR_ROBOT_USERNAME}" \
+      --docker-password="${HARBOR_ROBOT_TOKEN}" \
+      --dry-run=client -o yaml | kubectl apply -f -
+  else
+    echo "warning: harbor robot credentials not found (${robot_env}); skipping harbor-kaniko-push secret" >&2
+  fi
   if [[ "${ARGO_WORKFLOWS_INSTALL_ENABLED}" == "true" ]]; then
     kubectl create namespace argo --dry-run=client -o yaml | kubectl apply -f -
     kubectl apply -n argo -f "${ARGO_WORKFLOWS_INSTALL_MANIFEST}"
@@ -2269,25 +2440,92 @@ setup_registry_services_parallel() {
   return "$rc"
 }
 
-apply_jobs() {
+# Terminate any stale private-cloud-apply.sh processes left over from a previous
+# run (e.g. a GitHub Actions job that was cancelled — the SSH session dies but the
+# remote bash process keeps running as an orphan and holds devstack/terraform).
+# Excludes the current process tree (own PID, parent, and process group).
+terminate_stale_apply_processes() {
+  local script_path self_pid self_ppid self_pgid pids pid victim_pgid
+  script_path="${BASH_SOURCE[0]}"
+  self_pid="$$"
+  self_ppid="$PPID"
+  self_pgid="$(ps -o pgid= -p "$self_pid" 2>/dev/null | tr -d ' ' || true)"
+
+  pids="$(pgrep -f "private-cloud-apply.sh" 2>/dev/null || true)"
+  [[ -n "$pids" ]] || return 0
+
+  local to_kill=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    [[ "$pid" == "$self_pid" || "$pid" == "$self_ppid" ]] && continue
+    victim_pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    [[ -n "$self_pgid" && "$victim_pgid" == "$self_pgid" ]] && continue
+    to_kill+=("$pid")
+  done <<<"$pids"
+
+  [[ "${#to_kill[@]}" -gt 0 ]] || return 0
+  log "terminating ${#to_kill[@]} stale private-cloud-apply process(es): ${to_kill[*]}"
+  kill -TERM "${to_kill[@]}" 2>/dev/null || true
+  sleep 3
+  for pid in "${to_kill[@]}"; do
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  done
+}
+
+# Acquire a per-phase lock so the same phase cannot run twice concurrently on the
+# host. Different phases (platform vs registry) use different lock files so they
+# can run in parallel. Run-level exclusivity is handled by GitHub Actions
+# concurrency; this guards against overlapping local/manual invocations.
+acquire_phase_lock() {
+  local phase_name="$1"
+  local lock_dir lock_file
+  lock_dir="${ROOT}/.ha/ci/locks"
+  mkdir -p "$lock_dir"
+  lock_file="${lock_dir}/${phase_name}.lock"
+  exec {PHASE_LOCK_FD}>"$lock_file"
+  if ! flock -n "$PHASE_LOCK_FD"; then
+    printf 'another "%s" phase is already running on this host (lock: %s)\n' \
+      "$phase_name" "$lock_file" >&2
+    exit 1
+  fi
+}
+
+run_provision_phases() {
+  phase require_tools require_tools
+  if [[ "${MODE}" == "reinstall" ]]; then
+    phase devstack_reinstall devstack_reinstall
+  else
+    phase devstack_apply_check devstack_apply_check
+  fi
+  phase setup_reverse_proxy setup_reverse_proxy
   phase prepare_cached_images prepare_cached_images
   phase terraform_apply terraform_apply
+}
+
+run_platform_phases() {
   phase bootstrap_k8s bootstrap_k8s
   if optional_apply_phase_enabled "${HA_PRIVATE_CLOUD_SETUP_STORAGE}"; then
     phase setup_storage setup_storage
   else
     skip_phase setup_storage "disabled for lightweight Actions stack"
   fi
-  if optional_apply_phase_enabled "${HA_PRIVATE_CLOUD_SETUP_REGISTRY}"; then
-    phase setup_registry_services setup_registry_services_parallel
-  else
-    skip_phase setup_registry_services "disabled for lightweight Actions stack"
-  fi
   if optional_apply_phase_enabled "${HA_PRIVATE_CLOUD_SETUP_MODEL_BUILD}"; then
     phase setup_model_build_platform setup_model_build_platform
   else
     skip_phase setup_model_build_platform "disabled for lightweight Actions stack"
   fi
+}
+
+run_registry_phases() {
+  if optional_apply_phase_enabled "${HA_PRIVATE_CLOUD_SETUP_REGISTRY}"; then
+    phase setup_registry_services setup_registry_services_parallel
+    phase setup_reverse_proxy setup_reverse_proxy
+  else
+    skip_phase setup_registry_services "disabled for lightweight Actions stack"
+  fi
+}
+
+run_finalize_phases() {
   if [[ "${VALIDATE_GPU}" == "true" ]]; then
     phase validate_gpu_lightweight validate_gpu_lightweight
   fi
@@ -2295,22 +2533,33 @@ apply_jobs() {
 
 main() {
   case "${MODE}" in
-    reinstall)
-      phase require_tools require_tools
-      phase devstack_reinstall devstack_reinstall
-      apply_jobs
-      ;;
-    apply)
-      phase require_tools require_tools
-      phase devstack_apply_check devstack_apply_check
-      apply_jobs
-      ;;
+    apply|reinstall) ;;
     *)
       printf 'usage: %s [reinstall|apply]\n' "$0" >&2
       return 64
       ;;
   esac
-  log "DONE ${MODE}; timings: ${TIMINGS}"
+
+  # Only the entry phase clears stale orphans. platform/registry run as siblings of
+  # the same GitHub run, so they must not kill each other's process trees.
+  if [[ "${PHASES}" == "provision" || "${PHASES}" == "all" ]]; then
+    terminate_stale_apply_processes
+  fi
+  acquire_phase_lock "${PHASES}"
+
+  case "${PHASES}" in
+    provision) run_provision_phases ;;
+    platform)  run_platform_phases ;;
+    registry)  run_registry_phases ;;
+    finalize)  run_finalize_phases ;;
+    all)
+      run_provision_phases
+      run_platform_phases
+      run_registry_phases
+      run_finalize_phases
+      ;;
+  esac
+  log "DONE ${MODE}/${PHASES}; timings: ${TIMINGS}"
 }
 
 main "$@"
