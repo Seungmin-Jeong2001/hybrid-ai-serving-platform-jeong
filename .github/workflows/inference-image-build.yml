@@ -25,6 +25,8 @@ jobs:
         service:
           - inference-api
           - inference-worker
+          - dashboard-backend
+          - dashboard-frontend
     steps:
       - name: Checkout
         uses: actions/checkout@v6

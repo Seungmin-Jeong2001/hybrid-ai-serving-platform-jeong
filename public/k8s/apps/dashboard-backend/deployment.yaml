@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard-backend
+  namespace: app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dashboard-backend
+  template:
+    metadata:
+      labels:
+        app: dashboard-backend
+    spec:
+      nodeSelector:
+        workload: app
+      containers:
+        - name: dashboard-backend
+          image: 808379768010.dkr.ecr.ap-northeast-2.amazonaws.com/dashboard-backend:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: AWS_REGION
+              value: ap-northeast-2
+            - name: DYNAMODB_TABLE_NAME
+              value: sgs-hasp-inference-results
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

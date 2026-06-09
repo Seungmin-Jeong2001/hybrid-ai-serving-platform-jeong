@@ -13,3 +13,5 @@ resources:
   - kserve-crds-app.yaml
   - kserve-app.yaml
   - pdm-serving-app.yaml
+  - dashboard-backend-app.yaml
+  - dashboard-frontend-app.yaml

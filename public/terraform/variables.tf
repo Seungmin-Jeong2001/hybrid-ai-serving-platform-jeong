@@ -68,6 +68,8 @@ variable "ecr_repositories" {
     "predictive-model",
     "inference-api",
     "inference-worker",
+    "dashboard-backend",
+    "dashboard-frontend",
   ]
 }
 
