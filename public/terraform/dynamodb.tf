@@ -1,6 +1,6 @@
-# DynamoDB 테이블
-resource "aws_dynamodb_table" "inference_jobs" {
-  name         = "${var.project_name}-inference-jobs"
+# DynamoDB 테이블 - 고객사 대시보드용 추론 결과 저장
+resource "aws_dynamodb_table" "inference_results" {
+  name         = "${var.project_name}-inference-results"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "request_id"
 
@@ -19,6 +19,6 @@ resource "aws_dynamodb_table" "inference_jobs" {
   }
 
   tags = merge(local.common_tags, {
-    Name = "${var.project_name}-inference-jobs"
+    Name = "${var.project_name}-inference-results"
   })
 }

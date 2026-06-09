@@ -12,7 +12,6 @@ import boto3
 import httpx
 from kafka import KafkaConsumer, KafkaProducer, TopicPartition
 from kafka.errors import KafkaError
-from botocore.exceptions import ClientError
 
 
 logging.basicConfig(
@@ -80,17 +79,17 @@ def _retry_poll_delay_seconds() -> float:
     return float(os.getenv("RETRY_POLL_DELAY_SECONDS", "1"))
 
 
-def _jobs_table_name() -> str:
-    return os.getenv("DYNAMODB_TABLE_NAME", "sgs-hasp-inference-jobs")
+def _results_table_name() -> str:
+    return os.getenv("DYNAMODB_TABLE_NAME", "sgs-hasp-inference-results")
 
 
-def _idempotency_ttl_seconds() -> int:
-    return int(os.getenv("IDEMPOTENCY_TTL_SECONDS", str(7 * 24 * 60 * 60)))
+def _results_ttl_seconds() -> int:
+    return int(os.getenv("RESULTS_TTL_SECONDS", str(90 * 24 * 60 * 60)))  # 기본 90일
 
 
-def _create_jobs_table():
+def _create_results_table():
     return boto3.resource("dynamodb", region_name=os.getenv("AWS_REGION")).Table(
-        _jobs_table_name()
+        _results_table_name()
     )
 
 
@@ -123,10 +122,6 @@ def _now_epoch() -> int:
     return int(time.time())
 
 
-def _ttl_epoch() -> int:
-    return _now_epoch() + _idempotency_ttl_seconds()
-
-
 def _compute_next_attempt_at(retry_count: int) -> int:
     schedule = _retry_backoff_schedule_seconds()
     delay_index = min(max(retry_count - 1, 0), len(schedule) - 1)
@@ -135,69 +130,25 @@ def _compute_next_attempt_at(retry_count: int) -> int:
     return _now_epoch() + max(base_delay + jitter, 0)
 
 
-def _load_job_record(jobs_table, request_id: str) -> dict[str, Any] | None:
-    response = jobs_table.get_item(Key={"request_id": request_id})
-    return response.get("Item")
-
-
-def _claim_request(jobs_table, request_id: str, source_topic: str) -> bool:
-    timestamp = _now_epoch()
-    try:
-        jobs_table.put_item(
-            Item={
-                "request_id": request_id,
-                "status": "PROCESSING",
-                "retry_count": 0,
-                "source_topic": source_topic,
-                "updated_at": timestamp,
-                "ttl": _ttl_epoch(),
-            },
-            ConditionExpression="attribute_not_exists(request_id)",
-        )
-        return True
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            raise
-        return False
-
-
-def _update_job_status(
-    jobs_table,
+def _save_result(
+    results_table,
     request_id: str,
-    *,
-    status: str,
-    retry_count: int,
-    source_topic: str,
-    last_error: str | None = None,
+    factory_id: str,
+    equipment_id: str,
+    prediction: str,
+    requested_at: int,
 ) -> None:
-    expression_attribute_values: dict[str, Any] = {
-        ":status": status,
-        ":retry_count": retry_count,
-        ":source_topic": source_topic,
-        ":updated_at": _now_epoch(),
-        ":ttl": _ttl_epoch(),
-    }
-    update_expression = (
-        "SET #status = :status, retry_count = :retry_count, source_topic = :source_topic, "
-        "updated_at = :updated_at, #ttl = :ttl"
+    results_table.put_item(
+        Item={
+            "request_id": request_id,
+            "factory_id": factory_id,
+            "equipment_id": equipment_id,
+            "prediction": prediction,
+            "requested_at": requested_at,
+            "completed_at": _now_epoch() * 1000,  # milliseconds
+            "ttl": _now_epoch() + _results_ttl_seconds(),
+        }
     )
-    expression_attribute_names = {"#status": "status", "#ttl": "ttl"}
-
-    if last_error is not None:
-        expression_attribute_values[":last_error"] = last_error
-        update_expression += ", last_error = :last_error"
-
-    jobs_table.update_item(
-        Key={"request_id": request_id},
-        UpdateExpression=update_expression,
-        ExpressionAttributeNames=expression_attribute_names,
-        ExpressionAttributeValues=expression_attribute_values,
-    )
-
-
-def _should_route_immediately_to_dlq(payload: dict[str, Any]) -> bool:
-    parameters = payload.get("parameters", {})
-    return bool(parameters.get("dlq_immediately") or parameters.get("retryable") is False)
 
 
 def _publish(
@@ -239,7 +190,7 @@ def _defer_retry_record(consumer: KafkaConsumer, record, next_attempt_at: int) -
     sleep_seconds = min(remaining_seconds, _retry_poll_delay_seconds())
     logger.info(
         "defer retry request_id=%s remaining_seconds=%s next_attempt_at=%s",
-        record.key or "unknown-job",
+        record.key or "unknown",
         remaining_seconds,
         next_attempt_at,
     )
@@ -260,18 +211,18 @@ def _process_message(payload: dict[str, Any]) -> dict[str, Any]:
 
 def run() -> None:
     logger.info(
-        "worker started bootstrap_servers=%s subscribed_topics=%s dlq_topic=%s consumer_group=%s jobs_table=%s retry_schedule_seconds=%s retry_jitter_seconds=%s",
+        "worker started bootstrap_servers=%s subscribed_topics=%s dlq_topic=%s consumer_group=%s results_table=%s retry_schedule_seconds=%s retry_jitter_seconds=%s",
         _bootstrap_servers(),
         ",".join(_subscribed_topics()),
         _dlq_topic(),
         _consumer_group(),
-        _jobs_table_name(),
+        _results_table_name(),
         ",".join(str(value) for value in _retry_backoff_schedule_seconds()),
         _retry_jitter_seconds(),
     )
     consumer = _create_consumer()
     producer = _create_producer()
-    jobs_table = _create_jobs_table()
+    results_table = _create_results_table()
 
     try:
         while True:
@@ -283,7 +234,7 @@ def run() -> None:
                     request_id = (
                         payload.get("request_id")
                         or record.key
-                        or "unknown-job"
+                        or "unknown"
                     )
                     retry_count = int(payload.get("retry_count", 0))
                     next_attempt_at = int(payload.get("next_attempt_at", 0) or 0)
@@ -293,69 +244,23 @@ def run() -> None:
                             should_continue_polling = False
                             break
 
-                        if record.topic == _request_topic():
-                            claimed = _claim_request(jobs_table, request_id, record.topic)
-                            if not claimed:
-                                existing = _load_job_record(jobs_table, request_id)
-                                logger.info(
-                                    "skip duplicate request_id=%s existing_status=%s",
-                                    request_id,
-                                    existing.get("status") if existing else "unknown",
-                                )
-                                consumer.commit()
-                                continue
-                        else:
-                            existing = _load_job_record(jobs_table, request_id)
-                            if existing and existing.get("status") == "SUCCEEDED":
-                                logger.info(
-                                    "skip duplicate retry request_id=%s because it already succeeded",
-                                    request_id,
-                                )
-                                consumer.commit()
-                                continue
-                            _update_job_status(
-                                jobs_table,
-                                request_id,
-                                status="PROCESSING",
-                                retry_count=retry_count,
-                                source_topic=record.topic,
-                            )
-
-                        if _should_route_immediately_to_dlq(payload):
-                            dlq_payload = _build_failure_payload(
-                                payload,
-                                error_message="message met immediate dlq criteria",
-                                retry_count=retry_count,
-                                source_topic=record.topic,
-                                failure_stage="pre-validation",
-                            )
-                            _publish(producer, _dlq_topic(), request_id, dlq_payload)
-                            _update_job_status(
-                                jobs_table,
-                                request_id,
-                                status="DLQ",
-                                retry_count=retry_count,
-                                source_topic=_dlq_topic(),
-                                last_error="message met immediate dlq criteria",
-                            )
-                            consumer.commit()
-                            logger.info("message routed immediately to dlq request_id=%s", request_id)
-                            continue
-
                         result = _process_message(payload)
-                        _update_job_status(
-                            jobs_table,
-                            request_id,
-                            status="SUCCEEDED",
-                            retry_count=retry_count,
-                            source_topic=record.topic,
+                        prediction = result[0].get("class_name") if isinstance(result, list) else result.get("class_name", "Unknown")
+
+                        _save_result(
+                            results_table,
+                            request_id=request_id,
+                            factory_id=payload.get("factory_id", ""),
+                            equipment_id=payload.get("equipment_id", ""),
+                            prediction=prediction,
+                            requested_at=payload.get("timestamp", 0),
                         )
                         consumer.commit()
                         logger.info(
-                            "processed inference request_id=%s source_topic=%s result=%s",
+                            "inference completed request_id=%s equipment_id=%s prediction=%s",
                             request_id,
-                            record.topic,
-                            json.dumps(result),
+                            payload.get("equipment_id"),
+                            prediction,
                         )
                     except httpx.HTTPError as exc:
                         next_retry_count = retry_count + 1
@@ -371,14 +276,6 @@ def run() -> None:
                             next_attempt_at = _compute_next_attempt_at(next_retry_count)
                             failure_payload["next_attempt_at"] = next_attempt_at
                             _publish(producer, _retry_topic(), request_id, failure_payload)
-                            _update_job_status(
-                                jobs_table,
-                                request_id,
-                                status="RETRY_PENDING",
-                                retry_count=next_retry_count,
-                                source_topic=_retry_topic(),
-                                last_error=str(exc),
-                            )
                             logger.warning(
                                 "published retry message request_id=%s retry_count=%s next_attempt_at=%s",
                                 request_id,
@@ -388,14 +285,6 @@ def run() -> None:
                         else:
                             failure_payload["dlq_reason"] = "retry_exhausted"
                             _publish(producer, _dlq_topic(), request_id, failure_payload)
-                            _update_job_status(
-                                jobs_table,
-                                request_id,
-                                status="DLQ",
-                                retry_count=next_retry_count,
-                                source_topic=_dlq_topic(),
-                                last_error=str(exc),
-                            )
                             logger.warning(
                                 "published dlq message after retries request_id=%s retry_count=%s",
                                 request_id,
@@ -415,14 +304,6 @@ def run() -> None:
                         )
                         failure_payload["dlq_reason"] = "unhandled_worker_error"
                         _publish(producer, _dlq_topic(), request_id, failure_payload)
-                        _update_job_status(
-                            jobs_table,
-                            request_id,
-                            status="DLQ",
-                            retry_count=retry_count,
-                            source_topic=_dlq_topic(),
-                            last_error=str(exc),
-                        )
                         consumer.commit()
                         logger.exception("worker failed and routed to dlq request_id=%s", request_id)
                 if not should_continue_polling:
