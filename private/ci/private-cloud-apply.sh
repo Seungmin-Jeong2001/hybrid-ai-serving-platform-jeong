@@ -276,6 +276,7 @@ ensure_devstack_container_running() {
   status="$(lxc list ha-openstack -c s --format csv | tr -d '"')"
   if [[ "$status" != "RUNNING" ]]; then
     log "starting DevStack container ha-openstack (current status: ${status:-unknown})"
+    configure_lxc_devices
     lxc start ha-openstack
     wait_lxc_ip
   fi
@@ -308,9 +309,25 @@ add_lxc_vfio_devices() {
   done
 }
 
+prune_stale_lxc_vfio_devices() {
+  local device source
+
+  while IFS= read -r device; do
+    case "$device" in
+      vfio|vfio-control|vfio-group-*)
+        source="$(lxc config device get ha-openstack "$device" source 2>/dev/null || true)"
+        if [[ -z "$source" || ! -e "$source" ]]; then
+          lxc config device remove ha-openstack "$device" >/dev/null 2>&1 || true
+        fi
+        ;;
+    esac
+  done < <(lxc config device list ha-openstack 2>/dev/null || true)
+}
+
 configure_lxc_devices() {
   local kernel_modules_source
   kernel_modules_source="$(readlink -f /lib/modules)"
+  prune_stale_lxc_vfio_devices
   lxc config device add ha-openstack kmsg unix-char source=/dev/kmsg path=/dev/kmsg >/dev/null 2>&1 || true
   lxc config device remove ha-openstack host-kernel-modules >/dev/null 2>&1 || true
   lxc config device add ha-openstack host-kernel-modules disk source="${kernel_modules_source}" path=/usr/lib/modules readonly=true >/dev/null 2>&1 || true
