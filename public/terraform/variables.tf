@@ -106,7 +106,7 @@ variable "eks_node_groups" {
   }))
   default = {
     inference = {
-      instance_types = ["t3.small"]
+      instance_types = ["t3.medium"] # 임시 비용 절감, 원래 값: m7i-flex.large (t3.small은 최대 파드 11개 한계로 변경)
       az_count       = 3
       desired_size   = 1 # ★ 원래 값 : 2 (나중에 복구) ★
       min_size       = 1
