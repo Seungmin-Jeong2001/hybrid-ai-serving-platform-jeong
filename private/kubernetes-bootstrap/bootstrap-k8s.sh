@@ -336,9 +336,16 @@ wait_for_apt_locks() {
 
 apt_get() {
   local attempt
+  local apt_opts=(
+    -o Acquire::ForceIPv4=true
+    -o Acquire::Retries=5
+    -o Acquire::http::Timeout=30
+    -o Acquire::https::Timeout=30
+    -o Dpkg::Lock::Timeout=900
+  )
   for attempt in {1..12}; do
     wait_for_apt_locks
-    if apt-get "$@"; then
+    if apt-get "${apt_opts[@]}" "$@"; then
       return 0
     fi
     if (( attempt == 12 )); then
@@ -350,6 +357,14 @@ apt_get() {
 }
 
 wait_for_cloud_init
+
+cat >/etc/apt/apt.conf.d/99hybrid-ai-force-ipv4 <<'EOF'
+Acquire::ForceIPv4 "true";
+Acquire::Retries "5";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+Dpkg::Lock::Timeout "900";
+EOF
 
 swapoff -a || true
 sed -ri '/\sswap\s/s/^/#/' /etc/fstab || true
@@ -379,7 +394,7 @@ systemctl restart containerd
 
 mkdir -p -m 755 /etc/apt/keyrings
 rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-curl -fsSL "https://pkgs.k8s.io/core:/stable:/${version_minor}/deb/Release.key" \
+curl -4 -fsSL --connect-timeout 10 --max-time 60 --retry 5 --retry-delay 5 "https://pkgs.k8s.io/core:/stable:/${version_minor}/deb/Release.key" \
   | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 cat >/etc/apt/sources.list.d/kubernetes.list <<EOF
@@ -683,6 +698,18 @@ sudo "${join_args[@]}"
 REMOTE
 }
 
+join_k8s_worker_index() {
+  local index="$1"
+  local server_target_ip="$2"
+  local worker_join_command="$3"
+
+  wait_for_ssh "${NODE_TARGET_IPS[$index]}" "${NODE_NAMES[$index]}"
+  if ! kubernetes_worker_active "${NODE_TARGET_IPS[$index]}"; then
+    forget_kubernetes_node "$server_target_ip" "${NODE_NAMES[$index]}"
+  fi
+  install_k8s_worker "${NODE_TARGET_IPS[$index]}" "${NODE_NAMES[$index]}" "${NODE_ROLES[$index]}" "$worker_join_command"
+}
+
 label_nodes() {
   local host="$1"
   local index
@@ -835,22 +862,30 @@ main() {
 
   for index in "${!NODE_ROLES[@]}"; do
     [[ "$index" != "$first_index" ]] || continue
+    [[ "${NODE_ROLES[$index]}" == "control-plane" ]] || continue
     wait_for_ssh "${NODE_TARGET_IPS[$index]}" "${NODE_NAMES[$index]}"
+    if ! kubernetes_server_ready "${NODE_TARGET_IPS[$index]}"; then
+      forget_kubernetes_node "$server_target_ip" "${NODE_NAMES[$index]}"
+    fi
+    install_k8s_control_plane_join "${NODE_TARGET_IPS[$index]}" "${NODE_NAMES[$index]}" "${NODE_PRIVATE_IPS[$index]:-${NODE_TARGET_IPS[$index]}}" "$control_plane_join_command"
+  done
+
+  local worker_pids=()
+  local worker_pid
+  local worker_rc=0
+  for index in "${!NODE_ROLES[@]}"; do
+    [[ "$index" != "$first_index" ]] || continue
     case "${NODE_ROLES[$index]}" in
-      control-plane)
-        if ! kubernetes_server_ready "${NODE_TARGET_IPS[$index]}"; then
-          forget_kubernetes_node "$server_target_ip" "${NODE_NAMES[$index]}"
-        fi
-        install_k8s_control_plane_join "${NODE_TARGET_IPS[$index]}" "${NODE_NAMES[$index]}" "${NODE_PRIVATE_IPS[$index]:-${NODE_TARGET_IPS[$index]}}" "$control_plane_join_command"
-        ;;
       build-worker|gpu-worker)
-        if ! kubernetes_worker_active "${NODE_TARGET_IPS[$index]}"; then
-          forget_kubernetes_node "$server_target_ip" "${NODE_NAMES[$index]}"
-        fi
-        install_k8s_worker "${NODE_TARGET_IPS[$index]}" "${NODE_NAMES[$index]}" "${NODE_ROLES[$index]}" "$worker_join_command"
+        ( join_k8s_worker_index "$index" "$server_target_ip" "$worker_join_command" ) &
+        worker_pids+=("$!")
         ;;
     esac
   done
+  for worker_pid in "${worker_pids[@]}"; do
+    wait "$worker_pid" || worker_rc=1
+  done
+  [[ "$worker_rc" -eq 0 ]] || die "one or more Kubernetes worker joins failed"
 
   wait_for_kubernetes "$server_target_ip"
   label_nodes "$server_target_ip"

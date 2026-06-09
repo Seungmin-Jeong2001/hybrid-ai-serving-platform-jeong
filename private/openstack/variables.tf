@@ -166,6 +166,24 @@ variable "harbor_flavor_name" {
   default     = "m1.large"
 }
 
+variable "compute_instance_create_timeout" {
+  description = "Timeout for OpenStack VM creation. Large cached GPU/GitLab images can exceed the provider default while Nova warms its local base image cache."
+  type        = string
+  default     = "120m"
+}
+
+variable "compute_instance_update_timeout" {
+  description = "Timeout for OpenStack VM updates."
+  type        = string
+  default     = "30m"
+}
+
+variable "compute_instance_delete_timeout" {
+  description = "Timeout for OpenStack VM deletion."
+  type        = string
+  default     = "60m"
+}
+
 variable "gitlab_container_image" {
   description = "GitLab container image pre-pulled by the standalone GitLab VM cloud-init bootstrap."
   type        = string

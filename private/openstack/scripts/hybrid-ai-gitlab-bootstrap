@@ -107,8 +107,17 @@ ensure_apt_config() {
   cat >/etc/apt/apt.conf.d/99hybrid-ai-force-ipv4 <<'EOF'
 Acquire::ForceIPv4 "true";
 Acquire::Retries "5";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
 Dpkg::Lock::Timeout "900";
 EOF
+}
+
+has_required_packages() {
+  local package
+  for package in ca-certificates curl docker.io openssh-server python3 tzdata; do
+    dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null | grep -qx 'ii ' || return 1
+  done
 }
 
 ensure_packages() {
@@ -117,12 +126,16 @@ ensure_packages() {
   local apt_get_common=(
     -o Acquire::ForceIPv4=true
     -o Acquire::Retries=5
+    -o Acquire::http::Timeout=30
+    -o Acquire::https::Timeout=30
     -o Dpkg::Lock::Timeout=900
   )
-  wait_for_install_egress
-  wait_for_apt_locks
-  apt-get "${apt_get_common[@]}" update -qq
-  apt-get "${apt_get_common[@]}" install -y -qq ca-certificates curl docker.io openssh-server python3 tzdata
+  if ! has_required_packages; then
+    wait_for_install_egress
+    wait_for_apt_locks
+    apt-get "${apt_get_common[@]}" update -qq
+    apt-get "${apt_get_common[@]}" install -y -qq ca-certificates curl docker.io openssh-server python3 tzdata
+  fi
   systemctl enable --now docker
 }
 
@@ -694,9 +707,14 @@ PY
 }
 
 main() {
+  local short="${GITLAB_DOMAIN%%.*}"
+
   save_status starting "bootstrap_started"
   cloud-init status --wait >/dev/null 2>&1 || true
   hostnamectl set-hostname "$GITLAB_DOMAIN" || true
+  if ! grep -Eq "(^|[[:space:]])${short}([[:space:]]|$)" /etc/hosts; then
+    printf '127.0.1.1 %s %s\n' "$GITLAB_DOMAIN" "$short" >>/etc/hosts
+  fi
   ensure_apt_config
   ensure_packages
   ensure_swap

@@ -175,6 +175,12 @@ resource "openstack_compute_instance_v2" "control_plane" {
       user_data,
     ]
   }
+
+  timeouts {
+    create = var.compute_instance_create_timeout
+    update = var.compute_instance_update_timeout
+    delete = var.compute_instance_delete_timeout
+  }
 }
 
 resource "openstack_networking_floatingip_v2" "control_plane" {
@@ -229,6 +235,12 @@ resource "openstack_compute_instance_v2" "build_worker" {
       image_name,
       user_data,
     ]
+  }
+
+  timeouts {
+    create = var.compute_instance_create_timeout
+    update = var.compute_instance_update_timeout
+    delete = var.compute_instance_delete_timeout
   }
 }
 
@@ -285,6 +297,12 @@ resource "openstack_compute_instance_v2" "gpu_worker" {
       user_data,
     ]
   }
+
+  timeouts {
+    create = var.compute_instance_create_timeout
+    update = var.compute_instance_update_timeout
+    delete = var.compute_instance_delete_timeout
+  }
 }
 
 resource "openstack_networking_floatingip_v2" "gpu_worker" {
@@ -340,6 +358,12 @@ resource "openstack_compute_instance_v2" "gitlab" {
       user_data,
     ]
   }
+
+  timeouts {
+    create = var.compute_instance_create_timeout
+    update = var.compute_instance_update_timeout
+    delete = var.compute_instance_delete_timeout
+  }
 }
 
 resource "openstack_networking_floatingip_v2" "gitlab" {
@@ -394,6 +418,12 @@ resource "openstack_compute_instance_v2" "harbor" {
       image_name,
       user_data,
     ]
+  }
+
+  timeouts {
+    create = var.compute_instance_create_timeout
+    update = var.compute_instance_update_timeout
+    delete = var.compute_instance_delete_timeout
   }
 }
 

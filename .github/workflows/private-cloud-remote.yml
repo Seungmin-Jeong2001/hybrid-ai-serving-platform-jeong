@@ -171,6 +171,10 @@ jobs:
           write_env TF_VAR_harbor_count "$HARBOR_COUNT"
           write_env TF_VAR_harbor_image_name "$HARBOR_IMAGE_NAME"
           write_env TF_VAR_harbor_flavor_name "$HARBOR_FLAVOR_NAME"
+          write_env TF_VAR_compute_instance_create_timeout "$COMPUTE_INSTANCE_CREATE_TIMEOUT"
+          write_env TF_VAR_compute_instance_update_timeout "$COMPUTE_INSTANCE_UPDATE_TIMEOUT"
+          write_env TF_VAR_compute_instance_delete_timeout "$COMPUTE_INSTANCE_DELETE_TIMEOUT"
+          write_env HA_TERRAFORM_APPLY_PARALLELISM "$TERRAFORM_APPLY_PARALLELISM"
 
           write_env HA_OPENSTACK_GPU_PCI_ALIAS "$OPENSTACK_GPU_PCI_ALIAS"
           write_env HA_OPENSTACK_GPU_PCI_VENDOR_ID "$OPENSTACK_GPU_PCI_VENDOR_ID"
@@ -232,6 +236,10 @@ jobs:
           HARBOR_COUNT: ${{ vars.HARBOR_COUNT || '1' }}
           HARBOR_IMAGE_NAME: ${{ vars.HARBOR_IMAGE_NAME || 'ubuntu-22.04' }}
           HARBOR_FLAVOR_NAME: ${{ vars.HARBOR_FLAVOR_NAME || 'ha.m1.harbor' }}
+          COMPUTE_INSTANCE_CREATE_TIMEOUT: ${{ vars.COMPUTE_INSTANCE_CREATE_TIMEOUT || '120m' }}
+          COMPUTE_INSTANCE_UPDATE_TIMEOUT: ${{ vars.COMPUTE_INSTANCE_UPDATE_TIMEOUT || '30m' }}
+          COMPUTE_INSTANCE_DELETE_TIMEOUT: ${{ vars.COMPUTE_INSTANCE_DELETE_TIMEOUT || '60m' }}
+          TERRAFORM_APPLY_PARALLELISM: ${{ vars.TERRAFORM_APPLY_PARALLELISM || '2' }}
           OPENSTACK_GPU_PCI_ALIAS: ${{ vars.OPENSTACK_GPU_PCI_ALIAS || 'nvidia-gpu' }}
           OPENSTACK_GPU_PCI_VENDOR_ID: ${{ vars.OPENSTACK_GPU_PCI_VENDOR_ID || '10de' }}
           OPENSTACK_GPU_PCI_PRODUCT_ID: ${{ vars.OPENSTACK_GPU_PCI_PRODUCT_ID || 'auto' }}
@@ -241,7 +249,7 @@ jobs:
           OPENSTACK_GPU_FLAVOR_NAME: ${{ vars.OPENSTACK_GPU_FLAVOR_NAME || 'g1.large' }}
           OPENSTACK_GPU_FLAVOR_RAM: ${{ vars.OPENSTACK_GPU_FLAVOR_RAM || '8192' }}
           OPENSTACK_GPU_FLAVOR_VCPUS: ${{ vars.OPENSTACK_GPU_FLAVOR_VCPUS || '4' }}
-          OPENSTACK_GPU_FLAVOR_DISK: ${{ vars.OPENSTACK_GPU_FLAVOR_DISK || '40' }}
+          OPENSTACK_GPU_FLAVOR_DISK: ${{ vars.OPENSTACK_GPU_FLAVOR_DISK || '80' }}
           OPENSTACK_IMAGE_CACHE_ENABLED: ${{ vars.OPENSTACK_IMAGE_CACHE_ENABLED || 'true' }}
           OPENSTACK_IMAGE_CACHE_PREFIX: ${{ vars.OPENSTACK_IMAGE_CACHE_PREFIX || 'hybrid-ai-cache' }}
           OPENSTACK_IMAGE_CACHE_DRIVER_PACKAGE: ${{ vars.GPU_DRIVER_PACKAGE || vars.OPENSTACK_IMAGE_CACHE_DRIVER_PACKAGE || 'nvidia-driver-595-open' }}

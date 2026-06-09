@@ -81,6 +81,9 @@ TF_VAR_build_worker_image_name="${TF_VAR_build_worker_image_name:-ubuntu-22.04}"
 TF_VAR_gpu_worker_image_name="${TF_VAR_gpu_worker_image_name:-ubuntu-22.04}"
 TF_VAR_gitlab_image_name="${TF_VAR_gitlab_image_name:-ubuntu-22.04}"
 TF_VAR_harbor_image_name="${TF_VAR_harbor_image_name:-ubuntu-22.04}"
+TF_VAR_compute_instance_create_timeout="${TF_VAR_compute_instance_create_timeout:-120m}"
+TF_VAR_compute_instance_update_timeout="${TF_VAR_compute_instance_update_timeout:-30m}"
+TF_VAR_compute_instance_delete_timeout="${TF_VAR_compute_instance_delete_timeout:-60m}"
 TF_VAR_build_worker_count="${TF_VAR_build_worker_count:-1}"
 TF_VAR_gpu_worker_count="${TF_VAR_gpu_worker_count:-1}"
 TF_VAR_gitlab_count="${TF_VAR_gitlab_count:-1}"
@@ -116,7 +119,7 @@ HA_OPENSTACK_GPU_BIND_IOMMU_GROUP="${HA_OPENSTACK_GPU_BIND_IOMMU_GROUP:-true}"
 HA_OPENSTACK_GPU_FLAVOR_NAME="${HA_OPENSTACK_GPU_FLAVOR_NAME:-g1.large}"
 HA_OPENSTACK_GPU_FLAVOR_RAM="${HA_OPENSTACK_GPU_FLAVOR_RAM:-8192}"
 HA_OPENSTACK_GPU_FLAVOR_VCPUS="${HA_OPENSTACK_GPU_FLAVOR_VCPUS:-4}"
-HA_OPENSTACK_GPU_FLAVOR_DISK="${HA_OPENSTACK_GPU_FLAVOR_DISK:-40}"
+HA_OPENSTACK_GPU_FLAVOR_DISK="${HA_OPENSTACK_GPU_FLAVOR_DISK:-80}"
 GITLAB_INSTALL_ENABLED="${GITLAB_INSTALL_ENABLED:-true}"
 GITLAB_DOMAIN="${GITLAB_DOMAIN:-gitlab.${PRIVATE_CLOUD_BASE_DOMAIN}}"
 GITLAB_EXTERNAL_URL="${GITLAB_EXTERNAL_URL:-https://${GITLAB_DOMAIN}}"
@@ -162,6 +165,7 @@ HA_PRIVATE_CLOUD_SETUP_STORAGE="${HA_PRIVATE_CLOUD_SETUP_STORAGE:-auto}"
 HA_PRIVATE_CLOUD_SETUP_REGISTRY="${HA_PRIVATE_CLOUD_SETUP_REGISTRY:-auto}"
 HA_PRIVATE_CLOUD_SETUP_MODEL_BUILD="${HA_PRIVATE_CLOUD_SETUP_MODEL_BUILD:-auto}"
 HA_PRIVATE_CLOUD_SYNC_OPENSTACK_USER="${HA_PRIVATE_CLOUD_SYNC_OPENSTACK_USER:-auto}"
+HA_TERRAFORM_APPLY_PARALLELISM="${HA_TERRAFORM_APPLY_PARALLELISM:-2}"
 
 printf 'phase\tseconds\tstatus\n' >"${TIMINGS}"
 
@@ -511,9 +515,33 @@ cd /opt/stack/devstack
 set +u
 source openrc admin admin >/dev/null
 set -u
+flavor_matches() {
+  local name="$1" ram="$2" vcpus="$3" disk="$4"
+  local flavor_json
+  flavor_json="$(openstack flavor show "$name" -f json)"
+  python3 - "$ram" "$vcpus" "$disk" "$flavor_json" <<'PY'
+import json
+import sys
+
+expected_ram, expected_vcpus, expected_disk = map(int, sys.argv[1:4])
+flavor = json.loads(sys.argv[4])
+if (
+    int(flavor["ram"]) == expected_ram
+    and int(flavor["vcpus"]) == expected_vcpus
+    and int(flavor["disk"]) == expected_disk
+):
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+
 ensure_flavor() {
   local name="$1" ram="$2" vcpus="$3" disk="$4"
   if openstack flavor show "$name" >/dev/null 2>&1; then
+    if flavor_matches "$name" "$ram" "$vcpus" "$disk"; then
+      openstack flavor set --property "hw_rng:allowed=True" "$name"
+      return 0
+    fi
     openstack flavor delete "$name"
   fi
   openstack flavor create --ram "$ram" --vcpus "$vcpus" --disk "$disk" "$name" >/dev/null
@@ -1256,10 +1284,15 @@ devstack_reinstall() {
 }
 
 devstack_apply_check() {
+  local product_id
   verify_devstack
   sync_openstack_login_user
   configure_lxc_devices
+  product_id="$(detect_gpu_product)"
+  bind_gpu_vfio "${product_id}"
   configure_vfio_guest_access
+  ensure_flavors
+  configure_gpu_passthrough
   ensure_devstack_egress
   ensure_horizon_proxy
   configure_horizon_proxy_settings
@@ -1516,8 +1549,24 @@ terraform_apply() {
     terraform import openstack_compute_keypair_v2.admin "${key_pair_name}" >/dev/null 2>&1 || true
   fi
   terraform plan -input=false -out=private-cloud.tfplan
-  terraform apply -input=false -auto-approve private-cloud.tfplan
+  terraform apply -input=false -parallelism="${HA_TERRAFORM_APPLY_PARALLELISM}" -auto-approve private-cloud.tfplan
   terraform output -json >"${TF_OUTPUT_JSON}"
+}
+
+wait_one_node_ssh() {
+  local ip="$1"
+  local name="$2"
+  local ready=false
+  local deadline=$((SECONDS + 900))
+
+  while (( SECONDS < deadline )); do
+    if ssh -F "${SSH_CONFIG}" -n -o ConnectTimeout=10 "${ip}" 'true' 2>/dev/null; then
+      ready=true
+      break
+    fi
+    sleep 10
+  done
+  [[ "${ready}" == "true" ]] || { echo "${name} (${ip}) did not become SSH-ready" >&2; return 1; }
 }
 
 wait_nodes_ssh() {
@@ -1533,19 +1582,18 @@ for key in ("control_plane_nodes", "build_worker_nodes", "gpu_worker_nodes"):
         if ip:
             print(ip, node.get("name", ""))
 PY
-  while IFS=' ' read -r ip name; do
-    ready=false
-    deadline=$((SECONDS + 900))
-    while (( SECONDS < deadline )); do
-      if ssh -F "${SSH_CONFIG}" -n -o ConnectTimeout=10 "${ip}" 'true' 2>/dev/null; then
-        ready=true
-        break
-      fi
-      sleep 10
-    done
-    [[ "${ready}" == "true" ]] || { echo "${name} (${ip}) did not become SSH-ready" >&2; return 1; }
-  done <"${LOG_DIR}/node-inventory.txt"
   [[ -s "${LOG_DIR}/node-inventory.txt" ]] || { echo "node inventory is empty" >&2; return 1; }
+  local pids=()
+  local pid
+  local rc=0
+  while IFS=' ' read -r ip name; do
+    ( wait_one_node_ssh "$ip" "$name" ) &
+    pids+=("$!")
+  done <"${LOG_DIR}/node-inventory.txt"
+  for pid in "${pids[@]}"; do
+    wait "$pid" || rc=1
+  done
+  return "$rc"
 }
 
 first_control_plane_ip() {
