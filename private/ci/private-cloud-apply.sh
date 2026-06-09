@@ -1326,8 +1326,21 @@ ENSURE_PUBLIC_EGRESS
 }
 
 verify_devstack() {
-  lxc exec ha-openstack -- curl -fsS http://localhost/identity/v3 | grep -q "v3.14"
-  lxc exec ha-openstack -- sudo -u stack -H bash -lc 'cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && openstack token issue -f value -c id >/dev/null'
+  local attempt
+
+  for attempt in {1..60}; do
+    if lxc exec ha-openstack -- curl -fsS http://localhost/identity/v3 2>/dev/null | grep -q "v3.14" \
+      && lxc exec ha-openstack -- sudo -u stack -H bash -lc 'cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && openstack token issue -f value -c id >/dev/null' 2>/dev/null; then
+      return 0
+    fi
+    if [[ "$attempt" -eq 1 ]]; then
+      log "waiting for DevStack API readiness"
+    fi
+    sleep 5
+  done
+
+  printf 'DevStack API did not become ready; rerun with run_mode=reinstall if services are not recoverable.\n' >&2
+  return 1
 }
 
 ensure_horizon_proxy() {
