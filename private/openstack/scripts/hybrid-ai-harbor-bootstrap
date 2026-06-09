@@ -270,8 +270,10 @@ trivy:
   offline_scan: true
 jobservice:
   max_job_workers: 1
+  max_job_duration_hours: 24
   job_loggers:
     - STD_OUTPUT
+  logger_sweeper_duration: 1
 notification:
   webhook_job_max_retry: 3
 chart:
