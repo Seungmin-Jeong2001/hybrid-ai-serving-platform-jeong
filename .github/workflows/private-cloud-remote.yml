@@ -486,4 +486,4 @@ jobs:
 
       - name: Disconnect Tailscale auth key session
         if: ${{ always() && (env.TS_OAUTH_CLIENT_ID == '' || env.TS_OAUTH_SECRET == '') }}
-        run: sudo tailscale logout || true
+        run: timeout 20s sudo tailscale logout || true
