@@ -60,6 +60,7 @@ write_tfvars_if_present() {
 devstack_openrc_password() {
   command -v lxc >/dev/null 2>&1 || return 0
   local result
+  # shellcheck disable=SC2016
   result="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc 'cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && printf "%s" "${OS_PASSWORD:-}"' 2>/dev/null || true)"
   if [[ -z "$result" ]]; then
     printf '[private-cloud-destroy] warning: could not read DevStack admin password from openrc; falling back to HA_DEVSTACK_PASSWORD\n' >&2

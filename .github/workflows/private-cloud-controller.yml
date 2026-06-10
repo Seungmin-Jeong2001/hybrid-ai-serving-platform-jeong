@@ -1,0 +1,217 @@
+name: Private Cloud Controller
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Apply or destroy the private cloud foundation
+        required: true
+        type: choice
+        default: apply
+        options:
+          - apply
+          - destroy
+      openstack_lifecycle:
+        description: Reuse local DevStack or fully recreate/remove it
+        required: true
+        type: choice
+        default: tenant-stack-only
+        options:
+          - tenant-stack-only
+          - full-openstack
+      validate_gpu:
+        description: Run GPU passthrough validation jobs after apply
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One controller run owns the private cloud host. Inside an apply run, jobs use
+# a DAG plus script-level phase locks so independent VM work can run in parallel
+# without another apply/destroy run touching the same host state.
+concurrency:
+  group: private-cloud-foundation
+  cancel-in-progress: false
+
+jobs:
+  apply-devstack:
+    name: DevStack
+    if: ${{ inputs.operation == 'apply' }}
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.openstack_lifecycle == 'full-openstack' && 'reinstall' || 'apply' }}
+      phases: devstack
+      do_checkout: true
+      do_cleanup: false
+    secrets: inherit
+
+  apply-images:
+    name: Image Cache
+    if: ${{ inputs.operation == 'apply' }}
+    needs: apply-devstack
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.openstack_lifecycle == 'full-openstack' && 'reinstall' || 'apply' }}
+      phases: images
+      do_checkout: false
+      do_cleanup: false
+    secrets: inherit
+
+  apply-terraform:
+    name: Terraform
+    if: ${{ inputs.operation == 'apply' }}
+    needs: apply-images
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.openstack_lifecycle == 'full-openstack' && 'reinstall' || 'apply' }}
+      phases: terraform
+      do_checkout: false
+      do_cleanup: false
+    secrets: inherit
+
+  vm-control-plane:
+    name: VM / Control Plane
+    if: ${{ inputs.operation == 'apply' }}
+    needs: apply-terraform
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.openstack_lifecycle == 'full-openstack' && 'reinstall' || 'apply' }}
+      phases: control-plane
+      do_checkout: false
+      do_cleanup: false
+    secrets: inherit
+
+  vm-build-worker:
+    name: VM / Build Worker
+    if: ${{ inputs.operation == 'apply' }}
+    needs: apply-terraform
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.openstack_lifecycle == 'full-openstack' && 'reinstall' || 'apply' }}
+      phases: build-worker
+      do_checkout: false
+      do_cleanup: false
+    secrets: inherit
+
+  vm-gpu-worker:
+    name: VM / GPU Worker
+    if: ${{ inputs.operation == 'apply' }}
+    needs: apply-terraform
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.openstack_lifecycle == 'full-openstack' && 'reinstall' || 'apply' }}
+      phases: gpu-worker
+      do_checkout: false
+      do_cleanup: false
+    secrets: inherit
+
+  vm-gitlab:
+    name: VM / GitLab
+    if: ${{ inputs.operation == 'apply' }}
+    needs: apply-terraform
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.openstack_lifecycle == 'full-openstack' && 'reinstall' || 'apply' }}
+      phases: gitlab
+      do_checkout: false
+      do_cleanup: false
+    secrets: inherit
+
+  vm-harbor:
+    name: VM / Harbor
+    if: ${{ inputs.operation == 'apply' }}
+    needs: apply-terraform
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.openstack_lifecycle == 'full-openstack' && 'reinstall' || 'apply' }}
+      phases: harbor
+      do_checkout: false
+      do_cleanup: false
+    secrets: inherit
+
+  apply-k8s:
+    name: Kubernetes
+    if: ${{ inputs.operation == 'apply' }}
+    needs: [vm-control-plane, vm-build-worker, vm-gpu-worker]
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.openstack_lifecycle == 'full-openstack' && 'reinstall' || 'apply' }}
+      phases: k8s
+      do_checkout: false
+      do_cleanup: false
+    secrets: inherit
+
+  apply-storage:
+    name: Storage
+    if: ${{ inputs.operation == 'apply' }}
+    needs: apply-k8s
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.openstack_lifecycle == 'full-openstack' && 'reinstall' || 'apply' }}
+      phases: storage
+      do_checkout: false
+      do_cleanup: false
+    secrets: inherit
+
+  apply-model-build:
+    name: Model Build
+    if: ${{ inputs.operation == 'apply' }}
+    needs: [apply-storage, vm-harbor]
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.openstack_lifecycle == 'full-openstack' && 'reinstall' || 'apply' }}
+      phases: model-build
+      do_checkout: false
+      do_cleanup: false
+    secrets: inherit
+
+  apply-proxy:
+    name: Reverse Proxy
+    if: ${{ inputs.operation == 'apply' }}
+    needs: [vm-gitlab, vm-harbor]
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.openstack_lifecycle == 'full-openstack' && 'reinstall' || 'apply' }}
+      phases: proxy
+      do_checkout: false
+      do_cleanup: false
+    secrets: inherit
+
+  apply-finalize:
+    name: Finalize
+    if: ${{ always() && inputs.operation == 'apply' }}
+    needs: [apply-model-build, apply-proxy]
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: apply
+      run_mode: ${{ inputs.openstack_lifecycle == 'full-openstack' && 'reinstall' || 'apply' }}
+      phases: finalize
+      validate_gpu: ${{ inputs.validate_gpu }}
+      do_checkout: false
+      do_cleanup: true
+    secrets: inherit
+
+  destroy:
+    name: Destroy
+    if: ${{ inputs.operation == 'destroy' }}
+    uses: ./.github/workflows/private-cloud-remote.yml
+    with:
+      command: destroy
+      cleanup_devstack: ${{ inputs.openstack_lifecycle == 'full-openstack' }}
+      do_checkout: true
+      do_cleanup: true
+    secrets: inherit

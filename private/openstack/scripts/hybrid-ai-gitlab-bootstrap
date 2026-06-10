@@ -131,6 +131,7 @@ has_required_packages() {
 ensure_packages() {
   export DEBIAN_FRONTEND=noninteractive
   export NEEDRESTART_MODE=a
+  export NEEDRESTART_SUSPEND=1
   local apt_get_common=(
     -o Acquire::ForceIPv4=true
     -o Acquire::Retries=5
@@ -226,6 +227,11 @@ gitlab_rails['gitlab_shell_ssh_port'] = 2222
 gitlab_rails['usage_ping_enabled'] = false
 gitlab_rails['log_level'] = 'warn'
 gitlab_rails['time_zone'] = 'UTC'
+gitlab_rails['env'] = {
+  'TMPDIR' => '/tmp',
+  'TEMP' => '/tmp',
+  'TMP' => '/tmp'
+}
 puma['worker_processes'] = 1
 puma['min_threads'] = 2
 puma['max_threads'] = 3
@@ -292,9 +298,27 @@ load_gitlab_image_archive() {
   docker image inspect "$GITLAB_IMAGE" >/dev/null 2>&1
 }
 
+gitlab_rails_tmpfs_enabled() {
+  [[ "${GITLAB_RAILS_TMPFS_ENABLED:-false}" == "true" ]]
+}
+
+container_has_required_io_profile() {
+  local tmpfs_paths
+
+  tmpfs_paths="$(docker inspect -f '{{range $path, $_ := .HostConfig.Tmpfs}}{{println $path}}{{end}}' gitlab 2>/dev/null || true)"
+  grep -qx '/tmp' <<<"$tmpfs_paths" || return 1
+  if gitlab_rails_tmpfs_enabled; then
+    grep -qx '/var/opt/gitlab/gitlab-rails/tmp' <<<"$tmpfs_paths"
+  else
+    ! grep -qx '/var/opt/gitlab/gitlab-rails/tmp' <<<"$tmpfs_paths"
+  fi
+}
+
 ensure_container() {
   local current_image=""
   local current_status=""
+  local blkio_weight="${GITLAB_DOCKER_BLKIO_WEIGHT:-300}"
+  local docker_run_args=()
 
   current_image="$(docker inspect -f '{{.Config.Image}}' gitlab 2>/dev/null || true)"
   current_status="$(docker inspect -f '{{.State.Status}}' gitlab 2>/dev/null || true)"
@@ -307,14 +331,27 @@ ensure_container() {
     return 0
   fi
 
+  if [[ -n "$current_image" && "$current_image" == "$GITLAB_IMAGE" && "${GITLAB_RECREATE_FOR_IO_PROFILE:-true}" == "true" ]]; then
+    if ! container_has_required_io_profile; then
+      echo "Recreating GitLab container with tmpfs-backed transient IO paths"
+      docker rm -f gitlab >/dev/null 2>&1 || true
+      current_image=""
+      current_status=""
+    fi
+  fi
+
   if [[ -z "$current_image" || "$current_image" != "$GITLAB_IMAGE" ]]; then
     docker rm -f gitlab >/dev/null 2>&1 || true
     if ! load_gitlab_image_archive; then
       docker pull "$GITLAB_IMAGE"
     fi
-    docker run --detach \
+    docker_run_args=(
+      --detach
       --hostname "$GITLAB_DOMAIN" \
       --env GITLAB_OMNIBUS_CONFIG="from_file('/etc/gitlab/omnibus_config.rb')" \
+      --env TMPDIR=/tmp \
+      --env TEMP=/tmp \
+      --env TMP=/tmp \
       --publish 80:80 \
       --publish 2222:22 \
       --name gitlab \
@@ -322,12 +359,17 @@ ensure_container() {
       --log-driver local \
       --log-opt "max-size=${GITLAB_DOCKER_LOG_MAX_SIZE:-10m}" \
       --log-opt "max-file=${GITLAB_DOCKER_LOG_MAX_FILE:-3}" \
+      --blkio-weight "${blkio_weight}" \
       --tmpfs "/tmp:rw,nosuid,nodev,size=${GITLAB_TMPFS_SIZE:-1g}" \
       --volume /srv/gitlab/config:/etc/gitlab \
       --volume /srv/gitlab/logs:/var/log/gitlab \
       --volume /srv/gitlab/data:/var/opt/gitlab \
-      --shm-size 256m \
-      "$GITLAB_IMAGE"
+      --shm-size 256m
+    )
+    if gitlab_rails_tmpfs_enabled; then
+      docker_run_args+=(--tmpfs "/var/opt/gitlab/gitlab-rails/tmp:rw,nosuid,nodev,size=${GITLAB_RAILS_TMPFS_SIZE:-512m}")
+    fi
+    docker run "${docker_run_args[@]}" "$GITLAB_IMAGE"
     container_created=true
     return 0
   fi
@@ -335,6 +377,7 @@ ensure_container() {
   if [[ "$current_status" != "running" ]]; then
     docker start gitlab
   fi
+  docker update --blkio-weight "${blkio_weight}" gitlab >/dev/null 2>&1 || true
 }
 
 ensure_container_config_applied() {
@@ -490,6 +533,10 @@ apply_rails_settings() {
   apply_signup_setting
   rails_cli_ready=true
   save_status rails_ready "gitlab_account_settings_applied"
+}
+
+ensure_runtime_services() {
+  docker exec gitlab gitlab-ctl start sidekiq >/dev/null 2>&1 || true
 }
 
 create_bootstrap_pat() {
@@ -776,6 +823,7 @@ main() {
   ensure_container
   ensure_container_config_applied
   wait_for_web
+  ensure_runtime_services
   apply_rails_settings
   ensure_admin_account
   ensure_runner_token

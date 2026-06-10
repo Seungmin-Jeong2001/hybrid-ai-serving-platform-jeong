@@ -1,4 +1,4 @@
-name: Private Cloud CI
+name: Private Cloud Plan
 
 on:
   push:
@@ -7,12 +7,7 @@ on:
     paths:
       - .github/workflows/private-cloud-remote.yml
       - .github/workflows/private-cloud-plan.yml
-      - .github/workflows/private-cloud-apply.yml
-      - .github/workflows/private-cloud-provision.yml
-      - .github/workflows/private-cloud-platform.yml
-      - .github/workflows/private-cloud-registry.yml
-      - .github/workflows/private-cloud-finalize.yml
-      - .github/workflows/private-cloud-destroy.yml
+      - .github/workflows/private-cloud-controller.yml
       - ha
       - private/ci/**
       - private/openstack/**

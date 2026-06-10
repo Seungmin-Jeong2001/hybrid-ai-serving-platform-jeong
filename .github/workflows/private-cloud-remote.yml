@@ -23,7 +23,7 @@ on:
         type: boolean
         default: false
       phases:
-        description: Which apply phase group to run (provision|platform|registry|finalize|all)
+        description: Which apply phase group to run (tools|devstack|proxy|images|terraform|control-plane|build-worker|gpu-worker|k8s|storage|model-build|gitlab|harbor|registry|finalize|provision|platform|all)
         required: false
         type: string
         default: all
@@ -66,6 +66,13 @@ jobs:
             apply|reinstall) ;;
             *)
               echo "::error::run_mode must be one of: apply, reinstall"
+              exit 1
+              ;;
+          esac
+          case "${{ inputs.phases }}" in
+            tools|devstack|proxy|images|terraform|control-plane|build-worker|gpu-worker|k8s|storage|model-build|gitlab|harbor|registry|finalize|provision|platform|all) ;;
+            *)
+              echo "::error::phases must be one of: tools, devstack, proxy, images, terraform, control-plane, build-worker, gpu-worker, k8s, storage, model-build, gitlab, harbor, registry, finalize, provision, platform, all"
               exit 1
               ;;
           esac
@@ -164,6 +171,10 @@ jobs:
           write_env GITLAB_LOGS_TMPFS "$GITLAB_LOGS_TMPFS"
           write_env GITLAB_LOGS_TMPFS_SIZE "$GITLAB_LOGS_TMPFS_SIZE"
           write_env GITLAB_TMPFS_SIZE "$GITLAB_TMPFS_SIZE"
+          write_env GITLAB_RAILS_TMPFS_ENABLED "$GITLAB_RAILS_TMPFS_ENABLED"
+          write_env GITLAB_RAILS_TMPFS_SIZE "$GITLAB_RAILS_TMPFS_SIZE"
+          write_env GITLAB_DOCKER_BLKIO_WEIGHT "$GITLAB_DOCKER_BLKIO_WEIGHT"
+          write_env GITLAB_RECREATE_FOR_IO_PROFILE "$GITLAB_RECREATE_FOR_IO_PROFILE"
           write_env GITLAB_DOCKER_LOG_MAX_SIZE "$GITLAB_DOCKER_LOG_MAX_SIZE"
           write_env GITLAB_DOCKER_LOG_MAX_FILE "$GITLAB_DOCKER_LOG_MAX_FILE"
           write_env HARBOR_ADMIN_PASSWORD "$HARBOR_ADMIN_PASSWORD"
@@ -238,6 +249,10 @@ jobs:
           GITLAB_LOGS_TMPFS: ${{ vars.GITLAB_LOGS_TMPFS || 'true' }}
           GITLAB_LOGS_TMPFS_SIZE: ${{ vars.GITLAB_LOGS_TMPFS_SIZE || '512m' }}
           GITLAB_TMPFS_SIZE: ${{ vars.GITLAB_TMPFS_SIZE || '1g' }}
+          GITLAB_RAILS_TMPFS_ENABLED: ${{ vars.GITLAB_RAILS_TMPFS_ENABLED || 'false' }}
+          GITLAB_RAILS_TMPFS_SIZE: ${{ vars.GITLAB_RAILS_TMPFS_SIZE || '512m' }}
+          GITLAB_DOCKER_BLKIO_WEIGHT: ${{ vars.GITLAB_DOCKER_BLKIO_WEIGHT || '300' }}
+          GITLAB_RECREATE_FOR_IO_PROFILE: ${{ vars.GITLAB_RECREATE_FOR_IO_PROFILE || 'true' }}
           GITLAB_DOCKER_LOG_MAX_SIZE: ${{ vars.GITLAB_DOCKER_LOG_MAX_SIZE || '10m' }}
           GITLAB_DOCKER_LOG_MAX_FILE: ${{ vars.GITLAB_DOCKER_LOG_MAX_FILE || '3' }}
           HARBOR_ADMIN_PASSWORD: ${{ secrets.HARBOR_ADMIN_PASSWORD }}
@@ -251,10 +266,10 @@ jobs:
           GPU_WORKER_IMAGE_NAME: ${{ vars.GPU_WORKER_IMAGE_NAME || 'ubuntu-22.04' }}
           GPU_WORKER_FLAVOR_NAME: ${{ vars.GPU_WORKER_FLAVOR_NAME || 'g1.large' }}
           GPU_DRIVER_PACKAGE: ${{ vars.GPU_DRIVER_PACKAGE || vars.OPENSTACK_IMAGE_CACHE_DRIVER_PACKAGE || 'nvidia-driver-595-open' }}
-          GPU_CUDA_TOOLKIT_PACKAGE: ${{ vars.GPU_CUDA_TOOLKIT_PACKAGE || 'cuda-toolkit-12-1' }}
+          GPU_CUDA_TOOLKIT_PACKAGE: ${{ vars.GPU_CUDA_TOOLKIT_PACKAGE || 'cuda-toolkit-12-8' }}
           GPU_CUDNN_PACKAGE: ${{ vars.GPU_CUDNN_PACKAGE || 'cudnn9-cuda-12' }}
-          GPU_TRAINING_PYTORCH_CUDA_INDEX_URL: ${{ vars.GPU_TRAINING_PYTORCH_CUDA_INDEX_URL || 'https://download.pytorch.org/whl/cu121' }}
-          GPU_TRAINING_PYTHON_PACKAGES_JSON: ${{ vars.GPU_TRAINING_PYTHON_PACKAGES_JSON || '["torch==2.1.0+cu121","torchvision==0.16.0+cu121","torchaudio==2.1.0+cu121","numpy==1.26.4","pandas==2.2.2","scipy==1.11.4","scikit-learn==1.4.2","matplotlib==3.8.4","seaborn==0.13.2","notebook==7.2.2","ipykernel==6.29.5","minio==7.2.8"]' }}
+          GPU_TRAINING_PYTORCH_CUDA_INDEX_URL: ${{ vars.GPU_TRAINING_PYTORCH_CUDA_INDEX_URL || 'https://download.pytorch.org/whl/cu128' }}
+          GPU_TRAINING_PYTHON_PACKAGES_JSON: ${{ vars.GPU_TRAINING_PYTHON_PACKAGES_JSON || '["torch==2.7.0+cu128","torchvision==0.22.0+cu128","torchaudio==2.7.0+cu128","numpy==1.26.4","pandas==2.2.2","scipy==1.11.4","scikit-learn==1.4.2","matplotlib==3.8.4","seaborn==0.13.2","notebook==7.2.2","ipykernel==6.29.5","minio==7.2.8"]' }}
           GITLAB_COUNT: ${{ vars.GITLAB_COUNT || '1' }}
           GITLAB_IMAGE_NAME: ${{ vars.GITLAB_IMAGE_NAME || 'ubuntu-22.04' }}
           GITLAB_FLAVOR_NAME: ${{ vars.GITLAB_FLAVOR_NAME || 'ha.m1.gitlab' }}

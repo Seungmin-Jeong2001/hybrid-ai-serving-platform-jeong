@@ -179,6 +179,7 @@ has_required_packages() {
 ensure_packages() {
   export DEBIAN_FRONTEND=noninteractive
   export NEEDRESTART_MODE=a
+  export NEEDRESTART_SUSPEND=1
 
   if ! has_required_packages; then
     wait_for_install_egress

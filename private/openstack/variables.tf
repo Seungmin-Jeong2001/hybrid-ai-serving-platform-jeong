@@ -223,7 +223,7 @@ variable "enable_gpu_cuda_bootstrap" {
 variable "gpu_cuda_toolkit_package" {
   description = "CUDA Toolkit apt package installed on GPU workers."
   type        = string
-  default     = "cuda-toolkit-12-1"
+  default     = "cuda-toolkit-12-8"
 }
 
 variable "gpu_cudnn_package" {
@@ -247,7 +247,7 @@ variable "gpu_training_venv_path" {
 variable "gpu_training_pytorch_cuda_index_url" {
   description = "PyTorch CUDA wheel index used when installing GPU training dependencies."
   type        = string
-  default     = "https://download.pytorch.org/whl/cu121"
+  default     = "https://download.pytorch.org/whl/cu128"
 }
 
 variable "gpu_training_pip_cache_dir" {
@@ -260,9 +260,9 @@ variable "gpu_training_python_packages" {
   description = "Python packages installed into the GPU worker model-training virtual environment."
   type        = list(string)
   default = [
-    "torch==2.1.0+cu121",
-    "torchvision==0.16.0+cu121",
-    "torchaudio==2.1.0+cu121",
+    "torch==2.7.0+cu128",
+    "torchvision==0.22.0+cu128",
+    "torchaudio==2.7.0+cu128",
     "numpy==1.26.4",
     "pandas==2.2.2",
     "scipy==1.11.4",

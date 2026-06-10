@@ -41,18 +41,18 @@ install_node_dependencies = true
 enable_gpu_bootstrap      = true
 gpu_driver_autoinstall    = true
 enable_gpu_cuda_bootstrap = true
-gpu_cuda_toolkit_package  = "cuda-toolkit-12-1"
+gpu_cuda_toolkit_package  = "cuda-toolkit-12-8"
 gpu_cudnn_package         = "cudnn9-cuda-12"
 
 # GPU workers also prepare a Python environment for the feature/model training code.
 enable_gpu_training_bootstrap        = true
 gpu_training_venv_path               = "/opt/hybrid-ai/training-venv"
-gpu_training_pytorch_cuda_index_url  = "https://download.pytorch.org/whl/cu121"
+gpu_training_pytorch_cuda_index_url  = "https://download.pytorch.org/whl/cu128"
 gpu_training_pip_cache_dir           = "/mnt/nfs/hybrid-ai/pip-cache"
 gpu_training_python_packages = [
-  "torch==2.1.0+cu121",
-  "torchvision==0.16.0+cu121",
-  "torchaudio==2.1.0+cu121",
+  "torch==2.7.0+cu128",
+  "torchvision==0.22.0+cu128",
+  "torchaudio==2.7.0+cu128",
   "numpy==1.26.4",
   "pandas==2.2.2",
   "scipy==1.11.4",

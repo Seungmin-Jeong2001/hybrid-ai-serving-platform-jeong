@@ -255,12 +255,7 @@ required_project_paths() {
     "${HA_PROJECT_ROOT}/private/gpu-worker/kustomization.yaml" \
     "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-remote.yml" \
     "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-plan.yml" \
-    "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-apply.yml" \
-    "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-provision.yml" \
-    "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-platform.yml" \
-    "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-registry.yml" \
-    "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-finalize.yml" \
-    "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-destroy.yml"
+    "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-controller.yml"
 }
 
 default_launcher_locations() {

@@ -32,7 +32,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     -h|--help)
-      printf 'usage: ha apply [--run-mode apply|reinstall] [--phases provision|platform|registry|finalize|all] [--validate-gpu] [--require-backend-config]\n'
+      printf 'usage: ha apply [--run-mode apply|reinstall] [--phases tools|devstack|proxy|images|terraform|control-plane|build-worker|gpu-worker|k8s|storage|model-build|gitlab|harbor|registry|finalize|provision|platform|all] [--validate-gpu] [--require-backend-config]\n'
       exit 0
       ;;
     *)
@@ -51,16 +51,18 @@ case "$MODE" in
 esac
 
 case "$PHASES" in
-  provision|platform|registry|finalize|all) ;;
+  tools|devstack|proxy|images|terraform|control-plane|build-worker|gpu-worker|k8s|storage|model-build|gitlab|harbor|registry|finalize|provision|platform|all) ;;
   *)
-    printf 'phases must be one of: provision, platform, registry, finalize, all\n' >&2
+    printf 'phases must be one of: tools, devstack, proxy, images, terraform, control-plane, build-worker, gpu-worker, k8s, storage, model-build, gitlab, harbor, registry, finalize, provision, platform, all\n' >&2
     exit 64
     ;;
 esac
 
-RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-${MODE}}"
+RUN_ID_PHASE="${PHASES//[^[:alnum:]_.-]/_}"
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-${MODE}-${RUN_ID_PHASE}-$$}"
 LOG_DIR="${ROOT}/.ha/ci/runs/${RUN_ID}"
 TIMINGS="${LOG_DIR}/timings.tsv"
+TIMINGS_LOCK="${TIMINGS}.lock"
 mkdir -p "${LOG_DIR}" "${ROOT}/.ha/openstack" "${ROOT}/.ha/ssh"
 PATH="${ROOT}/.ha/bin:${PATH}"
 export TF_IN_AUTOMATION="${TF_IN_AUTOMATION:-true}"
@@ -86,9 +88,13 @@ TF_VAR_BUILD_WORKER_COUNT_INPUT_PROVIDED=false
 TF_VAR_GPU_WORKER_COUNT_INPUT_PROVIDED=false
 TF_VAR_GITLAB_COUNT_INPUT_PROVIDED=false
 TF_VAR_HARBOR_COUNT_INPUT_PROVIDED=false
+# shellcheck disable=SC2034 # read indirectly by effective_worker_count.
 [[ -n "${TF_VAR_build_worker_count+x}" ]] && TF_VAR_BUILD_WORKER_COUNT_INPUT_PROVIDED=true
+# shellcheck disable=SC2034 # read indirectly by effective_worker_count.
 [[ -n "${TF_VAR_gpu_worker_count+x}" ]] && TF_VAR_GPU_WORKER_COUNT_INPUT_PROVIDED=true
+# shellcheck disable=SC2034 # read indirectly by effective_worker_count.
 [[ -n "${TF_VAR_gitlab_count+x}" ]] && TF_VAR_GITLAB_COUNT_INPUT_PROVIDED=true
+# shellcheck disable=SC2034 # read indirectly by effective_worker_count.
 [[ -n "${TF_VAR_harbor_count+x}" ]] && TF_VAR_HARBOR_COUNT_INPUT_PROVIDED=true
 TF_VAR_control_plane_image_name="${TF_VAR_control_plane_image_name:-ubuntu-22.04}"
 TF_VAR_build_worker_image_name="${TF_VAR_build_worker_image_name:-ubuntu-22.04}"
@@ -146,6 +152,10 @@ GITLAB_UPSTREAM_PORT="${GITLAB_UPSTREAM_PORT:-18083}"
 GITLAB_LOGS_TMPFS="${GITLAB_LOGS_TMPFS:-true}"
 GITLAB_LOGS_TMPFS_SIZE="${GITLAB_LOGS_TMPFS_SIZE:-512m}"
 GITLAB_TMPFS_SIZE="${GITLAB_TMPFS_SIZE:-1g}"
+GITLAB_RAILS_TMPFS_ENABLED="${GITLAB_RAILS_TMPFS_ENABLED:-false}"
+GITLAB_RAILS_TMPFS_SIZE="${GITLAB_RAILS_TMPFS_SIZE:-512m}"
+GITLAB_DOCKER_BLKIO_WEIGHT="${GITLAB_DOCKER_BLKIO_WEIGHT:-300}"
+GITLAB_RECREATE_FOR_IO_PROFILE="${GITLAB_RECREATE_FOR_IO_PROFILE:-true}"
 GITLAB_DOCKER_LOG_MAX_SIZE="${GITLAB_DOCKER_LOG_MAX_SIZE:-10m}"
 GITLAB_DOCKER_LOG_MAX_FILE="${GITLAB_DOCKER_LOG_MAX_FILE:-3}"
 HARBOR_INSTALL_ENABLED="${HARBOR_INSTALL_ENABLED:-true}"
@@ -195,6 +205,19 @@ log() {
   printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"
 }
 
+record_timing() {
+  local name="$1" seconds="$2" status="$3" lock_fd
+  if command -v flock >/dev/null 2>&1; then
+    exec {lock_fd}>"${TIMINGS_LOCK}"
+    flock "${lock_fd}"
+    printf '%s\t%s\t%s\n' "${name}" "${seconds}" "${status}" >>"${TIMINGS}"
+    flock -u "${lock_fd}"
+    exec {lock_fd}>&-
+  else
+    printf '%s\t%s\t%s\n' "${name}" "${seconds}" "${status}" >>"${TIMINGS}"
+  fi
+}
+
 write_systemd_env_line() {
   local file="$1" name="$2" value="$3"
   value="${value//\\/\\\\}"
@@ -227,14 +250,14 @@ phase() {
   set -e
   end="$(date +%s)"
   if [[ "${rc}" -eq 0 ]]; then
-    printf '%s\t%s\tok\n' "${name}" "$((end - start))" >>"${TIMINGS}"
+    record_timing "${name}" "$((end - start))" ok
     log "OK ${name} ($((end - start))s)"
     if [[ "${grouped}" -eq 1 ]]; then
       printf '::endgroup::\n'
     fi
     return 0
   fi
-  printf '%s\t%s\tfailed\n' "${name}" "$((end - start))" >>"${TIMINGS}"
+  record_timing "${name}" "$((end - start))" failed
   log "FAILED ${name} ($((end - start))s); see ${log_file}"
   if [[ "${grouped}" -eq 1 ]]; then
     printf '::endgroup::\n'
@@ -261,7 +284,7 @@ wait_phase_bg() {
 
 require_tools() {
   local missing=0
-  for tool in curl git lxc python3 ssh scp ssh-keygen terraform kubectl helm; do
+  for tool in curl flock git lxc python3 ssh scp ssh-keygen terraform kubectl helm; do
     if ! command -v "${tool}" >/dev/null 2>&1; then
       printf 'missing tool: %s\n' "${tool}" >&2
       missing=1
@@ -271,13 +294,22 @@ require_tools() {
 }
 
 ensure_ssh_key() {
+  local lock_fd lock_file
+  mkdir -p "$(dirname "${SSH_KEY}")"
+  lock_file="${SSH_KEY}.lock"
+  exec {lock_fd}>"${lock_file}"
+  flock "${lock_fd}"
   if [[ ! -f "${SSH_KEY}" ]]; then
     ssh-keygen -t ed25519 -N '' -f "${SSH_KEY}" >/dev/null
   fi
+  flock -u "${lock_fd}"
+  exec {lock_fd}>&-
 }
 
 write_ssh_config() {
+  local tmp_config
   ensure_ssh_key
+  tmp_config="${SSH_CONFIG}.$$"
   {
     printf 'Host *\n'
     printf '  User ubuntu\n'
@@ -288,8 +320,9 @@ write_ssh_config() {
     printf '  UserKnownHostsFile /dev/null\n'
     printf '  LogLevel ERROR\n'
     printf '  ProxyCommand lxc exec ha-openstack -- nc %%h %%p\n'
-  } >"${SSH_CONFIG}"
-  chmod 600 "${SSH_CONFIG}"
+  } >"${tmp_config}"
+  chmod 600 "${tmp_config}"
+  mv "${tmp_config}" "${SSH_CONFIG}"
 }
 
 wait_lxc_ip() {
@@ -340,10 +373,54 @@ desired_lxc_raw_config() {
   fi
 }
 
+ensure_host_vfio_legacy_group_devices() {
+  local vfio_major group_dir group_id group_node group_devt dev_major dev_minor expected_devt actual_devt
+  local member current_driver has_vfio_device
+
+  [[ -d /dev/vfio ]] || return 0
+  vfio_major="$(awk '$2 == "vfio" {print $1; exit}' /proc/devices)"
+  [[ -n "${vfio_major}" ]] || return 0
+
+  for group_dir in /sys/kernel/iommu_groups/[0-9]*; do
+    [[ -d "${group_dir}" ]] || continue
+    has_vfio_device=0
+    for member in "${group_dir}"/devices/*; do
+      [[ -e "${member}" ]] || continue
+      current_driver="$(basename "$(readlink -f "${member}/driver" 2>/dev/null)" 2>/dev/null || true)"
+      if [[ "${current_driver}" == "vfio-pci" ]]; then
+        has_vfio_device=1
+        break
+      fi
+    done
+    [[ "${has_vfio_device}" == "1" ]] || continue
+
+    group_id="${group_dir##*/}"
+    group_node="/dev/vfio/${group_id}"
+    group_devt="$(cat "/sys/class/vfio/${group_id}/dev" 2>/dev/null || true)"
+    if [[ "${group_devt}" =~ ^[0-9]+:[0-9]+$ ]]; then
+      dev_major="${group_devt%%:*}"
+      dev_minor="${group_devt##*:}"
+    else
+      dev_major="${vfio_major}"
+      dev_minor="${group_id}"
+    fi
+    expected_devt="$(printf '%x:%x' "${dev_major}" "${dev_minor}")"
+    actual_devt="$(stat -c '%t:%T' "${group_node}" 2>/dev/null || true)"
+
+    if [[ -e "${group_node}" && ( ! -c "${group_node}" || "${actual_devt}" != "${expected_devt}" ) ]]; then
+      rm -f "${group_node}" || true
+    fi
+    if [[ ! -e "${group_node}" ]]; then
+      mknod "${group_node}" c "${dev_major}" "${dev_minor}" 2>/dev/null || true
+    fi
+  done
+}
+
 add_lxc_vfio_devices() {
   local group_device group_id
 
   [[ -d /dev/vfio ]] || return 0
+  ensure_host_vfio_legacy_group_devices
   lxc config device add ha-openstack vfio disk source=/dev/vfio path=/dev/vfio >/dev/null 2>&1 || true
   if [[ -c /dev/vfio/vfio ]]; then
     lxc config device add ha-openstack vfio-control unix-char source=/dev/vfio/vfio path=/dev/vfio/vfio >/dev/null 2>&1 || true
@@ -356,7 +433,7 @@ add_lxc_vfio_devices() {
 }
 
 prune_stale_lxc_vfio_devices() {
-  local device source
+  local device source group_id group_devt expected_devt actual_devt dev_major dev_minor
 
   while IFS= read -r device; do
     case "$device" in
@@ -364,8 +441,46 @@ prune_stale_lxc_vfio_devices() {
         source="$(lxc config device get ha-openstack "$device" source 2>/dev/null || true)"
         if [[ -z "$source" || ! -e "$source" ]]; then
           lxc config device remove ha-openstack "$device" >/dev/null 2>&1 || true
+          continue
         fi
-        ;;
+        case "$device" in
+          vfio-group-*)
+            group_id="${device#vfio-group-}"
+            group_devt="$(cat "/sys/class/vfio/${group_id}/dev" 2>/dev/null || true)"
+            if [[ "${group_devt}" =~ ^[0-9]+:[0-9]+$ ]]; then
+              dev_major="${group_devt%%:*}"
+              dev_minor="${group_devt##*:}"
+              expected_devt="$(printf '%x:%x' "${dev_major}" "${dev_minor}")"
+              actual_devt="$(stat -c '%t:%T' "$source" 2>/dev/null || true)"
+              if [[ ! -c "$source" || "$actual_devt" != "$expected_devt" ]]; then
+                lxc config device remove ha-openstack "$device" >/dev/null 2>&1 || true
+              fi
+            fi
+            ;;
+        esac
+      ;;
+    esac
+  done < <(lxc config device list ha-openstack 2>/dev/null || true)
+}
+
+remove_stale_vfio_group_mounts() {
+  local device source group_id group_devt expected_devt actual_devt dev_major dev_minor
+
+  while IFS= read -r device; do
+    case "$device" in
+      vfio-group-*)
+        source="$(lxc config device get ha-openstack "$device" source 2>/dev/null || true)"
+        group_id="${device#vfio-group-}"
+        group_devt="$(cat "/sys/class/vfio/${group_id}/dev" 2>/dev/null || true)"
+        [[ -n "$source" && "${group_devt}" =~ ^[0-9]+:[0-9]+$ ]] || continue
+        dev_major="${group_devt%%:*}"
+        dev_minor="${group_devt##*:}"
+        expected_devt="$(printf '%x:%x' "${dev_major}" "${dev_minor}")"
+        actual_devt="$(stat -c '%t:%T' "$source" 2>/dev/null || true)"
+        if [[ ! -c "$source" || "$actual_devt" != "$expected_devt" ]]; then
+          lxc config device remove ha-openstack "$device" >/dev/null 2>&1 || true
+        fi
+      ;;
     esac
   done < <(lxc config device list ha-openstack 2>/dev/null || true)
 }
@@ -374,6 +489,7 @@ configure_lxc_devices() {
   local kernel_modules_source
   kernel_modules_source="$(readlink -f /lib/modules)"
   prune_stale_lxc_vfio_devices
+  remove_stale_vfio_group_mounts
   lxc config device add ha-openstack kmsg unix-char source=/dev/kmsg path=/dev/kmsg >/dev/null 2>&1 || true
   lxc config device remove ha-openstack host-kernel-modules >/dev/null 2>&1 || true
   lxc config device add ha-openstack host-kernel-modules disk source="${kernel_modules_source}" path=/usr/lib/modules readonly=true >/dev/null 2>&1 || true
@@ -386,6 +502,51 @@ configure_lxc_devices() {
 configure_vfio_guest_access() {
   lxc exec ha-openstack -- bash -s <<'CONFIGURE_VFIO_GUEST_ACCESS'
 set -euo pipefail
+
+ensure_vfio_legacy_group_devices() {
+  local vfio_major group_dir group_id group_node group_devt dev_major dev_minor expected_devt actual_devt
+  local member current_driver has_vfio_device
+
+  [[ -d /dev/vfio ]] || return 0
+  vfio_major="$(awk '$2 == "vfio" {print $1; exit}' /proc/devices)"
+  [[ -n "${vfio_major}" ]] || return 0
+
+  for group_dir in /sys/kernel/iommu_groups/[0-9]*; do
+    [[ -d "${group_dir}" ]] || continue
+    has_vfio_device=0
+    for member in "${group_dir}"/devices/*; do
+      [[ -e "${member}" ]] || continue
+      current_driver="$(basename "$(readlink -f "${member}/driver" 2>/dev/null)" 2>/dev/null || true)"
+      if [[ "${current_driver}" == "vfio-pci" ]]; then
+        has_vfio_device=1
+        break
+      fi
+    done
+    [[ "${has_vfio_device}" == "1" ]] || continue
+
+    group_id="${group_dir##*/}"
+    group_node="/dev/vfio/${group_id}"
+    group_devt="$(cat "/sys/class/vfio/${group_id}/dev" 2>/dev/null || true)"
+    if [[ "${group_devt}" =~ ^[0-9]+:[0-9]+$ ]]; then
+      dev_major="${group_devt%%:*}"
+      dev_minor="${group_devt##*:}"
+    else
+      dev_major="${vfio_major}"
+      dev_minor="${group_id}"
+    fi
+    expected_devt="$(printf '%x:%x' "${dev_major}" "${dev_minor}")"
+    actual_devt="$(stat -c '%t:%T' "${group_node}" 2>/dev/null || true)"
+
+    if [[ -e "${group_node}" && ( ! -c "${group_node}" || "${actual_devt}" != "${expected_devt}" ) ]]; then
+      rm -f "${group_node}" || true
+    fi
+    if [[ ! -e "${group_node}" ]]; then
+      mknod "${group_node}" c "${dev_major}" "${dev_minor}" 2>/dev/null || true
+    fi
+  done
+}
+
+ensure_vfio_legacy_group_devices
 
 if [[ -d /dev/vfio ]]; then
   for dev in /dev/vfio/vfio /dev/vfio/[0-9]*; do
@@ -457,6 +618,8 @@ install_devstack_prereqs() {
   lxc exec ha-openstack -- bash -lc '
     set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_MODE=a
+    export NEEDRESTART_SUSPEND=1
     apt-get update -qq
     apt-get install -y -qq git sudo curl ca-certificates iproute2 net-tools kmod openssh-client netcat-openbsd python3-openstackclient
     id stack >/dev/null 2>&1 || useradd -s /bin/bash -d /opt/stack -m stack
@@ -527,11 +690,20 @@ for member in "${group_dir}"/devices/*; do
   member_bdf="${member##*/}"
   class="$(cat "${member}/class" 2>/dev/null || true)"
   class="$(printf '%s' "${class#0x}" | tr '[:upper:]' '[:lower:]')"
-  [[ "$class" == 06* ]] && continue
-  current_driver="$(basename "$(readlink -f "${member}/driver" 2>/dev/null)" 2>/dev/null || true)"
+  current_driver=""
+  driver_path=""
+  if [[ -L "${member}/driver" ]]; then
+    driver_path="$(readlink -f "${member}/driver" 2>/dev/null || true)"
+    current_driver="${driver_path##*/}"
+  fi
+  if [[ "$class" == 06* ]]; then
+    if [[ -n "$current_driver" && "$current_driver" != "vfio-pci" ]]; then
+      [[ -n "$driver_path" ]] && printf '%s' "$member_bdf" >"${driver_path}/unbind" || true
+    fi
+    continue
+  fi
   [[ "$current_driver" == "vfio-pci" ]] && continue
   printf vfio-pci >"${member}/driver_override"
-  driver_path="$(readlink -f "${member}/driver" 2>/dev/null || true)"
   [[ -n "$driver_path" ]] && printf '%s' "$member_bdf" >"${driver_path}/unbind"
   printf '%s' "$member_bdf" >/sys/bus/pci/drivers_probe
 done
@@ -866,6 +1038,7 @@ guard_unmanaged_openstack_stack() {
   managed_compute="${managed_compute:-0}"
   [[ "$managed_compute" -eq 0 ]] || return 0
 
+  # shellcheck disable=SC2016
   existing_servers="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc '
     set -euo pipefail
     prefix="$1"
@@ -1353,7 +1526,7 @@ prefix="${public_cidr#*/}"
 printf 'public_cidr=%s\n' "$public_cidr"
 printf 'public_gateway_cidr=%s/%s\n' "$public_gateway" "$prefix"
 LOOKUP_PUBLIC_EGRESS
-  # shellcheck disable=SC1090
+  # shellcheck disable=SC1091
   source "${LOG_DIR}/public-egress.env" || true
   [[ -n "${public_cidr:-}" && -n "${public_gateway_cidr:-}" ]] || return 0
   lxc exec ha-openstack -- bash -s -- "${public_cidr}" "${public_gateway_cidr}" <<'ENSURE_PUBLIC_EGRESS'
@@ -1444,8 +1617,10 @@ install_host_caddy_if_needed() {
   fi
 
   sudo systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service >/dev/null 2>&1 || true
-  sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Lock::Timeout=900 update -qq
-  sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Lock::Timeout=900 install -y -qq caddy openssl
+  sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
+    apt-get -o Dpkg::Lock::Timeout=900 update -qq
+  sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
+    apt-get -o Dpkg::Lock::Timeout=900 install -y -qq caddy openssl
 }
 
 ensure_internal_tls_certificate() {
@@ -1529,8 +1704,10 @@ setup_host_reverse_proxy() {
 
   sudo install -m 0644 -o root -g root "${config_path}" /etc/caddy/Caddyfile
   sudo systemctl daemon-reload
-  # shellcheck disable=SC1090
-  set -a; source "${LOG_DIR}/caddy.env"; set +a
+  set -a
+  # shellcheck disable=SC1091
+  source "${LOG_DIR}/caddy.env"
+  set +a
   sudo --preserve-env=HA_CADDY_ACME_EMAIL,HA_OPENSTACK_DOMAIN,HA_K8S_DOMAIN,HA_GRAFANA_DOMAIN,HA_ARGOCD_DOMAIN,HA_GIT_DOMAIN,HA_HARBOR_DOMAIN,HA_OPENSTACK_HORIZON_UPSTREAM,HA_K8S_DASHBOARD_UPSTREAM,HA_GRAFANA_UPSTREAM,HA_ARGOCD_UPSTREAM,HA_GITLAB_UPSTREAM,HA_HARBOR_UPSTREAM,CLOUDFLARE_API_TOKEN \
     caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
   sudo systemctl enable --now caddy
@@ -1625,6 +1802,8 @@ setup_lxc_reverse_proxy() {
 set -euo pipefail
 base_domain="$1"
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
 systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service >/dev/null 2>&1 || true
 if ! command -v caddy >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
   apt-get -o Dpkg::Lock::Timeout=900 update -qq
@@ -1707,6 +1886,7 @@ devstack_apply_check() {
 
 devstack_openrc_password() {
   command -v lxc >/dev/null 2>&1 || return 0
+  # shellcheck disable=SC2016
   lxc exec ha-openstack -- sudo -u stack -H bash -lc 'cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && printf "%s" "${OS_PASSWORD:-}"' 2>/dev/null || true
 }
 
@@ -2003,6 +2183,110 @@ PY
   return "$rc"
 }
 
+write_role_node_inventory() {
+  local output="$1"
+  local tf_key="$2"
+
+  python3 - "${TF_OUTPUT_JSON}" "$tf_key" >"$output" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+
+for node in data.get(sys.argv[2], {}).get("value", []):
+    ip = node.get("floating_ip") or node.get("private_ip")
+    if ip:
+        print(f"{ip}\t{node.get('name', '')}")
+PY
+}
+
+inspect_one_node() {
+  local ip="$1"
+  local name="$2"
+  local role="$3"
+
+  wait_one_node_ssh "$ip" "$name"
+  ssh -F "${SSH_CONFIG}" -o ConnectTimeout=10 "$ip" bash -s -- "$role" "$name" <<'REMOTE'
+set -euo pipefail
+role="$1"
+name="$2"
+cloud_init_status=0
+cloud_init_output=""
+printf 'vm_role=%s\n' "$role"
+printf 'vm_name=%s\n' "$name"
+printf 'hostname=%s\n' "$(hostname -f 2>/dev/null || hostname)"
+printf 'kernel=%s\n' "$(uname -r)"
+printf 'uptime='
+uptime || true
+printf '\n== cloud-init ==\n'
+if command -v cloud-init >/dev/null 2>&1; then
+  cloud_init_output="$(cloud-init status --long 2>&1)" || cloud_init_status=$?
+  printf '%s\n' "$cloud_init_output"
+  if grep -Eq '^(status|extended_status): error' <<<"$cloud_init_output"; then
+    cloud_init_status=1
+  fi
+else
+  echo "cloud-init not installed"
+fi
+printf '\n== memory ==\n'
+free -h || true
+printf '\n== filesystems ==\n'
+df -h / /var/lib/docker /srv/gitlab /data 2>/dev/null || df -h /
+printf '\n== block devices ==\n'
+if command -v lsblk >/dev/null 2>&1; then
+  lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS
+fi
+printf '\n== io sample ==\n'
+if command -v iostat >/dev/null 2>&1; then
+  iostat -xz 1 2 || true
+else
+  echo "iostat not installed"
+fi
+printf '\n== failed units ==\n'
+systemctl --failed --no-pager || true
+if [[ "$role" == "gpu-worker" ]]; then
+  gpu_dependency_status=0
+  printf '\n== gpu dependency check ==\n'
+  if sudo test -x /usr/local/sbin/hybrid-ai-dependency-check; then
+    sudo /usr/local/sbin/hybrid-ai-dependency-check || gpu_dependency_status=$?
+  else
+    echo "missing GPU dependency check: /usr/local/sbin/hybrid-ai-dependency-check" >&2
+    gpu_dependency_status=1
+  fi
+  if [[ "$cloud_init_status" -ne 0 && "$gpu_dependency_status" -eq 0 ]]; then
+    echo "cloud-init reported a previous error, but the GPU runtime dependency check passed"
+  fi
+  exit "$gpu_dependency_status"
+fi
+exit "$cloud_init_status"
+REMOTE
+}
+
+wait_role_nodes_ssh() {
+  local role="$1"
+  local tf_key="$2"
+  local inventory="${LOG_DIR}/${role}-inventory.tsv"
+  local pids=()
+  local pid rc=0
+
+  write_ssh_config
+  write_role_node_inventory "$inventory" "$tf_key"
+  if [[ ! -s "$inventory" ]]; then
+    log "SKIP ${role}: no nodes in Terraform output key ${tf_key}"
+    return 0
+  fi
+
+  while IFS=$'\t' read -r ip name; do
+    ( inspect_one_node "$ip" "$name" "$role" ) &
+    pids+=("$!")
+  done <"$inventory"
+  for pid in "${pids[@]}"; do
+    wait "$pid" || rc=1
+  done
+  return "$rc"
+}
+
 first_control_plane_ip() {
   python3 - "${TF_OUTPUT_JSON}" <<'PY'
 import json
@@ -2044,7 +2328,9 @@ start_kubectl_tunnel() {
   first_cp_ip="$(first_control_plane_ip)"
   [[ -n "${first_cp_ip}" ]] || return 1
   pgrep -f "ssh .*127.0.0.1:${HA_KUBECTL_TUNNEL_PORT}:127.0.0.1:6443" | xargs -r kill || true
-  ssh -F "${SSH_CONFIG}" -fN -L "127.0.0.1:${HA_KUBECTL_TUNNEL_PORT}:127.0.0.1:6443" "${first_cp_ip}"
+  ssh -F "${SSH_CONFIG}" -fN -o ExitOnForwardFailure=yes \
+    -L "127.0.0.1:${HA_KUBECTL_TUNNEL_PORT}:127.0.0.1:6443" \
+    "${first_cp_ip}" </dev/null >/dev/null 2>&1
 }
 
 bootstrap_k8s() {
@@ -2088,13 +2374,14 @@ PY
 }
 
 prepare_nfs_server() {
-  # shellcheck disable=SC1090
+  # shellcheck disable=SC1091
   source "${LOG_DIR}/storage.env"
   ssh -F "${SSH_CONFIG}" "${NFS_SSH_IP}" bash -s -- "${PRIVATE_NETWORK_CIDR}" <<'REMOTE'
 set -euo pipefail
 cidr="$1"
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
 host="$(hostname)"
 short="$(hostname -s)"
 if ! grep -Eq "(^|[[:space:]])${short}([[:space:]]|$)" /etc/hosts; then
@@ -2202,7 +2489,7 @@ for pod in pods:
     fi
     sleep 10
   done
-  # shellcheck disable=SC1090
+  # shellcheck disable=SC1091
   source "${LOG_DIR}/storage.env"
   nfs_values="${LOG_DIR}/nfs-values.yaml"
   cat >"${nfs_values}" <<VALUES
@@ -2274,9 +2561,16 @@ setup_gitlab() {
     "${GITLAB_ADMIN_USERNAME}" \
     "${GITLAB_GPU_RUNNER_NAME_PREFIX}" \
     "${GITLAB_GPU_RUNNER_TAGS}" \
-    "" \
     "5400" \
-    "" <<'REMOTE'
+    "${GITLAB_LOGS_TMPFS}" \
+    "${GITLAB_LOGS_TMPFS_SIZE}" \
+    "${GITLAB_TMPFS_SIZE}" \
+    "${GITLAB_RAILS_TMPFS_ENABLED}" \
+    "${GITLAB_RAILS_TMPFS_SIZE}" \
+    "${GITLAB_DOCKER_BLKIO_WEIGHT}" \
+    "${GITLAB_RECREATE_FOR_IO_PROFILE}" \
+    "${GITLAB_DOCKER_LOG_MAX_SIZE}" \
+    "${GITLAB_DOCKER_LOG_MAX_FILE}" <<'REMOTE'
 set -euo pipefail
 external_url="$1"
 gitlab_domain="$2"
@@ -2285,9 +2579,16 @@ gitlab_signup_enabled="$4"
 gitlab_admin_username="${5:-root}"
 runner_name_prefix="$6"
 runner_tags="$7"
-root_password_file="${8:-}"
-gitlab_bootstrap_wait_seconds="${9:-5400}"
-gitlab_image_archive_source="${10:-}"
+gitlab_bootstrap_wait_seconds="${8:-5400}"
+gitlab_logs_tmpfs="${9:-true}"
+gitlab_logs_tmpfs_size="${10:-512m}"
+gitlab_tmpfs_size="${11:-1g}"
+gitlab_rails_tmpfs_enabled="${12:-false}"
+gitlab_rails_tmpfs_size="${13:-512m}"
+gitlab_docker_blkio_weight="${14:-300}"
+gitlab_recreate_for_io_profile="${15:-true}"
+gitlab_docker_log_max_size="${16:-10m}"
+gitlab_docker_log_max_file="${17:-3}"
 sudo install -d -m 0700 /etc/hybrid-ai
 sudo install -d -m 0755 /usr/local/sbin /var/lib/hybrid-ai/gitlab-bootstrap /var/cache/hybrid-ai/container-images
 env_file_tmp="$(mktemp)"
@@ -2307,11 +2608,15 @@ write_env_line GITLAB_ROOT_PASSWORD_FILE /etc/hybrid-ai/gitlab-root-password
 write_env_line GITLAB_GPU_RUNNER_NAME_PREFIX "$runner_name_prefix"
 write_env_line GITLAB_GPU_RUNNER_TAGS "$runner_tags"
 write_env_line GITLAB_BOOTSTRAP_WAIT_SECONDS "$gitlab_bootstrap_wait_seconds"
-write_env_line GITLAB_LOGS_TMPFS "${GITLAB_LOGS_TMPFS}"
-write_env_line GITLAB_LOGS_TMPFS_SIZE "${GITLAB_LOGS_TMPFS_SIZE}"
-write_env_line GITLAB_TMPFS_SIZE "${GITLAB_TMPFS_SIZE}"
-write_env_line GITLAB_DOCKER_LOG_MAX_SIZE "${GITLAB_DOCKER_LOG_MAX_SIZE}"
-write_env_line GITLAB_DOCKER_LOG_MAX_FILE "${GITLAB_DOCKER_LOG_MAX_FILE}"
+write_env_line GITLAB_LOGS_TMPFS "$gitlab_logs_tmpfs"
+write_env_line GITLAB_LOGS_TMPFS_SIZE "$gitlab_logs_tmpfs_size"
+write_env_line GITLAB_TMPFS_SIZE "$gitlab_tmpfs_size"
+write_env_line GITLAB_RAILS_TMPFS_ENABLED "$gitlab_rails_tmpfs_enabled"
+write_env_line GITLAB_RAILS_TMPFS_SIZE "$gitlab_rails_tmpfs_size"
+write_env_line GITLAB_DOCKER_BLKIO_WEIGHT "$gitlab_docker_blkio_weight"
+write_env_line GITLAB_RECREATE_FOR_IO_PROFILE "$gitlab_recreate_for_io_profile"
+write_env_line GITLAB_DOCKER_LOG_MAX_SIZE "$gitlab_docker_log_max_size"
+write_env_line GITLAB_DOCKER_LOG_MAX_FILE "$gitlab_docker_log_max_file"
 sudo install -m 0644 -o root -g root "$env_file_tmp" /etc/hybrid-ai/gitlab-bootstrap.env
 rm -f "$env_file_tmp"
 sudo tee /etc/systemd/system/hybrid-ai-gitlab-bootstrap.service >/dev/null <<'EOF'
@@ -2573,8 +2878,7 @@ setup_registry_services_parallel() {
 # remote bash process keeps running as an orphan and holds devstack/terraform).
 # Excludes the current process tree (own PID, parent, and process group).
 terminate_stale_apply_processes() {
-  local script_path self_pid self_ppid self_pgid pids pid victim_pgid
-  script_path="${BASH_SOURCE[0]}"
+  local self_pid self_ppid self_pgid pids pid victim_pgid
   self_pid="$$"
   self_ppid="$PPID"
   self_pgid="$(ps -o pgid= -p "$self_pid" 2>/dev/null | tr -d ' ' || true)"
@@ -2596,47 +2900,94 @@ terminate_stale_apply_processes() {
   kill -TERM "${to_kill[@]}" 2>/dev/null || true
   sleep 3
   for pid in "${to_kill[@]}"; do
-    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
   done
 }
 
-# Acquire a per-phase lock so the same phase cannot run twice concurrently on the
-# host. Different phases (platform vs registry) use different lock files so they
-# can run in parallel. Run-level exclusivity is handled by GitHub Actions
-# concurrency; this guards against overlapping local/manual invocations.
-acquire_phase_lock() {
-  local phase_name="$1"
-  local lock_dir lock_file
-  lock_dir="${ROOT}/.ha/ci/locks"
-  mkdir -p "$lock_dir"
-  lock_file="${lock_dir}/${phase_name}.lock"
-  exec {PHASE_LOCK_FD}>"$lock_file"
-  if ! flock -n "$PHASE_LOCK_FD"; then
-    printf 'another "%s" phase is already running on this host (lock: %s)\n' \
-      "$phase_name" "$lock_file" >&2
-    exit 1
-  fi
+release_phase_lock() {
+  local lock_path
+  lock_path="${PHASE_LOCK_PATH:-}"
+  [[ -n "$lock_path" ]] || return 0
+  case "$lock_path" in
+    "${ROOT}/.ha/ci/locks/"*.lockdir)
+      rm -rf -- "$lock_path"
+      PHASE_LOCK_PATH=""
+      ;;
+  esac
 }
 
-run_provision_phases() {
+# Acquire a per-phase lock so the same phase cannot run twice concurrently on the
+# host. Use a lock directory instead of an inherited FD lock: phase work is
+# streamed through pipelines and long-lived children must not keep the lock alive.
+acquire_phase_lock() {
+  local phase_name="$1"
+  local lock_dir lock_path owner_pid
+  lock_dir="${ROOT}/.ha/ci/locks"
+  mkdir -p "$lock_dir"
+  lock_path="${lock_dir}/${phase_name}.lockdir"
+
+  if mkdir "$lock_path" 2>/dev/null; then
+    printf '%s\n' "$$" >"${lock_path}/pid"
+    PHASE_LOCK_PATH="$lock_path"
+    trap release_phase_lock EXIT
+    return 0
+  fi
+
+  owner_pid="$(cat "${lock_path}/pid" 2>/dev/null || true)"
+  if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+    rm -rf -- "$lock_path"
+    if mkdir "$lock_path" 2>/dev/null; then
+      printf '%s\n' "$$" >"${lock_path}/pid"
+      PHASE_LOCK_PATH="$lock_path"
+      trap release_phase_lock EXIT
+      return 0
+    fi
+  fi
+
+  printf 'another "%s" phase is already running on this host (lock: %s owner_pid=%s)\n' \
+    "$phase_name" "$lock_path" "${owner_pid:-unknown}" >&2
+  exit 1
+}
+
+run_tools_phases() {
   phase require_tools require_tools
+}
+
+run_devstack_steps() {
   if [[ "${MODE}" == "reinstall" ]]; then
     phase devstack_reinstall devstack_reinstall
   else
     phase devstack_apply_check devstack_apply_check
   fi
+}
+
+run_proxy_steps() {
   phase setup_reverse_proxy setup_reverse_proxy
+}
+
+run_images_steps() {
   phase prepare_cached_images prepare_cached_images
+}
+
+run_terraform_steps() {
   phase terraform_apply terraform_apply
 }
 
-run_platform_phases() {
+run_k8s_steps() {
   phase bootstrap_k8s bootstrap_k8s
+}
+
+run_storage_steps() {
   if optional_apply_phase_enabled "${HA_PRIVATE_CLOUD_SETUP_STORAGE}"; then
     phase setup_storage setup_storage
   else
     skip_phase setup_storage "disabled for lightweight Actions stack"
   fi
+}
+
+run_model_build_steps() {
   if optional_apply_phase_enabled "${HA_PRIVATE_CLOUD_SETUP_MODEL_BUILD}"; then
     phase setup_model_build_platform setup_model_build_platform
   else
@@ -2644,7 +2995,91 @@ run_platform_phases() {
   fi
 }
 
+run_devstack_phases() {
+  run_tools_phases
+  run_devstack_steps
+}
+
+run_proxy_phases() {
+  run_tools_phases
+  run_proxy_steps
+}
+
+run_images_phases() {
+  run_tools_phases
+  run_images_steps
+}
+
+run_terraform_phases() {
+  run_tools_phases
+  run_terraform_steps
+}
+
+run_control_plane_phases() {
+  run_tools_phases
+  phase wait_control_plane_vm wait_role_nodes_ssh control-plane control_plane_nodes
+}
+
+run_build_worker_phases() {
+  run_tools_phases
+  phase wait_build_worker_vm wait_role_nodes_ssh build-worker build_worker_nodes
+}
+
+run_gpu_worker_phases() {
+  run_tools_phases
+  phase wait_gpu_worker_vm wait_role_nodes_ssh gpu-worker gpu_worker_nodes
+}
+
+run_k8s_phases() {
+  run_tools_phases
+  run_k8s_steps
+}
+
+run_storage_phases() {
+  run_tools_phases
+  run_storage_steps
+}
+
+run_model_build_phases() {
+  run_tools_phases
+  run_model_build_steps
+}
+
+run_provision_phases() {
+  run_tools_phases
+  run_devstack_steps
+  run_images_steps
+  run_terraform_steps
+  run_proxy_steps
+}
+
+run_platform_phases() {
+  run_tools_phases
+  run_k8s_steps
+  run_storage_steps
+  run_model_build_steps
+}
+
+run_gitlab_phases() {
+  run_tools_phases
+  if optional_apply_phase_enabled "${HA_PRIVATE_CLOUD_SETUP_REGISTRY}"; then
+    phase setup_gitlab setup_gitlab
+  else
+    skip_phase setup_gitlab "disabled for lightweight Actions stack"
+  fi
+}
+
+run_harbor_phases() {
+  run_tools_phases
+  if optional_apply_phase_enabled "${HA_PRIVATE_CLOUD_SETUP_REGISTRY}"; then
+    phase setup_harbor setup_harbor
+  else
+    skip_phase setup_harbor "disabled for lightweight Actions stack"
+  fi
+}
+
 run_registry_phases() {
+  run_tools_phases
   if optional_apply_phase_enabled "${HA_PRIVATE_CLOUD_SETUP_REGISTRY}"; then
     phase setup_registry_services setup_registry_services_parallel
     phase setup_reverse_proxy setup_reverse_proxy
@@ -2668,22 +3103,43 @@ main() {
       ;;
   esac
 
-  # Only the entry phase clears stale orphans. platform/registry run as siblings of
-  # the same GitHub run, so they must not kill each other's process trees.
-  if [[ "${PHASES}" == "provision" || "${PHASES}" == "all" ]]; then
+  # Only the entry phases clear stale orphans. Later jobs in a split GitHub run
+  # must not kill the process tree from another active invocation.
+  if [[ "${PHASES}" == "devstack" || "${PHASES}" == "provision" || "${PHASES}" == "all" ]]; then
     terminate_stale_apply_processes
   fi
   acquire_phase_lock "${PHASES}"
 
   case "${PHASES}" in
+    tools)     run_tools_phases ;;
+    devstack)  run_devstack_phases ;;
+    proxy)     run_proxy_phases ;;
+    images)    run_images_phases ;;
+    terraform) run_terraform_phases ;;
+    control-plane) run_control_plane_phases ;;
+    build-worker) run_build_worker_phases ;;
+    gpu-worker) run_gpu_worker_phases ;;
+    k8s)       run_k8s_phases ;;
+    storage)   run_storage_phases ;;
+    model-build) run_model_build_phases ;;
+    gitlab)    run_gitlab_phases ;;
+    harbor)    run_harbor_phases ;;
     provision) run_provision_phases ;;
     platform)  run_platform_phases ;;
     registry)  run_registry_phases ;;
     finalize)  run_finalize_phases ;;
     all)
-      run_provision_phases
-      run_platform_phases
+      run_tools_phases
+      run_devstack_steps
+      run_images_steps
+      run_terraform_steps
+      run_control_plane_phases
+      run_build_worker_phases
+      run_gpu_worker_phases
       run_registry_phases
+      run_k8s_steps
+      run_storage_steps
+      run_model_build_steps
       run_finalize_phases
       ;;
   esac
