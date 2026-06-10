@@ -33,6 +33,7 @@ Terraform variables
 - OpenStack image cache는 dependency manifest hash 기반으로 재빌드합니다.
 - DevStack full init 캐시는 `.ha/openstack/devstack-cache`에 남기며, APT archives와 root/stack pip cache를 LXD disk device로 재사용합니다.
 - 캐시를 끄려면 `HA_DEVSTACK_CACHE_ENABLED=false`를 Actions 환경에 지정합니다.
+- DevStack 컨테이너 캐시는 `DEVSTACK_LXD_STORAGE_POOL`이 `btrfs`, `zfs`, `lvm` 같은 CoW storage driver를 가리킬 때만 사용합니다. 현재처럼 `dir` driver이면 rootfs 전체 복사 I/O를 피하기 위해 자동으로 건너뜁니다.
 
 ## GitLab bootstrap 변수
 

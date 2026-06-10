@@ -83,6 +83,13 @@ HA_DEVSTACK_CACHE_DIR="${HA_DEVSTACK_CACHE_DIR:-${ROOT}/.ha/openstack/devstack-c
 HA_DEVSTACK_APT_CACHE_DIR="${HA_DEVSTACK_APT_CACHE_DIR:-${HA_DEVSTACK_CACHE_DIR}/apt/archives}"
 HA_DEVSTACK_ROOT_CACHE_DIR="${HA_DEVSTACK_ROOT_CACHE_DIR:-${HA_DEVSTACK_CACHE_DIR}/root-cache}"
 HA_DEVSTACK_STACK_CACHE_DIR="${HA_DEVSTACK_STACK_CACHE_DIR:-${HA_DEVSTACK_CACHE_DIR}/stack-cache}"
+HA_DEVSTACK_LXD_STORAGE_POOL="${HA_DEVSTACK_LXD_STORAGE_POOL:-}"
+HA_DEVSTACK_CONTAINER_CACHE_ENABLED="${HA_DEVSTACK_CONTAINER_CACHE_ENABLED:-${HA_DEVSTACK_CACHE_ENABLED}}"
+HA_DEVSTACK_CONTAINER_CACHE_NAME="${HA_DEVSTACK_CONTAINER_CACHE_NAME:-ha-openstack-devstack-cache}"
+HA_DEVSTACK_CONTAINER_CACHE_RESTORE="${HA_DEVSTACK_CONTAINER_CACHE_RESTORE:-true}"
+HA_DEVSTACK_CONTAINER_CACHE_REFRESH="${HA_DEVSTACK_CONTAINER_CACHE_REFRESH:-true}"
+HA_DEVSTACK_CONTAINER_CACHE_COW_DRIVERS="${HA_DEVSTACK_CONTAINER_CACHE_COW_DRIVERS:-btrfs,zfs,lvm}"
+HA_DEVSTACK_CONTAINER_CACHE_VERSION="${HA_DEVSTACK_CONTAINER_CACHE_VERSION:-20260610.1}"
 PRIVATE_CLOUD_BASE_DOMAIN="${PRIVATE_CLOUD_BASE_DOMAIN:-intp.me}"
 OS_PASSWORD_INPUT_PROVIDED=false
 [[ -n "${OS_PASSWORD+x}" ]] && OS_PASSWORD_INPUT_PROVIDED=true
@@ -217,6 +224,7 @@ HA_PRIVATE_CLOUD_SETUP_MODEL_BUILD="${HA_PRIVATE_CLOUD_SETUP_MODEL_BUILD:-auto}"
 HA_PRIVATE_CLOUD_SYNC_OPENSTACK_USER="${HA_PRIVATE_CLOUD_SYNC_OPENSTACK_USER:-auto}"
 HA_TERRAFORM_APPLY_PARALLELISM="${HA_TERRAFORM_APPLY_PARALLELISM:-2}"
 HA_ALLOW_UNMANAGED_OPENSTACK_STACK="${HA_ALLOW_UNMANAGED_OPENSTACK_STACK:-false}"
+DEVSTACK_CONTAINER_RESTORED_FROM_CACHE=false
 
 printf 'phase\tseconds\tstatus\n' >"${TIMINGS}"
 
@@ -549,6 +557,108 @@ configure_lxc_devices() {
   add_lxc_vfio_devices
 }
 
+remove_transient_lxc_devices() {
+  local instance="$1" device
+
+  while IFS= read -r device; do
+    case "$device" in
+      horizon-proxy|host-kernel-modules|hybrid-ai-devstack-apt-cache|hybrid-ai-devstack-root-cache|hybrid-ai-devstack-stack-cache|"$HA_OPENSTACK_GLANCE_STORE_LXD_DEVICE"|"$HA_OPENSTACK_NOVA_INSTANCES_LXD_DEVICE"|hybrid-ai-image-cache|kmsg|kvm|vfio|vfio-control|vfio-group-*|hybrid-ai-public-http|hybrid-ai-public-https)
+        lxc config device remove "$instance" "$device" >/dev/null 2>&1 || true
+        ;;
+    esac
+  done < <(lxc config device list "$instance" 2>/dev/null || true)
+}
+
+lxc_instance_root_pool() {
+  local instance="$1" pool
+  pool="$(lxc config device get "$instance" root pool 2>/dev/null || true)"
+  if [[ -z "$pool" ]]; then
+    pool="$(lxc profile device get default root pool 2>/dev/null || true)"
+  fi
+  printf '%s\n' "$pool"
+}
+
+lxc_storage_driver() {
+  local pool="$1"
+  [[ -n "$pool" ]] || return 1
+  lxc storage show "$pool" 2>/dev/null | awk '$1 == "driver:" {print $2; exit}'
+}
+
+lxc_storage_driver_supports_container_cache() {
+  local driver="$1"
+  [[ -n "$driver" ]] || return 1
+  case ",${HA_DEVSTACK_CONTAINER_CACHE_COW_DRIVERS}," in
+    *,"$driver",*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+devstack_container_cache_key() {
+  {
+    printf 'version=%s\n' "$HA_DEVSTACK_CONTAINER_CACHE_VERSION"
+    printf 'ubuntu=24.04\n'
+    printf 'password=%s\n' "$HA_DEVSTACK_PASSWORD"
+    printf 'libvirt_type=%s\n' "$HA_DEVSTACK_LIBVIRT_TYPE"
+    printf 'nova_instances_dir=%s\n' "$HA_OPENSTACK_NOVA_INSTANCES_CONTAINER_DIR"
+    printf 'glance_store_dir=%s\n' "$HA_OPENSTACK_GLANCE_STORE_CONTAINER_DIR"
+    printf 'force_raw_images=false\n'
+  } | sha256sum | awk '{print substr($1, 1, 16)}'
+}
+
+restore_devstack_container_cache() {
+  local cache_name cache_key cached_key cache_pool cache_driver raw_lxc
+
+  [[ "${HA_DEVSTACK_CONTAINER_CACHE_ENABLED}" == "true" ]] || return 1
+  [[ "${HA_DEVSTACK_CONTAINER_CACHE_RESTORE}" == "true" ]] || return 1
+
+  cache_name="$HA_DEVSTACK_CONTAINER_CACHE_NAME"
+  lxc info "$cache_name" >/dev/null 2>&1 || return 1
+
+  cache_pool="$(lxc_instance_root_pool "$cache_name")"
+  cache_driver="$(lxc_storage_driver "$cache_pool")"
+  if ! lxc_storage_driver_supports_container_cache "$cache_driver"; then
+    log "DevStack container cache ${cache_name} is on ${cache_driver:-unknown} storage; skipping to avoid I/O-heavy rootfs copy"
+    return 1
+  fi
+
+  cache_key="$(devstack_container_cache_key)"
+  cached_key="$(lxc config get "$cache_name" user.hybrid-ai.devstack-cache-key 2>/dev/null || true)"
+  if [[ "$cached_key" != "$cache_key" ]]; then
+    log "DevStack container cache exists but does not match current config; rebuilding"
+    return 1
+  fi
+
+  log "restoring DevStack container from LXD cache ${cache_name}"
+  lxc stop ha-openstack --force >/dev/null 2>&1 || true
+  lxc delete ha-openstack --force >/dev/null 2>&1 || true
+  lxc copy "$cache_name" ha-openstack --instance-only
+
+  raw_lxc="$(desired_lxc_raw_config)"
+  lxc config set ha-openstack security.nesting true
+  lxc config set ha-openstack security.privileged true
+  lxc config set ha-openstack raw.lxc "$raw_lxc"
+  remove_transient_lxc_devices ha-openstack
+  configure_lxc_devices
+  lxc start ha-openstack
+  wait_lxc_ip
+  configure_vfio_guest_access
+  configure_devstack_apt_cache
+  configure_devstack_user_caches
+  configure_devstack_persistent_storage
+
+  if verify_devstack; then
+    DEVSTACK_CONTAINER_RESTORED_FROM_CACHE=true
+    lxc list ha-openstack
+    return 0
+  fi
+
+  log "cached DevStack container did not become ready; rebuilding from Ubuntu base"
+  lxc stop ha-openstack --force >/dev/null 2>&1 || true
+  lxc delete ha-openstack --force >/dev/null 2>&1 || true
+  DEVSTACK_CONTAINER_RESTORED_FROM_CACHE=false
+  return 1
+}
+
 configure_devstack_cache_mount() {
   local device="$1"
   local host_dir="$2"
@@ -624,6 +734,48 @@ cat >/etc/pip.conf <<'EOF'
 disable-pip-version-check = true
 EOF
 CONFIGURE_DEVSTACK_USER_CACHES
+}
+
+refresh_devstack_container_cache() {
+  local cache_name cache_key pool driver tmp_name was_running
+
+  [[ "${HA_DEVSTACK_CONTAINER_CACHE_ENABLED}" == "true" ]] || return 0
+  [[ "${HA_DEVSTACK_CONTAINER_CACHE_REFRESH}" == "true" ]] || return 0
+  lxc info ha-openstack >/dev/null 2>&1 || return 0
+
+  pool="$(lxc_instance_root_pool ha-openstack)"
+  driver="$(lxc_storage_driver "$pool")"
+  if ! lxc_storage_driver_supports_container_cache "$driver"; then
+    log "skipping DevStack container cache refresh on ${driver:-unknown} storage to avoid I/O-heavy rootfs copy"
+    return 0
+  fi
+
+  cache_name="$HA_DEVSTACK_CONTAINER_CACHE_NAME"
+  cache_key="$(devstack_container_cache_key)"
+  tmp_name="${cache_name}-tmp-$$"
+  was_running="$(lxc list ha-openstack -c s --format csv | tr -d '"')"
+
+  log "refreshing DevStack LXD container cache ${cache_name}"
+  lxc delete "$tmp_name" --force >/dev/null 2>&1 || true
+  if [[ "$was_running" == "RUNNING" ]]; then
+    lxc stop ha-openstack --timeout 60 >/dev/null 2>&1 || lxc stop ha-openstack --force >/dev/null
+  fi
+  lxc copy ha-openstack "$tmp_name" --instance-only
+  if [[ "$was_running" == "RUNNING" ]]; then
+    lxc start ha-openstack
+    wait_lxc_ip
+    verify_devstack
+  fi
+
+  remove_transient_lxc_devices "$tmp_name"
+  lxc config set "$tmp_name" boot.autostart false
+  lxc config set "$tmp_name" user.hybrid-ai.devstack-cache-key "$cache_key"
+  lxc config set "$tmp_name" user.hybrid-ai.devstack-cache-version "$HA_DEVSTACK_CONTAINER_CACHE_VERSION"
+  lxc config set "$tmp_name" user.hybrid-ai.devstack-cache-updated-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  lxc delete "$cache_name" --force >/dev/null 2>&1 || true
+  lxc move "$tmp_name" "$cache_name"
+  lxc list "$cache_name"
 }
 
 configure_vfio_guest_access() {
@@ -726,14 +878,23 @@ CONFIGURE_VFIO_GUEST_ACCESS
 }
 
 create_devstack_container() {
-  local raw_lxc
+  local raw_lxc init_args=()
+  DEVSTACK_CONTAINER_RESTORED_FROM_CACHE=false
+  if restore_devstack_container_cache; then
+    return 0
+  fi
+
   lxc stop ha-openstack --force >/dev/null 2>&1 || true
   lxc delete ha-openstack --force >/dev/null 2>&1 || true
   raw_lxc="$(desired_lxc_raw_config)"
-  lxc init ubuntu:24.04 ha-openstack \
+  init_args=(lxc init ubuntu:24.04 ha-openstack \
     -c security.nesting=true \
     -c security.privileged=true \
-    -c raw.lxc="${raw_lxc}"
+    -c raw.lxc="${raw_lxc}")
+  if [[ -n "$HA_DEVSTACK_LXD_STORAGE_POOL" ]]; then
+    init_args+=(--storage "$HA_DEVSTACK_LXD_STORAGE_POOL")
+  fi
+  "${init_args[@]}"
   configure_lxc_devices
   lxc start ha-openstack
   wait_lxc_ip
@@ -2244,11 +2405,16 @@ setup_reverse_proxy() {
 devstack_reinstall() {
   local product_id
   create_devstack_container
-  install_devstack_prereqs
-  product_id="$(detect_gpu_product)"
-  bind_gpu_vfio "${product_id}"
-  clone_and_configure_devstack "${product_id}"
-  run_devstack
+  if [[ "$DEVSTACK_CONTAINER_RESTORED_FROM_CACHE" != "true" ]]; then
+    install_devstack_prereqs
+    product_id="$(detect_gpu_product)"
+    bind_gpu_vfio "${product_id}"
+    clone_and_configure_devstack "${product_id}"
+    run_devstack
+  else
+    product_id="$(detect_gpu_product)"
+    bind_gpu_vfio "${product_id}"
+  fi
   ensure_horizon_proxy
   ensure_flavors
   configure_gpu_passthrough
@@ -2257,6 +2423,9 @@ devstack_reinstall() {
   ensure_devstack_egress
   configure_horizon_proxy_settings
   verify_devstack
+  if [[ "$DEVSTACK_CONTAINER_RESTORED_FROM_CACHE" != "true" ]]; then
+    refresh_devstack_container_cache
+  fi
 }
 
 devstack_apply_check() {
@@ -3077,7 +3246,11 @@ if ! sudo systemctl start hybrid-ai-gitlab-bootstrap.service; then
   echo "warning: GitLab bootstrap service did not complete on the first attempt" >&2
 fi
 wait_gitlab_local_web() {
-  local deadline=$((SECONDS + 900))
+  local wait_seconds="$gitlab_bootstrap_wait_seconds"
+  if ! [[ "$wait_seconds" =~ ^[0-9]+$ ]] || (( wait_seconds < 60 )); then
+    wait_seconds=5400
+  fi
+  local deadline=$((SECONDS + wait_seconds))
   while (( SECONDS < deadline )); do
     if curl -fsS http://127.0.0.1/-/readiness >/dev/null 2>&1 || curl -fsS http://127.0.0.1/users/sign_in >/dev/null 2>&1; then
       return 0
@@ -3086,7 +3259,13 @@ wait_gitlab_local_web() {
   done
   return 1
 }
-if sudo systemctl is-failed --quiet hybrid-ai-gitlab-bootstrap.service && wait_gitlab_local_web; then
+if ! wait_gitlab_local_web; then
+  sudo systemctl status hybrid-ai-gitlab-bootstrap.service --no-pager || true
+  sudo journalctl -u hybrid-ai-gitlab-bootstrap.service -n 200 --no-pager || true
+  sudo cat /var/lib/hybrid-ai/gitlab-bootstrap/status.env 2>/dev/null || true
+  exit 1
+fi
+if sudo systemctl is-failed --quiet hybrid-ai-gitlab-bootstrap.service; then
   echo "GitLab web became ready after the first bootstrap attempt; retrying idempotent account/token setup"
   sudo systemctl reset-failed hybrid-ai-gitlab-bootstrap.service >/dev/null 2>&1 || true
   if ! sudo systemctl start hybrid-ai-gitlab-bootstrap.service; then
