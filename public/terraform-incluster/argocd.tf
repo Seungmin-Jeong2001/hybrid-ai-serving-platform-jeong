@@ -19,42 +19,42 @@ resource "helm_release" "argocd" {
     yamlencode({
       global = {
         nodeSelector = {
-          workload = "system"
+          workload = "general"
         }
       }
       controller = {
         nodeSelector = {
-          workload = "system"
+          workload = "general"
         }
       }
       dex = {
         nodeSelector = {
-          workload = "system"
+          workload = "general"
         }
       }
       redis = {
         nodeSelector = {
-          workload = "system"
+          workload = "general"
         }
       }
       repoServer = {
         nodeSelector = {
-          workload = "system"
+          workload = "general"
         }
       }
       server = {
         nodeSelector = {
-          workload = "system"
+          workload = "general"
         }
       }
       applicationSet = {
         nodeSelector = {
-          workload = "system"
+          workload = "general"
         }
       }
       notifications = {
         nodeSelector = {
-          workload = "system"
+          workload = "general"
         }
       }
     })

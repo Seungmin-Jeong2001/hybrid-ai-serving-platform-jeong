@@ -37,7 +37,7 @@ resource "helm_release" "aws_load_balancer_controller" {
         }
       }
       nodeSelector = {
-        workload = "system"
+        workload = "general"
       }
     })
   ]
