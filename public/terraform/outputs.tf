@@ -56,6 +56,11 @@ output "inference_worker_role_arn" {
   value       = aws_iam_role.inference_worker.arn
 }
 
+output "dashboard_backend_role_arn" {
+  description = "IAM role ARN for the dashboard-backend service account (IRSA)"
+  value       = aws_iam_role.dashboard_backend.arn
+}
+
 output "ebs_csi_driver_role_arn" {
   description = "IAM role ARN used by the EBS CSI driver add-on"
   value       = aws_iam_role.ebs_csi.arn

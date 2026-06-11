@@ -13,6 +13,7 @@ spec:
       labels:
         app: dashboard-backend
     spec:
+      serviceAccountName: dashboard-backend
       priorityClassName: app-high
       nodeSelector:
         workload: general
