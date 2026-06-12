@@ -534,7 +534,7 @@ jobs:
           ENI_IDS=$(aws ec2 describe-network-interfaces \
             --region "${AWS_REGION}" \
             --filters "Name=vpc-id,Values=${VPC_ID}" \
-            --query "NetworkInterfaces[].[NetworkInterfaceId,Status,Attachment.AttachmentId]" \
+            --query "NetworkInterfaces[].[NetworkInterfaceId,Status,Attachment.AttachmentId,RequesterManaged,Description,Attachment.DeviceIndex,InterfaceType]" \
             --output text)
 
           if [[ -z "${ENI_IDS}" || "${ENI_IDS}" == "None" ]]; then
@@ -542,8 +542,29 @@ jobs:
             exit 0
           fi
 
-          while IFS=$'\t' read -r ENI_ID STATUS ATTACHMENT_ID; do
-            echo "Processing ENI ${ENI_ID} (status: ${STATUS})..."
+          while IFS=$'\t' read -r ENI_ID STATUS ATTACHMENT_ID REQUESTER_MANAGED DESCRIPTION DEVICE_INDEX INTERFACE_TYPE; do
+            echo "Processing ENI ${ENI_ID} (status: ${STATUS}, type: ${INTERFACE_TYPE}, requesterManaged: ${REQUESTER_MANAGED}, deviceIndex: ${DEVICE_INDEX})..."
+
+            if [[ "${REQUESTER_MANAGED}" == "True" ]]; then
+              echo "Skipping requester-managed ENI ${ENI_ID}."
+              continue
+            fi
+
+            if [[ "${ATTACHMENT_ID}" == ela-attach-* ]]; then
+              echo "Skipping ELA-managed attachment for ENI ${ENI_ID}."
+              continue
+            fi
+
+            if [[ "${DEVICE_INDEX}" == "0" ]]; then
+              echo "Skipping primary network interface ${ENI_ID}."
+              continue
+            fi
+
+            if [[ "${DESCRIPTION}" != *ELB* && "${DESCRIPTION}" != *k8s* && "${DESCRIPTION}" != *amazon-eks* ]]; then
+              echo "Skipping ENI ${ENI_ID} because description does not look like a load-balancer/controller ENI: ${DESCRIPTION}"
+              continue
+            fi
+
             if [[ "${STATUS}" == "in-use" && -n "${ATTACHMENT_ID}" && "${ATTACHMENT_ID}" != "None" ]]; then
               echo "Detaching ENI ${ENI_ID} (attachment: ${ATTACHMENT_ID})..."
               aws ec2 detach-network-interface \
