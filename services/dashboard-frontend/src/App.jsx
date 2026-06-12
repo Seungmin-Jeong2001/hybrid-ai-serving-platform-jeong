@@ -74,8 +74,9 @@ export default function App() {
   const [loading, setLoading]         = useState(false);
   const [error, setError]             = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
-  const filterRef    = useRef("");
+  const filterRef     = useRef("");
   const dateFilterRef = useRef(todayKST());
+  const scrollRef     = useRef(null);
 
   const fetchSummary = useCallback(async () => {
     try {
@@ -108,8 +109,12 @@ export default function App() {
       const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
+      const scrollTop = scrollRef.current?.scrollTop ?? 0;
       setResults(data.results ?? []);
       setLastUpdated(Date.now());
+      requestAnimationFrame(() => {
+        if (scrollRef.current) scrollRef.current.scrollTop = scrollTop;
+      });
     } catch (e) {
       setError("데이터를 불러오지 못했습니다.");
     } finally {
@@ -152,7 +157,7 @@ export default function App() {
           --green: #22c55e; --red: #ef4444; --indigo: #6366f1;
           --yellow: #eab308;
         }
-        html, body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; font-size: 15px; }
+        html, body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; font-size: 17px; }
         header { display: flex; align-items: center; justify-content: space-between; padding: 0.75rem 2rem; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; }
         header h1 { font-size: 1.1rem; font-weight: 700; color: #fff; }
         header h1 span { color: var(--indigo); }
@@ -176,10 +181,10 @@ export default function App() {
         .refresh-btn:hover { opacity: 0.85; }
         .count-badge { font-size: 0.75rem; color: var(--sub); }
         .table-wrap { overflow-x: auto; border-radius: 0.75rem; border: 1px solid var(--border); }
-        .table-scroll { max-height: calc(15 * 41px); overflow-y: auto; }
+        .table-scroll { max-height: 50vh; overflow-y: auto; }
         table { width: 100%; border-collapse: collapse; font-size: 0.8rem; table-layout: fixed; }
         thead th, tbody td { width: 25%; }
-        thead { background: var(--surface); }
+        thead { background: var(--surface); position: sticky; top: 0; z-index: 1; }
         thead th { padding: 0.65rem 1rem; text-align: left; color: var(--muted); font-weight: 600; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border); white-space: nowrap; }
         tbody tr { border-bottom: 1px solid var(--border); transition: background 0.15s; }
         tbody tr:last-child { border-bottom: none; }
@@ -232,7 +237,7 @@ export default function App() {
         </div>
 
         <div className="table-wrap">
-          <div className="table-scroll">
+          <div className="table-scroll" ref={scrollRef}>
           <table>
             <thead>
               <tr>
