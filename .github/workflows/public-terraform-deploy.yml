@@ -250,20 +250,15 @@ jobs:
               "read AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<< \"$ASSUME_ROLE_OUTPUT\"",
               "export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN",
               f"aws eks update-kubeconfig --region {os.environ['AWS_REGION']} --name {os.environ['EKS_CLUSTER_NAME']} --kubeconfig /tmp/eks-kubeconfig",
-              "kubectl delete ingress --all -n inference --wait --timeout=60s || true",
-              "sleep 15",
+              "kubectl delete ingress --all -n inference --force --grace-period=0 || true",
               "kubectl get application -n argocd -o name | xargs -I{} kubectl patch {} -n argocd -p '{\"metadata\":{\"finalizers\":[]}}' --type=merge || true",
-              "kubectl delete application --all -n argocd --wait --timeout=120s || true",
+              "kubectl delete application --all -n argocd --force --grace-period=0 || true",
               "kubectl get inferenceservice -n inference -o name 2>/dev/null | xargs -I{} kubectl patch {} -n inference -p '{\"metadata\":{\"finalizers\":[]}}' --type=merge || true",
               "kubectl delete inferenceservice --all -n inference --force --grace-period=0 || true",
-              "for resource in $(kubectl api-resources --verbs=list --namespaced -o name 2>/dev/null); do kubectl get $resource -n inference -o name 2>/dev/null | xargs -I{} kubectl patch {} -n inference -p '{\"metadata\":{\"finalizers\":[]}}' --type=merge 2>/dev/null || true; done",
-              "kubectl delete pvc --all -n inference --wait --timeout=60s || true",
+              "kubectl delete pvc --all -n inference --force --grace-period=0 || true",
               "kubectl delete all --all -n inference --force --grace-period=0 || true",
-              "kubectl patch namespace inference -p '{\"metadata\":{\"finalizers\":[]}}' --type=merge || true",
-              "kubectl delete namespace inference --force --grace-period=0 || true",
-              "kubectl patch namespace argocd -p '{\"metadata\":{\"finalizers\":[]}}' --type=merge || true",
-              "kubectl delete namespace argocd --force --grace-period=0 || true",
-              "sleep 30",
+              "for ns in inference app monitoring logging kserve keda cert-manager chaos-testing argocd; do kubectl patch namespace $ns -p '{\"metadata\":{\"finalizers\":[]}}' --type=merge 2>/dev/null || true; kubectl delete namespace $ns --force --grace-period=0 2>/dev/null || true; done",
+              "sleep 10",
           ]
 
           with open("argocd-cleanup-commands.json", "w") as fp:
@@ -283,6 +278,8 @@ jobs:
 
       - name: Wait for ArgoCD cleanup
         if: ${{ inputs.action == 'destroy' && steps.resolve_instance.outputs.value != '' }}
+        continue-on-error: true
+        timeout-minutes: 10
         env:
           COMMAND_ID: ${{ steps.delete_argocd_apps.outputs.command_id }}
           TARGET_INSTANCE_ID: ${{ steps.resolve_instance.outputs.value }}
