@@ -14,7 +14,8 @@ import urllib.request
 
 
 API_BASE = "https://api.cloudflare.com/client/v4"
-DEFAULT_RECORDS = ("openstack", "k8s", "grafana", "argocd")
+DEFAULT_RECORDS = ("openstack", "k8s", "grafana", "argocd", "gitlab", "harbor", "minio", "minio-console")
+DEFAULT_SSH_ALIASES = ("control-ssh", "build-ssh", "gpu-ssh", "gitlab-ssh", "harbor-ssh")
 
 
 def require_env(name: str) -> str:
@@ -118,15 +119,60 @@ def delete_record(zone_id: str, token: str, payload: dict, apply: bool) -> None:
             api_request("DELETE", f"/zones/{zone_id}/dns_records/{record['id']}", token)
 
 
-def desired_records(base_domain: str, tailscale_ip: str, ttl: int, services: tuple[str, ...]) -> list[dict]:
+def desired_records(
+    base_domain: str,
+    tailscale_ip: str,
+    ttl: int,
+    services: tuple[str, ...],
+    ssh_aliases: tuple[str, ...],
+) -> list[dict]:
     ipaddress.ip_address(tailscale_ip)
     base = base_domain.rstrip(".")
     ssh_name = f"ssh.{base}"
 
     records = [record_payload("A", ssh_name, tailscale_ip, ttl)]
     for service in services:
-        records.append(record_payload("CNAME", f"{service}.{base}", ssh_name, ttl))
-    return records
+        if service != "ssh":
+            records.append(record_payload("CNAME", f"{service}.{base}", ssh_name, ttl))
+    for alias in ssh_aliases:
+        if alias != "ssh":
+            records.append(record_payload("CNAME", f"{alias}.{base}", ssh_name, ttl))
+
+    deduplicated = []
+    seen = set()
+    for record in records:
+        key = (record["type"], record["name"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(record)
+    return deduplicated
+
+
+def parse_services(raw_services: str) -> tuple[str, ...]:
+    services = []
+    for service in raw_services.split(","):
+        service = service.strip()
+        if not service:
+            continue
+        if service == "git":
+            service = "gitlab"
+        services.append(service)
+    if "gitlab" not in services:
+        services.append("gitlab")
+    return tuple(dict.fromkeys(services))
+
+
+def parse_ssh_aliases(raw_aliases: str) -> tuple[str, ...]:
+    aliases = []
+    if raw_aliases.strip().lower() in {"", "none", "false", "disabled", "off"}:
+        return ()
+    for alias in raw_aliases.split(","):
+        alias = alias.strip()
+        if not alias:
+            continue
+        aliases.append(alias)
+    return tuple(dict.fromkeys(aliases))
 
 
 def main() -> int:
@@ -142,6 +188,15 @@ def main() -> int:
         ),
         help="comma-separated subdomains that should CNAME to ssh.<base-domain>",
     )
+    parser.add_argument(
+        "--ssh-aliases",
+        default=first_env(
+            "PRIVATE_CLOUD_DNS_SSH_ALIASES",
+            "HA_DNS_SSH_ALIASES",
+            default=",".join(DEFAULT_SSH_ALIASES),
+        ),
+        help="comma-separated SSH subdomains that should CNAME to ssh.<base-domain>",
+    )
     args = parser.parse_args()
 
     token = require_env("CLOUDFLARE_API_TOKEN")
@@ -149,7 +204,8 @@ def main() -> int:
     base_domain = first_env("PRIVATE_CLOUD_BASE_DOMAIN", "HA_BASE_DOMAIN", default="intp.me")
     tailscale_ip = first_env("PRIVATE_CLOUD_TAILSCALE_IP", "HA_TAILSCALE_IP")
     ttl = int(first_env("PRIVATE_CLOUD_DNS_TTL", "HA_CLOUDFLARE_DNS_TTL", default="120"))
-    services = tuple(service.strip() for service in args.services.split(",") if service.strip())
+    services = parse_services(args.services)
+    ssh_aliases = parse_ssh_aliases(args.ssh_aliases)
 
     operation = "delete" if args.delete else "upsert"
     mode = "apply" if args.apply else "dry-run"
@@ -158,7 +214,7 @@ def main() -> int:
     print(f"zone: {zone_id}")
     print(f"base domain: {base_domain}")
 
-    for payload in desired_records(base_domain, tailscale_ip, ttl, services):
+    for payload in desired_records(base_domain, tailscale_ip, ttl, services, ssh_aliases):
         if args.delete:
             delete_record(zone_id, token, payload, args.apply)
         else:

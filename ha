@@ -69,7 +69,10 @@ usage() {
 Usage:
   ./ha install [--bin-dir DIR] [--force] [--no-shell-config] [--with-deps]
   ha doctor
+  ha ci
   ha test [--strict] [--terraform-init] [--integration]
+  ha apply [--run-mode apply|reinstall] [--phases provision|platform|registry|finalize|all] [--validate-gpu] [--require-backend-config]
+  ha destroy [--cleanup-devstack] [--require-backend-config]
   ha up local|lxd|openstack-local|openstack|openstack-kubernetes|kubernetes|storage|gpu|all [--auto-approve]
   ha prod check
   ha env init|check|path|example|secret-example
@@ -85,7 +88,10 @@ Commands:
   install    Install the Hybrid AI project CLI launcher in the first writable PATH location
   uninstall  Remove the managed launcher
   doctor     Check project layout and local tool availability
+  ci         Run the private-cloud CI script used by GitHub Actions
   test       Run smoke/integration validation without applying changes
+  apply      Run the private-cloud apply script used by GitHub Actions
+  destroy    Run the private-cloud destroy script used by GitHub Actions
   up         Provision local Kubernetes or apply OpenStack/Kubernetes targets
   prod       Check production readiness of the active Kubernetes target
   env        Create or check the local private-cloud env file
@@ -103,6 +109,7 @@ Examples:
   ./ha install --with-deps
   ./ha install --bin-dir /opt/homebrew/bin
   ha doctor
+  ha ci
   ha test
   ha env init
   vi .env
@@ -112,6 +119,9 @@ Examples:
   ha prod check
   ha explain
   ha completion zsh
+  ha apply --run-mode apply
+  ha apply --run-mode reinstall
+  ha destroy
   ha up all --auto-approve
   ha prod check
   ha up openstack-local --auto-approve
@@ -233,13 +243,18 @@ required_project_paths() {
   printf '%s\n' \
     "${HA_OPENSTACK_DIR}/main.tf" \
     "${HA_OPENSTACK_DIR}/variables.tf" \
+    "${HA_PROJECT_ROOT}/private/ci/private-cloud-ci.sh" \
+    "${HA_PROJECT_ROOT}/private/ci/private-cloud-apply.sh" \
+    "${HA_PROJECT_ROOT}/private/ci/private-cloud-destroy.sh" \
     "${HA_OPENSTACK_BOOTSTRAP_DIR}/bootstrap-k8s.sh" \
     "${HA_REVERSE_PROXY_DIR}/Caddyfile" \
+    "${HA_REVERSE_PROXY_DIR}/Caddyfile.internal-tls" \
     "${HA_REVERSE_PROXY_DIR}/cloudflare_dns.py" \
     "${HA_PROJECT_ROOT}/private/kubernetes/kustomization.yaml" \
     "${HA_PROJECT_ROOT}/private/storage/kustomization.yaml" \
     "${HA_PROJECT_ROOT}/private/gpu-worker/kustomization.yaml" \
-    "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-foundation.yml"
+    "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-remote.yml" \
+    "${HA_PROJECT_ROOT}/.github/workflows/private-cloud-controller.yml"
 }
 
 default_launcher_locations() {
@@ -400,13 +415,16 @@ zstyle ':completion:*' verbose yes
 bindkey '^I' complete-word 2>/dev/null || true
 
 _ha() {
-  local -a commands install_opts uninstall_opts test_opts up_targets up_opts prod_actions k8s_actions k8s_targets completion_shells env_actions proxy_actions proxy_profiles terraform_commands
+  local -a commands install_opts uninstall_opts test_opts apply_opts destroy_opts up_targets up_opts prod_actions k8s_actions k8s_targets completion_shells env_actions proxy_actions proxy_profiles terraform_commands
 
   commands=(
     'install:install launcher and optional dependencies'
     'uninstall:remove managed launcher'
     'doctor:check project layout and local tools'
+    'ci:run GitHub Actions private-cloud CI script'
     'test:run smoke or integration validation'
+    'apply:run GitHub Actions private-cloud apply script'
+    'destroy:run GitHub Actions private-cloud destroy script'
     'up:apply OpenStack Terraform or Kubernetes manifests'
     'prod:check production readiness'
     'production:alias for prod'
@@ -437,6 +455,15 @@ _ha() {
     '--strict:treat skipped checks as failures'
     '--terraform-init:download providers and run terraform validate'
     '--integration:run terraform plan and Kubernetes server dry-run'
+  )
+  apply_opts=(
+    '--run-mode:apply from existing DevStack or reinstall DevStack first'
+    '--validate-gpu:run GPU validation after apply'
+    '--require-backend-config:fail if Terraform backend config is empty'
+  )
+  destroy_opts=(
+    '--cleanup-devstack:remove local DevStack container after Terraform destroy'
+    '--require-backend-config:fail if Terraform backend config is empty'
   )
   up_targets=(local lxd server openstack-local devstack openstack openstack-kubernetes openstack-k8s terraform kubernetes foundation base storage gpu gpu-worker k8s all)
   up_opts=('--auto-approve:apply OpenStack Terraform without prompting')
@@ -471,6 +498,19 @@ _ha() {
       ;;
     test)
       _describe -t options 'test option' test_opts
+      ;;
+    ci)
+      _describe -t options 'ci option' test_opts
+      ;;
+    apply)
+      if [[ "${words[CURRENT-1]}" == "--run-mode" ]]; then
+        _values 'run mode' apply reinstall
+      else
+        _describe -t options 'apply option' apply_opts
+      fi
+      ;;
+    destroy)
+      _describe -t options 'destroy option' destroy_opts
       ;;
     up)
       if (( CURRENT == 3 )); then
@@ -1204,7 +1244,22 @@ test_terraform_static() {
     return
   fi
 
-  if output="$(terraform -chdir="$HA_OPENSTACK_DIR" fmt -check -recursive 2>&1)"; then
+  local terraform_fmt_files=()
+  local terraform_path
+  local terraform_relpath
+
+  while IFS= read -r terraform_path; do
+    case "$terraform_path" in
+      private/openstack/*.tf|private/openstack/*.tfvars)
+        terraform_relpath="${terraform_path#private/openstack/}"
+        terraform_fmt_files+=("$terraform_relpath")
+        ;;
+    esac
+  done < <(git -C "$HA_PROJECT_ROOT" ls-files private/openstack)
+
+  if [[ "${#terraform_fmt_files[@]}" -eq 0 ]]; then
+    test_skip "terraform fmt (no tracked Terraform files)"
+  elif output="$(terraform -chdir="$HA_OPENSTACK_DIR" fmt -check "${terraform_fmt_files[@]}" 2>&1)"; then
     test_ok "terraform fmt"
   else
     [[ -z "$output" ]] || info "$output"
@@ -1291,6 +1346,16 @@ export HA_K8S_KUBEADM_IGNORE_PREFLIGHT="${HA_K8S_KUBEADM_IGNORE_PREFLIGHT:-NumCP
 export HA_OPENSTACK_LXD_IMAGE="${HA_OPENSTACK_LXD_IMAGE:-ubuntu:24.04}"
 export HA_DEVSTACK_BRANCH="${HA_DEVSTACK_BRANCH:-master}"
 export HA_DEVSTACK_PASSWORD="${HA_DEVSTACK_PASSWORD:-hybrid-ai-devstack}"
+export HA_DEVSTACK_LIBVIRT_TYPE="${HA_DEVSTACK_LIBVIRT_TYPE:-auto}"
+export HA_OPENSTACK_PERSISTENT_STORAGE="${HA_OPENSTACK_PERSISTENT_STORAGE:-true}"
+export HA_OPENSTACK_PERSISTENT_DIR="${HA_OPENSTACK_PERSISTENT_DIR:-.ha/openstack/persistent}"
+export HA_OPENSTACK_GLANCE_STORE_DIR="${HA_OPENSTACK_GLANCE_STORE_DIR:-${HA_OPENSTACK_PERSISTENT_DIR}/glance-images}"
+export HA_OPENSTACK_NOVA_INSTANCES_DIR="${HA_OPENSTACK_NOVA_INSTANCES_DIR:-${HA_OPENSTACK_PERSISTENT_DIR}/nova-instances}"
+export HA_DEVSTACK_CACHE_ENABLED="${HA_DEVSTACK_CACHE_ENABLED:-true}"
+export HA_DEVSTACK_CACHE_DIR="${HA_DEVSTACK_CACHE_DIR:-.ha/openstack/devstack-cache}"
+export HA_DEVSTACK_APT_CACHE_DIR="${HA_DEVSTACK_APT_CACHE_DIR:-${HA_DEVSTACK_CACHE_DIR}/apt/archives}"
+export HA_DEVSTACK_ROOT_CACHE_DIR="${HA_DEVSTACK_ROOT_CACHE_DIR:-${HA_DEVSTACK_CACHE_DIR}/root-cache}"
+export HA_DEVSTACK_STACK_CACHE_DIR="${HA_DEVSTACK_STACK_CACHE_DIR:-${HA_DEVSTACK_CACHE_DIR}/stack-cache}"
 export TF_BACKEND_TYPE="${TF_BACKEND_TYPE:-s3}"
 
 # OpenStack VM Kubernetes bootstrap settings.
@@ -1320,7 +1385,22 @@ export HA_K8S_DASHBOARD_UPSTREAM="${HA_K8S_DASHBOARD_UPSTREAM:-127.0.0.1:18082}"
 export HA_GRAFANA_UPSTREAM="${HA_GRAFANA_UPSTREAM:-127.0.0.1:3000}"
 export HA_ARGOCD_UPSTREAM="${HA_ARGOCD_UPSTREAM:-127.0.0.1:8080}"
 export HA_CLOUDFLARE_DNS_TTL="${HA_CLOUDFLARE_DNS_TTL:-120}"
-export HA_DNS_SERVICES="${HA_DNS_SERVICES:-openstack,k8s,grafana,argocd}"
+export HA_DNS_SERVICES="${HA_DNS_SERVICES:-openstack,k8s,grafana,argocd,gitlab,harbor,minio,minio-console}"
+export MINIO_DOMAIN="${MINIO_DOMAIN:-minio.${HA_BASE_DOMAIN}}"
+export MINIO_CONSOLE_DOMAIN="${MINIO_CONSOLE_DOMAIN:-minio-console.${HA_BASE_DOMAIN}}"
+export MINIO_API_NODEPORT="${MINIO_API_NODEPORT:-30900}"
+export MINIO_CONSOLE_NODEPORT="${MINIO_CONSOLE_NODEPORT:-30990}"
+export MINIO_API_UPSTREAM_PORT="${MINIO_API_UPSTREAM_PORT:-19000}"
+export MINIO_CONSOLE_UPSTREAM_PORT="${MINIO_CONSOLE_UPSTREAM_PORT:-19090}"
+export MINIO_PROXY_ENABLED="${MINIO_PROXY_ENABLED:-true}"
+export HA_DNS_SSH_ALIASES="${HA_DNS_SSH_ALIASES:-control-ssh,build-ssh,gpu-ssh,gitlab-ssh,harbor-ssh}"
+export PRIVATE_CLOUD_SSH_TUNNELS_ENABLED="${PRIVATE_CLOUD_SSH_TUNNELS_ENABLED:-true}"
+export PRIVATE_CLOUD_SSH_TUNNEL_LISTEN_ADDRESS="${PRIVATE_CLOUD_SSH_TUNNEL_LISTEN_ADDRESS:-auto}"
+export PRIVATE_CLOUD_SSH_CONTROL_PORT="${PRIVATE_CLOUD_SSH_CONTROL_PORT:-2201}"
+export PRIVATE_CLOUD_SSH_BUILD_PORT="${PRIVATE_CLOUD_SSH_BUILD_PORT:-2202}"
+export PRIVATE_CLOUD_SSH_GPU_PORT="${PRIVATE_CLOUD_SSH_GPU_PORT:-2203}"
+export PRIVATE_CLOUD_SSH_GITLAB_PORT="${PRIVATE_CLOUD_SSH_GITLAB_PORT:-2204}"
+export PRIVATE_CLOUD_SSH_HARBOR_PORT="${PRIVATE_CLOUD_SSH_HARBOR_PORT:-2205}"
 # Cloudflare zone ID is not a secret. Put the API token in .env.secret.
 # export CLOUDFLARE_ZONE_ID=""
 
@@ -2455,6 +2535,7 @@ ensure_openstack_lxd_container() {
   fi
 
   lxc exec "$name" -- cloud-init status --wait >/dev/null 2>&1 || true
+  configure_openstack_devstack_apt_cache "$name"
 }
 
 ensure_openstack_lxd_kernel_modules() {
@@ -2468,15 +2549,171 @@ ensure_openstack_lxd_kernel_modules() {
   ' || die "failed to load Open vSwitch kernel modules in ${name}; make sure linux-modules-extra-$(uname -r) is installed on the host"
 }
 
+openstack_persistent_path() {
+  local path="$1"
+  if [[ "$path" == /* ]]; then
+    printf '%s\n' "$path"
+  else
+    printf '%s/%s\n' "$HA_PROJECT_ROOT" "$path"
+  fi
+}
+
+configure_openstack_devstack_cache_mount() {
+  local name="$1"
+  local device="$2"
+  local host_dir="$3"
+  local container_dir="$4"
+  local container_parent source path
+
+  [[ "${HA_DEVSTACK_CACHE_ENABLED:-true}" == "true" ]] || return 0
+
+  mkdir -p "$host_dir"
+  container_parent="${container_dir%/*}"
+  lxc exec "$name" -- mkdir -p "$container_parent" >/dev/null
+
+  source="$(lxc config device get "$name" "$device" source 2>/dev/null || true)"
+  path="$(lxc config device get "$name" "$device" path 2>/dev/null || true)"
+  if [[ -n "$source" || -n "$path" ]]; then
+    if [[ "$source" != "$host_dir" || "$path" != "$container_dir" ]]; then
+      lxc config device remove "$name" "$device" >/dev/null
+      source=""
+      path=""
+    fi
+  fi
+  if [[ -z "$source" && -z "$path" ]]; then
+    lxc config device add "$name" "$device" disk \
+      source="$host_dir" \
+      path="$container_dir" >/dev/null
+  fi
+}
+
+configure_openstack_devstack_apt_cache() {
+  local name="$1"
+  local cache_dir
+
+  [[ "${HA_DEVSTACK_CACHE_ENABLED:-true}" == "true" ]] || return 0
+
+  cache_dir="$(openstack_persistent_path "${HA_DEVSTACK_APT_CACHE_DIR:-.ha/openstack/devstack-cache/apt/archives}")"
+  info "Configuring DevStack APT package cache"
+  configure_openstack_devstack_cache_mount "$name" hybrid-ai-devstack-apt-cache "$cache_dir" /var/cache/apt/archives
+  lxc exec "$name" -- bash -s <<'EOS'
+set -euo pipefail
+install -d -m 0755 /var/cache/apt/archives
+install -d -m 0700 /var/cache/apt/archives/partial
+if getent passwd _apt >/dev/null 2>&1; then
+  chown _apt:root /var/cache/apt/archives/partial
+fi
+cat >/etc/apt/apt.conf.d/99hybrid-ai-cache <<'EOF'
+Binary::apt::APT::Keep-Downloaded-Packages "true";
+APT::Keep-Downloaded-Packages "true";
+Acquire::Retries "5";
+Acquire::ForceIPv4 "true";
+EOF
+EOS
+}
+
+configure_openstack_devstack_user_caches() {
+  local name="$1"
+  local root_cache_dir stack_cache_dir
+
+  [[ "${HA_DEVSTACK_CACHE_ENABLED:-true}" == "true" ]] || return 0
+
+  root_cache_dir="$(openstack_persistent_path "${HA_DEVSTACK_ROOT_CACHE_DIR:-.ha/openstack/devstack-cache/root-cache}")"
+  stack_cache_dir="$(openstack_persistent_path "${HA_DEVSTACK_STACK_CACHE_DIR:-.ha/openstack/devstack-cache/stack-cache}")"
+  info "Configuring DevStack root/stack user caches"
+  configure_openstack_devstack_cache_mount "$name" hybrid-ai-devstack-root-cache "$root_cache_dir" /root/.cache
+  configure_openstack_devstack_cache_mount "$name" hybrid-ai-devstack-stack-cache "$stack_cache_dir" /opt/stack/.cache
+  lxc exec "$name" -- bash -s <<'EOS'
+set -euo pipefail
+install -d -m 0755 /root/.cache /root/.cache/pip
+if id stack >/dev/null 2>&1; then
+  install -d -o stack -g stack -m 0755 /opt/stack/.cache /opt/stack/.cache/pip
+fi
+cat >/etc/pip.conf <<'EOF'
+[global]
+disable-pip-version-check = true
+EOF
+EOS
+}
+
+configure_openstack_persistent_mount() {
+  local name="$1"
+  local device="$2"
+  local host_dir="$3"
+  local container_dir="$4"
+  local container_parent source path
+
+  [[ "${HA_OPENSTACK_PERSISTENT_STORAGE:-true}" == "true" ]] || return 0
+
+  mkdir -p "$host_dir"
+  container_parent="${container_dir%/*}"
+  lxc exec "$name" -- mkdir -p "$container_parent" >/dev/null
+
+  source="$(lxc config device get "$name" "$device" source 2>/dev/null || true)"
+  path="$(lxc config device get "$name" "$device" path 2>/dev/null || true)"
+  if [[ -n "$source" || -n "$path" ]]; then
+    if [[ "$source" != "$host_dir" || "$path" != "$container_dir" ]]; then
+      lxc config device remove "$name" "$device" >/dev/null
+      source=""
+      path=""
+    fi
+  fi
+  if [[ -z "$source" && -z "$path" ]]; then
+    lxc config device add "$name" "$device" disk \
+      source="$host_dir" \
+      path="$container_dir" >/dev/null
+  fi
+
+  lxc exec "$name" -- bash -s -- "$container_dir" <<'EOS'
+set -euo pipefail
+container_dir="$1"
+container_parent="${container_dir%/*}"
+mkdir -p "$container_dir"
+if id stack >/dev/null 2>&1; then
+  mkdir -p /opt/stack/data "$container_parent"
+  chown stack:stack /opt/stack /opt/stack/data "$container_parent"
+  chown -R stack:stack "$container_dir"
+fi
+chmod 0755 "$container_dir"
+EOS
+}
+
+configure_openstack_persistent_storage() {
+  local name="$1"
+  local persistent_dir glance_dir nova_dir
+
+  [[ "${HA_OPENSTACK_PERSISTENT_STORAGE:-true}" == "true" ]] || return 0
+
+  persistent_dir="$(openstack_persistent_path "${HA_OPENSTACK_PERSISTENT_DIR:-.ha/openstack/persistent}")"
+  glance_dir="$(openstack_persistent_path "${HA_OPENSTACK_GLANCE_STORE_DIR:-${persistent_dir}/glance-images}")"
+  nova_dir="$(openstack_persistent_path "${HA_OPENSTACK_NOVA_INSTANCES_DIR:-${persistent_dir}/nova-instances}")"
+
+  info "Configuring persistent OpenStack storage mounts"
+  configure_openstack_persistent_mount "$name" hybrid-ai-glance-store "$glance_dir" /opt/stack/data/glance/images
+  configure_openstack_persistent_mount "$name" hybrid-ai-nova-instances "$nova_dir" /opt/stack/data/nova/instances
+}
+
 write_devstack_local_conf() {
   local name="$1"
   local host_ip="$2"
   local password="$3"
+  local libvirt_type="${HA_DEVSTACK_LIBVIRT_TYPE:-auto}"
 
-  lxc exec "$name" -- bash -s -- "$host_ip" "$password" <<'EOS'
+  lxc exec "$name" -- bash -s -- "$host_ip" "$password" "$libvirt_type" <<'EOS'
 set -euo pipefail
 host_ip="$1"
 password="$2"
+requested_libvirt_type="$3"
+if [[ "$requested_libvirt_type" == "auto" ]]; then
+  if [[ -e /dev/kvm ]]; then
+    libvirt_type="kvm"
+  else
+    libvirt_type="qemu"
+  fi
+else
+  libvirt_type="$requested_libvirt_type"
+fi
+printf 'DevStack libvirt type: %s\n' "$libvirt_type"
 install -d -o stack -g stack /opt/stack/devstack
 cat >/opt/stack/devstack/local.conf <<EOF
 [[local|localrc]]
@@ -2489,9 +2726,29 @@ SERVICE_HOST=${host_ip}
 LOGFILE=/opt/stack/logs/stack.sh.log
 LOG_COLOR=False
 VERBOSE=True
-LIBVIRT_TYPE=qemu
+LIBVIRT_TYPE=${libvirt_type}
 ENABLE_VOLUME_BACKING_FILE=True
 disable_service tempest
+
+[[post-config|\$NOVA_CONF]]
+[DEFAULT]
+instances_path = /opt/stack/data/nova/instances
+force_raw_images = False
+
+[neutron]
+project_domain_name = Default
+
+[[post-config|/etc/nova/nova-cpu.conf]]
+[DEFAULT]
+instances_path = /opt/stack/data/nova/instances
+force_raw_images = False
+
+[neutron]
+project_domain_name = Default
+
+[[post-config|\$GLANCE_API_CONF]]
+[glance_store]
+filesystem_store_datadir = /opt/stack/data/glance/images
 EOF
 chown stack:stack /opt/stack/devstack/local.conf
 chmod 600 /opt/stack/devstack/local.conf
@@ -2602,6 +2859,8 @@ printf "stack ALL=(ALL) NOPASSWD: ALL\n" >/etc/sudoers.d/stack
 chmod 440 /etc/sudoers.d/stack
 chown -R stack:stack /opt/stack
 EOS
+  configure_openstack_devstack_user_caches "$name"
+  configure_openstack_persistent_storage "$name"
 
   if ! lxc exec "$name" -- test -d /opt/stack/devstack/.git; then
     lxc exec "$name" -- sudo -u stack -H bash -lc \
@@ -2745,6 +3004,31 @@ run_tests() {
   fi
 
   die "local tests failed"
+}
+
+run_private_cloud_ci() {
+  local script="${HA_PROJECT_ROOT}/private/ci/private-cloud-ci.sh"
+
+  if [[ -x "$script" ]]; then
+    "$script" "$@"
+    return
+  fi
+
+  run_tests --terraform-init "$@"
+}
+
+run_private_cloud_apply() {
+  local script="${HA_PROJECT_ROOT}/private/ci/private-cloud-apply.sh"
+
+  [[ -x "$script" ]] || die "missing executable private cloud apply script: ${script#${HA_PROJECT_ROOT}/}"
+  "$script" "$@"
+}
+
+run_private_cloud_destroy() {
+  local script="${HA_PROJECT_ROOT}/private/ci/private-cloud-destroy.sh"
+
+  [[ -x "$script" ]] || die "missing executable private cloud destroy script: ${script#${HA_PROJECT_ROOT}/}"
+  "$script" "$@"
 }
 
 require_openstack_env() {
@@ -3340,6 +3624,9 @@ main() {
     doctor)
       doctor
       ;;
+    ci)
+      run_private_cloud_ci "$@"
+      ;;
     explain|guide)
       explain
       ;;
@@ -3348,6 +3635,12 @@ main() {
       ;;
     test)
       run_tests "$@"
+      ;;
+    apply)
+      run_private_cloud_apply "$@"
+      ;;
+    destroy)
+      run_private_cloud_destroy "$@"
       ;;
     up)
       run_up "$@"

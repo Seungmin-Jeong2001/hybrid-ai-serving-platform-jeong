@@ -32,7 +32,7 @@ permissions:
 # a DAG plus script-level phase locks so independent VM work can run in parallel
 # without another apply/destroy run touching the same host state.
 concurrency:
-  group: private-cloud-foundation
+  group: private-cloud-foundation-v2
   cancel-in-progress: false
 
 jobs:

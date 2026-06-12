@@ -1,0 +1,293 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: model-build-job
+  namespace: model-build
+  labels:
+    app.kubernetes.io/name: model-build-job
+    app.kubernetes.io/part-of: hybrid-ai-serving-platform
+spec:
+  entrypoint: model-build
+  serviceAccountName: model-build-workflow
+  podGC:
+    strategy: OnWorkflowCompletion
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+    secondsAfterFailure: 604800
+  arguments:
+    parameters:
+      - name: git_repo_url
+      - name: git_ref
+        value: main
+      - name: training_image
+        value: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+      - name: train_command
+        value: python model_build.py --data ../data --output ../output
+      - name: dataset_bucket
+        value: datasets
+      - name: dataset_prefix
+        value: raw-data
+      - name: artifact_bucket
+        value: artifacts
+      - name: artifact_prefix
+        value: models/{{workflow.name}}
+      - name: gpu_count
+        value: "1"
+  volumes:
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: model-build-cache
+    - name: artifacts
+      persistentVolumeClaim:
+        claimName: model-artifacts
+  templates:
+    - name: model-build
+      dag:
+        tasks:
+          - name: clone-code
+            template: clone-code
+          - name: download-dataset
+            template: download-dataset
+          - name: train
+            dependencies: [clone-code, download-dataset]
+            template: train
+          - name: upload-artifacts
+            dependencies: [train]
+            template: upload-artifacts
+
+    - name: clone-code
+      container:
+        image: alpine/git:2.45.2
+        command: [sh, -lc]
+        args:
+          - |
+            set -euo pipefail
+            workdir="/workspace/{{workflow.name}}"
+            rm -rf "${workdir}/src"
+            mkdir -p "${workdir}"
+            git clone --depth 1 --branch "{{workflow.parameters.git_ref}}" "{{workflow.parameters.git_repo_url}}" "${workdir}/src"
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    - name: download-dataset
+      container:
+        image: minio/mc:RELEASE.2024-05-09T17-04-24Z
+        env:
+          - name: MINIO_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: minio-client-credentials
+                key: accessKey
+          - name: MINIO_SECRET_KEY
+            valueFrom:
+              secretKeyRef:
+                name: minio-client-credentials
+                key: secretKey
+        command: [sh, -lc]
+        args:
+          - |
+            set -euo pipefail
+            workdir="/workspace/{{workflow.name}}"
+            rm -rf "${workdir}/data"
+            mkdir -p "${workdir}/data"
+            mc alias set minio http://minio-api.minio-tenant.svc.cluster.local:9000 "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+            mc cp --recursive "minio/{{workflow.parameters.dataset_bucket}}/{{workflow.parameters.dataset_prefix}}/" "${workdir}/data/"
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    - name: train
+      nodeSelector:
+        hybrid-ai.io/node-role: gpu-worker
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      container:
+        image: "{{workflow.parameters.training_image}}"
+        workingDir: /workspace/{{workflow.name}}/src
+        command: [sh, -lc]
+        args:
+          - |
+            set -euo pipefail
+            mkdir -p /workspace/{{workflow.name}}/output /artifacts/{{workflow.name}}
+            {{workflow.parameters.train_command}}
+            cp -a /workspace/{{workflow.name}}/output/. /artifacts/{{workflow.name}}/
+        resources:
+          requests:
+            cpu: "1"
+            memory: 4Gi
+          limits:
+            cpu: "4"
+            memory: 16Gi
+            nvidia.com/gpu: "{{workflow.parameters.gpu_count}}"
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+          - name: artifacts
+            mountPath: /artifacts
+
+    - name: upload-artifacts
+      container:
+        image: minio/mc:RELEASE.2024-05-09T17-04-24Z
+        env:
+          - name: MINIO_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: minio-client-credentials
+                key: accessKey
+          - name: MINIO_SECRET_KEY
+            valueFrom:
+              secretKeyRef:
+                name: minio-client-credentials
+                key: secretKey
+        command: [sh, -lc]
+        args:
+          - |
+            set -euo pipefail
+            mc alias set minio http://minio-api.minio-tenant.svc.cluster.local:9000 "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+            mc cp --recursive "/artifacts/{{workflow.name}}/" "minio/{{workflow.parameters.artifact_bucket}}/{{workflow.parameters.artifact_prefix}}/"
+        volumeMounts:
+          - name: artifacts
+            mountPath: /artifacts
+---
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: model-package-job
+  namespace: model-build
+  labels:
+    app.kubernetes.io/name: model-package-job
+    app.kubernetes.io/part-of: hybrid-ai-serving-platform
+spec:
+  entrypoint: model-package
+  serviceAccountName: model-build-workflow
+  podGC:
+    strategy: OnWorkflowCompletion
+  ttlStrategy:
+    secondsAfterCompletion: 86400
+    secondsAfterFailure: 604800
+  arguments:
+    parameters:
+      - name: git_repo_url
+      - name: git_ref
+        value: main
+      - name: artifact_bucket
+        value: artifacts
+      - name: artifact_prefix
+        value: models/latest
+      - name: harbor_registry
+        value: harbor.intp.me
+      - name: harbor_project
+        value: models
+      - name: image_name
+        value: predictor-image
+      - name: image_tag
+        value: "{{workflow.name}}"
+      - name: dockerfile_path
+        value: Dockerfile.predictor
+      - name: context_subdir
+        value: "."
+  volumes:
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: model-build-cache
+    - name: artifacts
+      persistentVolumeClaim:
+        claimName: model-artifacts
+    - name: kaniko-docker-config
+      secret:
+        secretName: harbor-kaniko-push
+        items:
+          - key: .dockerconfigjson
+            path: config.json
+  templates:
+    - name: model-package
+      dag:
+        tasks:
+          - name: clone-code
+            template: clone-code
+          - name: download-artifacts
+            template: download-artifacts
+          - name: prepare-context
+            dependencies: [clone-code, download-artifacts]
+            template: prepare-context
+          - name: kaniko-build
+            dependencies: [prepare-context]
+            template: kaniko-build
+
+    - name: clone-code
+      container:
+        image: alpine/git:2.45.2
+        command: [sh, -lc]
+        args:
+          - |
+            set -euo pipefail
+            workdir="/workspace/{{workflow.name}}"
+            rm -rf "${workdir}/src"
+            mkdir -p "${workdir}"
+            git clone --depth 1 --branch "{{workflow.parameters.git_ref}}" "{{workflow.parameters.git_repo_url}}" "${workdir}/src"
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    - name: download-artifacts
+      container:
+        image: minio/mc:RELEASE.2024-05-09T17-04-24Z
+        env:
+          - name: MINIO_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: minio-client-credentials
+                key: accessKey
+          - name: MINIO_SECRET_KEY
+            valueFrom:
+              secretKeyRef:
+                name: minio-client-credentials
+                key: secretKey
+        command: [sh, -lc]
+        args:
+          - |
+            set -euo pipefail
+            workdir="/workspace/{{workflow.name}}"
+            rm -rf "${workdir}/artifacts"
+            mkdir -p "${workdir}/artifacts"
+            mc alias set minio http://minio-api.minio-tenant.svc.cluster.local:9000 "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+            mc cp --recursive "minio/{{workflow.parameters.artifact_bucket}}/{{workflow.parameters.artifact_prefix}}/" "${workdir}/artifacts/"
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    - name: prepare-context
+      container:
+        image: alpine:3.20
+        command: [sh, -lc]
+        args:
+          - |
+            set -euo pipefail
+            workdir="/workspace/{{workflow.name}}"
+            rm -rf "${workdir}/context"
+            mkdir -p "${workdir}/context"
+            cp -a "${workdir}/src/{{workflow.parameters.context_subdir}}/." "${workdir}/context/"
+            mkdir -p "${workdir}/context/model-artifacts"
+            cp -a "${workdir}/artifacts/." "${workdir}/context/model-artifacts/"
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    - name: kaniko-build
+      container:
+        image: gcr.io/kaniko-project/executor:v1.23.2
+        args:
+          - --context=dir:///workspace/{{workflow.name}}/context
+          - --dockerfile=/workspace/{{workflow.name}}/context/{{workflow.parameters.dockerfile_path}}
+          - --destination={{workflow.parameters.harbor_registry}}/{{workflow.parameters.harbor_project}}/{{workflow.parameters.image_name}}:{{workflow.parameters.image_tag}}
+          - --cache=true
+          - --cache-repo={{workflow.parameters.harbor_registry}}/infra/kaniko-cache
+          - --snapshot-mode=redo
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+          - name: kaniko-docker-config
+            mountPath: /kaniko/.docker
