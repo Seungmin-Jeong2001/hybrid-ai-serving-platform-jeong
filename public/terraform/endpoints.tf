@@ -5,26 +5,15 @@ resource "aws_security_group" "vpce" {
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    description = "Allow HTTPS from within the VPC"
+    description = "Allow HTTPS from VPC and Private Cloud sites"
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
+    cidr_blocks = concat([var.vpc_cidr], var.private_cloud_cidrs)
   }
 
   # Private Cloud 사이트(VPN)에서 인터페이스 엔드포인트(ECR/S3/STS/SSM 등) 호출 허용
-  # - Edge 사이트는 VPCE를 직접 호출할 필요가 없으므로 의도적으로 제외 (역할 분리)
-  dynamic "ingress" {
-    for_each = length(var.private_cloud_cidrs) > 0 ? [1] : []
-    content {
-      description = "Allow HTTPS from Private Cloud site over VPN"
-      from_port   = 443
-      to_port     = 443
-      protocol    = "tcp"
-      cidr_blocks = var.private_cloud_cidrs
-    }
-  }
-
+  # Edge 사이트는 VPCE를 직접 호출할 필요가 없으므로 의도적으로 제외 (역할 분리)
   egress {
     from_port   = 0
     to_port     = 0

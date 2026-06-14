@@ -205,7 +205,7 @@ variable "artifacts_s3_force_destroy" {
 variable "private_cloud_cidrs" {
   description = "Private Cloud 사이트 CIDR (VPCE 경유로 ECR/S3/STS 등 AWS 서비스 접근 허용)"
   type        = list(string)
-  default     = []
+  default     = ["10.42.0.0/24"]
 }
 
 variable "edge_network_cidrs" {
