@@ -26,7 +26,7 @@ spec:
             key: infra
           channel: '#infra-alerts'
           title: '{{ if eq .GroupLabels.severity "critical" }}[INFRA][CRITICAL]{{ else }}[INFRA][WARNING]{{ end }} {{ .GroupLabels.alertname }}'
-          text: '{{ range .Alerts }}{{ .Annotations.summary }}\n{{ .Annotations.description }}{{ end }}'
+          text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ "\n" }}{{ .Annotations.description }}{{ end }}'
           sendResolved: true
     - name: slo-alerts
       slackConfigs:
@@ -35,5 +35,5 @@ spec:
             key: slo
           channel: '#slo-alerts'
           title: '{{ if eq .GroupLabels.severity "critical" }}[SLO][CRITICAL]{{ else }}[SLO][WARNING]{{ end }} {{ .GroupLabels.alertname }}'
-          text: '{{ range .Alerts }}{{ .Annotations.summary }}\n{{ .Annotations.description }}{{ end }}'
+          text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ "\n" }}{{ .Annotations.description }}{{ end }}'
           sendResolved: true
