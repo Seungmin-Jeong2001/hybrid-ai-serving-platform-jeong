@@ -2,6 +2,12 @@
 # - VPN 연결된 엣지에서 dashboard.sgs-hasp.click → internal ALB IP로 resolve
 # - Resolver Inbound Endpoint를 통해 온프레미스(엣지)에서 VPC DNS 조회 가능
 
+# Public Hosted Zone lookup
+data "aws_route53_zone" "public" {
+  name         = "sgs-hasp.click"
+  private_zone = false
+}
+
 # Private Hosted Zone
 resource "aws_route53_zone" "private" {
   name = "sgs-hasp.click"

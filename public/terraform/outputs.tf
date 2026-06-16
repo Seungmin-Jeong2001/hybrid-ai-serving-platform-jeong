@@ -167,6 +167,16 @@ output "vpn_connection_ids" {
   value       = { for k, vpn in aws_vpn_connection.sites : k => vpn.id }
 }
 
+output "public_hosted_zone_id" {
+  description = "Route53 public hosted zone ID for sgs-hasp.click"
+  value       = data.aws_route53_zone.public.zone_id
+}
+
+output "private_hosted_zone_id" {
+  description = "Route53 private hosted zone ID for sgs-hasp.click"
+  value       = aws_route53_zone.private.zone_id
+}
+
 # Route 53 Resolver outputs
 # 비활성화됨 - route53_resolver.tf 참고
 # output "inbound_resolver_ips" {

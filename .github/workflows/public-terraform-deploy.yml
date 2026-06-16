@@ -445,8 +445,10 @@ jobs:
 
       - name: Update Route53 A records for Internal ALB
         if: ${{ inputs.action == 'apply' && steps.resolve_instance.outputs.value != '' }}
+        working-directory: public/terraform
         run: |
-          HOSTED_ZONE_ID="Z02027133DFPOVFLKA9YK"
+          HOSTED_ZONE_ID="$(terraform output -raw public_hosted_zone_id)"
+          PRIVATE_HOSTED_ZONE_ID="$(terraform output -raw private_hosted_zone_id)"
 
           # ArgoCD sync 후 ALB 생성까지 대기
           sleep 30
@@ -493,15 +495,10 @@ jobs:
           done
 
           # Private Hosted Zone - CNAME 업데이트
-          PRIVATE_ZONE_ID=$(aws route53 list-hosted-zones-by-name \
-            --dns-name "sgs-hasp.click" \
-            --query "HostedZones[?Config.PrivateZone==\`true\`].Id" \
-            --output text | sed 's|/hostedzone/||')
-
-          if [[ -n "${PRIVATE_ZONE_ID}" && "${PRIVATE_ZONE_ID}" != "None" ]]; then
+          if [[ -n "${PRIVATE_HOSTED_ZONE_ID}" && "${PRIVATE_HOSTED_ZONE_ID}" != "None" ]]; then
             for DOMAIN in "dashboard.sgs-hasp.click" "api.sgs-hasp.click"; do
               aws route53 change-resource-record-sets \
-                --hosted-zone-id "${PRIVATE_ZONE_ID}" \
+                --hosted-zone-id "${PRIVATE_HOSTED_ZONE_ID}" \
                 --change-batch "{
                   \"Changes\": [{
                     \"Action\": \"UPSERT\",
