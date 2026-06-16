@@ -25,8 +25,8 @@ spec:
             name: slack-webhooks
             key: infra
           channel: '#infra-alerts'
-          color: '{{ if eq .GroupLabels.severity "critical" }}danger{{ else }}warning{{ end }}'
-          title: '[{{ if eq .GroupLabels.severity "critical" }}CRITICAL{{ else }}WARNING{{ end }}][{{ .GroupLabels.plane }}]'
+          color: '{{ if eq .Status "resolved" }}good{{ else if eq .GroupLabels.severity "critical" }}danger{{ else }}warning{{ end }}'
+          title: '{{ if eq .Status "resolved" }}[RESOLVED][{{ .GroupLabels.plane }}]{{ else }}[{{ if eq .GroupLabels.severity "critical" }}CRITICAL{{ else }}WARNING{{ end }}][{{ .GroupLabels.plane }}]{{ end }}'
           text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ "\n" }}{{ .Annotations.description }}{{ end }}'
           sendResolved: true
     - name: slo-alerts
@@ -35,7 +35,7 @@ spec:
             name: slack-webhooks
             key: slo
           channel: '#slo-alerts'
-          color: '{{ if eq .GroupLabels.severity "critical" }}danger{{ else }}warning{{ end }}'
-          title: '[{{ if eq .GroupLabels.severity "critical" }}CRITICAL{{ else }}WARNING{{ end }}]'
+          color: '{{ if eq .Status "resolved" }}good{{ else if eq .GroupLabels.severity "critical" }}danger{{ else }}warning{{ end }}'
+          title: '{{ if eq .Status "resolved" }}[RESOLVED]{{ else }}[{{ if eq .GroupLabels.severity "critical" }}CRITICAL{{ else }}WARNING{{ end }}]{{ end }}'
           text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ "\n" }}{{ .Annotations.description }}{{ end }}'
           sendResolved: true
