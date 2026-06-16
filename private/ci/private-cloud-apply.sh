@@ -2003,11 +2003,41 @@ flavor_value() {
 total_vcpus=0
 total_ram_mb=0
 total_disk_gb=0
+missing_disk_gb=0
 existing_vcpus=0
 existing_ram_mb=0
 existing_disk_gb=0
 summary=()
 existing_summary=()
+server_list_json="$(openstack server list --all-projects -f json -c Name -c Status -c Flavor)"
+server_list_names="$(python3 - "$server_list_json" <<'PY'
+import json
+import sys
+
+servers = json.loads(sys.argv[1] or "[]")
+skip_statuses = {"DELETED", "SOFT_DELETED"}
+for server in servers:
+    name = str(server.get("Name") or "")
+    status = str(server.get("Status") or "")
+    if not name:
+        continue
+    if status.upper() in skip_statuses:
+        continue
+    print(f"{name}\t{status}")
+PY
+)"
+
+server_exists() {
+  local target="$1"
+  local name status
+
+  while IFS=$'\t' read -r name status; do
+    [[ -n "$name" ]] || continue
+    [[ "$name" == "$target" ]] && return 0
+  done <<<"$server_list_names"
+  return 1
+}
+
 while [[ $# -gt 0 ]]; do
   role="$1"
   count="$2"
@@ -2020,10 +2050,19 @@ while [[ $# -gt 0 ]]; do
   role_vcpus=$((count * vcpus))
   role_ram_mb=$((count * ram_mb))
   role_disk_gb=$((count * disk_gb))
+  role_missing=0
+  for ((index = 1; index <= count; index += 1)); do
+    printf -v server_name "%s-%s-%02d" "$apply_prefix" "$role" "$index"
+    if ! server_exists "$server_name"; then
+      role_missing=$((role_missing + 1))
+    fi
+  done
+  role_missing_disk_gb=$((role_missing * disk_gb))
   total_vcpus=$((total_vcpus + role_vcpus))
   total_ram_mb=$((total_ram_mb + role_ram_mb))
   total_disk_gb=$((total_disk_gb + role_disk_gb))
-  summary+=("${role}: count=${count} flavor=${flavor} vcpus=${role_vcpus} ram_mb=${role_ram_mb} disk_gb=${role_disk_gb}")
+  missing_disk_gb=$((missing_disk_gb + role_missing_disk_gb))
+  summary+=("${role}: count=${count} missing=${role_missing} flavor=${flavor} vcpus=${role_vcpus} ram_mb=${role_ram_mb} disk_gb=${role_disk_gb} additional_disk_gb=${role_missing_disk_gb}")
 done
 
 while IFS=$'\t' read -r name status flavor; do
@@ -2036,13 +2075,12 @@ while IFS=$'\t' read -r name status flavor; do
   existing_disk_gb=$((existing_disk_gb + disk_gb))
   existing_summary+=("${name}: status=${status} flavor=${flavor} vcpus=${vcpus} ram_mb=${ram_mb} disk_gb=${disk_gb}")
 done < <(
-  openstack server list --all-projects -f json -c Name -c Status -c Flavor \
-    | python3 - "$apply_prefix" <<'PY'
+  python3 - "$apply_prefix" "$server_list_json" <<'PY'
 import json
 import sys
 
 prefix = sys.argv[1]
-servers = json.load(sys.stdin)
+servers = json.loads(sys.argv[2] or "[]")
 skip_statuses = {"DELETED", "SOFT_DELETED"}
 for server in servers:
     name = str(server.get("Name") or "")
@@ -2060,7 +2098,6 @@ PY
 
 total_after_vcpus=$((total_vcpus + existing_vcpus))
 total_after_ram_mb=$((total_ram_mb + existing_ram_mb))
-total_after_disk_gb=$((total_disk_gb + existing_disk_gb))
 
 echo "host capacity requested target stack: vcpus=${total_vcpus} ram_mb=${total_ram_mb} disk_gb=${total_disk_gb}"
 printf '  %s\n' "${summary[@]}"
@@ -2068,8 +2105,9 @@ echo "host capacity existing other stacks: vcpus=${existing_vcpus} ram_mb=${exis
 if [[ "${#existing_summary[@]}" -gt 0 ]]; then
   printf '  %s\n' "${existing_summary[@]}"
 fi
-echo "host capacity total after apply: vcpus=${total_after_vcpus}/${max_guest_vcpus} ram_mb=${total_after_ram_mb}/${max_guest_ram_mb} disk_gb=${total_after_disk_gb}/${max_guest_disk_gb}"
-if (( total_after_vcpus > max_guest_vcpus || total_after_ram_mb > max_guest_ram_mb || total_after_disk_gb > max_guest_disk_gb )); then
+echo "host capacity total after apply: vcpus=${total_after_vcpus}/${max_guest_vcpus} ram_mb=${total_after_ram_mb}/${max_guest_ram_mb}"
+echo "host capacity additional disk required: disk_gb=${missing_disk_gb}/${max_guest_disk_gb}"
+if (( total_after_vcpus > max_guest_vcpus || total_after_ram_mb > max_guest_ram_mb || missing_disk_gb > max_guest_disk_gb )); then
   cat >&2 <<EOF
 Host capacity preflight failed.
 Requested VM resources plus existing OpenStack VMs exceed the physical host budget for this local DevStack.
