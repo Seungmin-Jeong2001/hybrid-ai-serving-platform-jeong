@@ -8,7 +8,7 @@ metadata:
 spec:
   route:
     receiver: infra-alerts
-    groupBy: ['alertname', 'namespace', 'severity']
+    groupBy: ['alertname', 'namespace', 'severity', 'plane']
     groupWait: 30s
     groupInterval: 5m
     repeatInterval: 4h
@@ -25,7 +25,7 @@ spec:
             name: slack-webhooks
             key: infra
           channel: '#infra-alerts'
-          title: '{{ if eq .GroupLabels.severity "critical" }}[INFRA][CRITICAL]{{ else }}[INFRA][WARNING]{{ end }} {{ .GroupLabels.alertname }}'
+          title: '[{{ if eq .GroupLabels.severity "critical" }}CRITICAL{{ else }}WARNING{{ end }}][{{ .GroupLabels.plane }}]'
           text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ "\n" }}{{ .Annotations.description }}{{ end }}'
           sendResolved: true
     - name: slo-alerts
@@ -34,6 +34,6 @@ spec:
             name: slack-webhooks
             key: slo
           channel: '#slo-alerts'
-          title: '{{ if eq .GroupLabels.severity "critical" }}[SLO][CRITICAL]{{ else }}[SLO][WARNING]{{ end }} {{ .GroupLabels.alertname }}'
+          title: '[{{ if eq .GroupLabels.severity "critical" }}CRITICAL{{ else }}WARNING{{ end }}]'
           text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ "\n" }}{{ .Annotations.description }}{{ end }}'
           sendResolved: true
