@@ -284,6 +284,16 @@ jobs:
           write_env HA_OPENSTACK_IMAGE_CACHE_PREFIX "$OPENSTACK_IMAGE_CACHE_PREFIX"
           write_env HA_OPENSTACK_IMAGE_CACHE_DRIVER_PACKAGE "$OPENSTACK_IMAGE_CACHE_DRIVER_PACKAGE"
 
+          
+
+          write_env AWS_ACCESS_KEY_ID "$AWS_ECR_IAM_ID"
+          write_env AWS_SECRET_ACCESS_KEY "$AWS_ECR_IAM_PASS"
+          write_env SLACK_WEBHOOK_URL "$INFRA_ALERTS"
+          write_env ECR_ENDPOINT "$ECR_ENDPOINT"
+          write_env HARBOR_USER "$HARBOR_USER_GITLAB"
+          write_env HARBOR_PASSWORD "$HARBOR_PASSWORD_GITLAB"
+
+
           chmod 600 "$env_file"
           echo "path=$env_file" >> "$GITHUB_OUTPUT"
         env:
@@ -382,6 +392,12 @@ jobs:
           OPENSTACK_IMAGE_CACHE_ENABLED: ${{ vars.OPENSTACK_IMAGE_CACHE_ENABLED || 'true' }}
           OPENSTACK_IMAGE_CACHE_PREFIX: ${{ vars.OPENSTACK_IMAGE_CACHE_PREFIX || 'hybrid-ai-cache' }}
           OPENSTACK_IMAGE_CACHE_DRIVER_PACKAGE: ${{ vars.GPU_DRIVER_PACKAGE || vars.OPENSTACK_IMAGE_CACHE_DRIVER_PACKAGE || 'nvidia-driver-595-open' }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ECR_IAM_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ECR_IAM_PASS }}
+          SLACK_WEBHOOK_URL: ${{ secrets.INFRA_ALERTS }}
+          ECR_ENDPOINT: ${{ secrets.ECR_ENDPOINT }}
+          HARBOR_USER: ${{ secrets.HARBOR_USER_GITLAB }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD_GITLAB }}
 
       - name: Run remote ha command
         run: |
