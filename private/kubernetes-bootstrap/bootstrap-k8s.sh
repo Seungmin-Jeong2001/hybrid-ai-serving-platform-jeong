@@ -812,6 +812,96 @@ wait_for_kubernetes_api() {
   ssh_node "$host" 'sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw=/readyz >/dev/null'
 }
 
+#feature/hybrid# ==============================================================================
+#   GitLab Runner 주입 엔진 (수동 성공 수순과 100% 동일하게 일치화 완료)
+# ==============================================================================
+install_gitlab_runner_automation() {
+  local master_host="$1"
+
+  info "--------------------------------------------------------"
+  info "Fox: GitLab Runner 무인 배포 및 사설 인프라 연동 자동화를 가동합니다."
+  info "--------------------------------------------------------"
+  local target_gitlab_url="${GITLAB_URL:-https://gitlab.intp.me}"
+  local target_gitlab_token="${GITLAB_TOKEN:-GLRT-PLACEHOLDER-TOKEN}"
+
+  info "  Target 사설 GitLab 엔드포인트: ${target_gitlab_url}"
+
+  local gitlab_domain
+  gitlab_domain="${target_gitlab_url#*://}" # "gitlab.intp.me" 추출
+  gitlab_domain="${gitlab_domain%%/*}"      # 포트나 슬래시 제거
+
+  # 마스터 노드 관점에서 gitlab.intp.me의 실제 사설 IP를 동적으로 추출
+  local gitlab_ip
+  gitlab_ip=$(ssh_node "$master_host" "getent hosts ${gitlab_domain} | awk '{print \$1}'" | tr -d '\r\n' || true)
+  
+  if [[ -z "${gitlab_ip}" ]]; then
+    # getent로 해석 안 될 경우를 대비해 핑 테스트 결과로부터 추출하는 방어적 백업 설계
+    gitlab_ip=$(ssh_node "$master_host" "ping -c 1 ${gitlab_domain} | head -n 1 | awk -F'[()]' '{print \$2}'" | tr -d '\r\n' || true)
+  fi
+  
+  info "  Detected GitLab VM Private IP: ${gitlab_ip}"
+
+  # 마스터 노드 원격 진입 후 백엔드 비대화형 자원 패키징 시작
+  ssh_node "$master_host" bash -s -- "$target_gitlab_url" "$target_gitlab_token" "$gitlab_ip" <<'REMOTE'
+set -euo pipefail
+gl_url="$1"
+gl_token="$2"
+gl_ip="$3"
+
+# 1. 마스터 노드 내부에 Helm v3 패키지 관리자 다운로드 및 기동
+if ! command -v helm >/dev/null 2>&1; then
+  echo "Installing Helm v3 on master node..."
+  curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+fi
+
+# 2. 오피셜 깃랩 차트 레포지토리 동기화 및 인덱스 싱크
+helm repo add gitlab https://charts.gitlab.io --force-update >/dev/null
+helm repo update >/dev/null
+
+# 3. 팀 아키텍처 규칙에 따른 모델 빌드 격리 방(Namespace) 선행 생성
+sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf create namespace model-build --dry-run=client -o yaml | sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -
+
+# 4. 사설 인증서 가로채서 K8s Secret으로 자동 구워내기 (수동 성공 수순과 100% 동일하게 일치화)
+openssl s_client -showcerts -connect gitlab.intp.me:443 </dev/null 2>/dev/null | openssl x509 -outform PEM > gitlab.intp.me.crt
+sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf -n model-build create secret generic gitlab-runner-certs \
+  --from-file=gitlab.intp.me.crt=gitlab.intp.me.crt \
+  --dry-run=client -o yaml | sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -
+rm -f gitlab.intp.me.crt
+
+echo "Deploying GitLab Runner with Private Harbor Cache configurations..."
+# 이미지 주소를 사내 Harbor 사설 프록시 대역(harbor.intp.me/docker-hub/gitlab/...)으로 원상 복구 및 설정 자동화
+sudo helm --kubeconfig=/etc/kubernetes/admin.conf upgrade --install gitlab-runner gitlab/gitlab-runner \
+  --namespace model-build \
+  --set gitlabUrl="${gl_url}" \
+  --set runnerRegistrationToken="${gl_token}" \
+  --set rbac.create=false \
+  --set rbac.serviceAccountName=model-build-runner \
+  --set runners.tags="gpu-worker,argo" \
+  --set image.registry="harbor.intp.me" \
+  --set image.image="docker-hub/gitlab/gitlab-runner" \
+  --set runners.helpers.image="harbor.intp.me/docker-hub/gitlab/gitlab-runner-helper" \
+  --set certsSecretName="gitlab-runner-certs" \
+  --set-json "hostAliases=[{\"ip\":\"${gl_ip}\",\"hostnames\":[\"gitlab.intp.me\"]}]" \
+  --set-json 'envVars=[{"name":"GITLAB_RUNNER_DISABLE_SSL_VERIFICATION","value":"true"}]' \
+  --set runners.config="[[runners]]
+    name = \"private-argo-controller-runner\"
+    executor = \"kubernetes\"
+    [runners.kubernetes]
+      namespace = \"model-build\"
+      privileged = true
+      service_account = \"model-build-runner\"
+      image = \"harbor.intp.me/docker-hub/library/alpine:latest\"
+      memory_request = \"2Gi\"
+      memory_limit = \"10Gi\"
+      image_pull_secrets = [\"harbor-kaniko-push\"]
+      [[runners.kubernetes.volumes.pvc]]
+        name = \"build-cache\"
+        claim_name = \"model-build-cache\"
+        mount_path = \"/cache\""
+
+echo "🎉 GitLab Runner 제한망 배포 신호 탄막 전송 완료!"
+REMOTE
+}
 main() {
   local first_index
   local server_private_ip
@@ -898,6 +988,8 @@ main() {
 
   wait_for_kubernetes "$server_target_ip"
   label_nodes "$server_target_ip"
+  #feature/hybrid 
+  install_gitlab_runner_automation "$server_target_ip"
   write_kubeconfig "$server_target_ip" "$api_endpoint"
   write_handoff "$server_name" "$api_endpoint" "$server_target_ip"
   info "ok: OpenStack Kubernetes bootstrap complete"
