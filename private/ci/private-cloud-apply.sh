@@ -3270,6 +3270,20 @@ bootstrap_k8s() {
   export HA_K8S_VERSION_MINOR="${HA_K8S_VERSION_MINOR:-v1.36}"
   export HA_K8S_POD_CIDR="${HA_K8S_POD_CIDR:-192.168.0.0/16}"
   export HA_K8S_CNI_MANIFEST="${HA_K8S_CNI_MANIFEST:-https://raw.githubusercontent.com/projectcalico/calico/v3.32.0/manifests/calico.yaml}"
+   # ============================================================================
+  # feature/hybrid
+  #  GitLab VM에서 러너 토큰 및 외부망 주소 동적 추출 후 환경변수 내보내기
+  # ============================================================================
+  if optional_apply_phase_enabled "${HA_PRIVATE_CLOUD_SETUP_REGISTRY}"; then
+    local gitlab_ip
+    gitlab_ip="$(first_gitlab_ip || true)"
+    if [[ -n "${gitlab_ip}" ]]; then
+      log "fetching GitLab runner token from GitLab VM for K8s bootstrapping"
+      export GITLAB_TOKEN="$(ssh -F "${SSH_CONFIG}" "${gitlab_ip}" 'sudo cat /var/lib/hybrid-ai/gitlab-bootstrap/runner-token' 2>/dev/null || true)"
+      export GITLAB_URL="${GITLAB_EXTERNAL_URL}"
+    fi
+  fi
+  # ============================================================================
   "${ROOT}/private/kubernetes-bootstrap/bootstrap-k8s.sh"
   start_kubectl_tunnel
   export KUBECONFIG="${KUBECONFIG_PATH}"
@@ -4085,6 +4099,117 @@ run_finalize_phases() {
   fi
 }
 
+# ============================================================================
+# feature/hybrid
+# GitLab 초기 프로젝트 생성, 변수 주입 및 템플릿 코드 시딩 자동화
+# 깃랩 mianifest update -> argo imageupater 로 배포 방법 변경
+# ecr 푸시를 망연계 서버 및 vpn(strongswan) 을 통한 site to site vpn 을 통해 진행 예정이라 변
+# ============================================================================
+setup_initial_gitlab_project() {
+  local gitlab_ip="$1"
+  local gitlab_token
+  local tmp_git_dir
+  local project_id
+  
+  log "provisioning initial GitLab repository for model pipeline"
+  
+  # 1. GitLab VM에서 러너/관리자 토큰 가져오기
+  gitlab_token="$(ssh -F "${SSH_CONFIG}" "${gitlab_ip}" 'sudo cat /var/lib/hybrid-ai/gitlab-bootstrap/runner-token' 2>/dev/null || true)"
+  [[ -n "${gitlab_token}" ]] || { log "warning: GitLab token not ready; skipping project creation" >&2; return 0; }
+
+  # 2. GitLab REST API를 호출하여 'predictor-model' 비공개 프로젝트 자동 생성
+  log "creating GitLab private repository via REST API..."
+  curl -k -fsS -X POST \
+    -H "PRIVATE-TOKEN: ${gitlab_token}" \
+    -H "Content-Type: application/json" \
+    -d "{\"name\": \"predictor-model\", \"visibility\": \"private\", \"initialize_with_readme\": \"true\"}" \
+    "http://127.0.0.1:${GITLAB_UPSTREAM_PORT}/api/v4/projects" >/dev/null || true
+
+  # 3. 신규 생성된 프로젝트의 고유 ID(Project ID) 동적 추출
+  project_id="$(curl -k -fsS -H "PRIVATE-TOKEN: ${gitlab_token}" "http://127.0.0.1:${GITLAB_UPSTREAM_PORT}/api/v4/projects" | python3 -c "import json, sys; print(json.load(sys.stdin)[0]['id'])" 2>/dev/null || true)"
+  
+  # 4. 수집한 자격 증명들을 GitLab CI/CD 프로젝트 변수(Variables)로 무인 자동 등록
+  if [[ -n "${project_id}" ]]; then
+    log "registering secure credentials into GitLab CI/CD Variables..."
+    
+    create_gitlab_variable() {
+      local name="$1" value="$2" masked="${3:-false}"
+      [[ -n "$value" ]] || return 0
+      
+      # 멱등성 보장: 기존에 등록된 중복 변수가 있다면 사전 삭제 처리
+      curl -k -fsS -X DELETE \
+        -H "PRIVATE-TOKEN: ${gitlab_token}" \
+        "http://127.0.0.1:${GITLAB_UPSTREAM_PORT}/api/v4/projects/${project_id}/variables/${name}" >/dev/null 2>&1 || true
+
+      # 신규 변수 등록 API 호출
+      curl -k -fsS -X POST \
+        -H "PRIVATE-TOKEN: ${gitlab_token}" \
+        -H "Content-Type: application/json" \
+        -d "{\"key\": \"${name}\", \"value\": \"${value}\", \"masked\": ${masked}, \"protected\": false}" \
+        "http://127.0.0.1:${GITLAB_UPSTREAM_PORT}/api/v4/projects/${project_id}/variables" >/dev/null || true
+    }
+
+    # 내부망 인트라망 전용 MinIO 자격증명 클러스터 내부에서 복사 추출
+    local minio_access_key minio_secret_key
+    minio_access_key="$(kubectl -n minio-tenant get secret minio-creds-secret -o jsonpath='{.data.accessKey}' | base64 -d 2>/dev/null || true)"
+    minio_secret_key="$(kubectl -n minio-tenant get secret minio-creds-secret -o jsonpath='{.data.secretKey}' | base64 -d 2>/dev/null || true)"
+
+    # 🔐 [요청사항 반영] GitHub Actions 주입 명세 기반 변수 맵 바인딩 패치
+    # 1) AWS ECR 관련 계정 자산 주입
+    create_gitlab_variable "AWS_ACCESS_KEY_ID" "${AWS_ACCESS_KEY_ID:-}" "true"
+    create_gitlab_variable "AWS_SECRET_ACCESS_KEY" "${AWS_SECRET_ACCESS_KEY:-}" "true"
+    
+    # # 2) GitHub PAT 및 알림 채널 자산 주입
+    # create_gitlab_variable "GITHUB_PAT" "${GITHUB_PAT:-}" "true"
+    # create_gitlab_variable "SLACK_WEBHOOK_URL" "${SLACK_WEBHOOK_URL:-}" "true"
+    
+    # # 3) ECR 엔드포인트 주소 바인딩 (호스트의 ECR_ENDPOINT 값을 GitLab 내의 ECR_API_URI로 매핑)
+    # local target_ecr_uri="${ECR_ENDPOINT:-${ECR_API_URI:-}}"
+    # create_gitlab_variable "ECR_API_URI" "${target_ecr_uri}" "false"
+    
+    # 4) Harbor 사설망 컨테이너 레지스트리 크레덴셜 추가 연동
+    create_gitlab_variable "HARBOR_USER" "${HARBOR_USER:-}" "false"
+    create_gitlab_variable "HARBOR_PASSWORD" "${HARBOR_PASSWORD:-}" "true"
+    
+    # 5) 내부 스토리지 자격증명 백업 동기화
+    create_gitlab_variable "MINIO_ACCESS_KEY" "${minio_access_key:-}" "true"
+    create_gitlab_variable "MINIO_SECRET_KEY" "${minio_secret_key:-}" "true"
+  fi
+
+  # 5. 호스트 로컬에 임시 디렉토리를 만들고 템플릿 파일 복사
+  tmp_git_dir="$(mktemp -d)"
+  log "preparing template files in temporary workspace: ${tmp_git_dir}"
+  
+  if [[ -d "${ROOT}/private/templates" ]]; then
+    cp -a "${ROOT}/private/templates/." "${tmp_git_dir}/"
+    log "copied template files from private/templates/ to workspace"
+    
+    # 주소 하드코딩 변환 플러그인(sed 로직)은 제거되었습니다.
+    # 이제 빌드 코드가 GitLab UI Variables 자산을 온전히 동적 참조합니다.
+  else
+    log "warning: private/templates/ directory not found on host; skipping template copy" >&2
+  fi
+
+  # 6. 안전한 서브쉘(Subshell) 내부에서 Git 작업 및 멱등성 보장형 강제 푸시 실행
+  (
+    cd "${tmp_git_dir}"
+    git init -b main >/dev/null
+    git config user.email "gitlab-ci-bridge@intp.me"
+    git config user.name "GitLab-Argo-Bridge-Bot"
+    git add .
+    git commit -m "initial: 무인 MLOps 템플릿 코드 구조 세팅 완료 [skip ci]" >/dev/null
+    
+    # 사설망 인증서 자가 서명 신뢰 경고 격리 허용
+    git config http.sslVerify false
+    
+    log "pushing template code to GitLab VM..."
+    git push --force "http://root:${gitlab_token}@127.0.0.1:${GITLAB_UPSTREAM_PORT}/root/predictor-model.git" main:main >/dev/null 2>&1 || true
+  )
+  
+  # 7. 작업 공간 정리 및 완료 로그 기록
+  rm -rf "${tmp_git_dir}"
+  log "ok: GitLab initial repository 'root/predictor-model' with template code and CI variables is ready"
+}
 main() {
   case "${MODE}" in
     apply|reinstall) ;;
