@@ -1,0 +1,264 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: minio-sensor
+  namespace: model-build
+spec:
+  dependencies:
+  - eventName: raw-data-upload
+    eventSourceName: minio-event-source
+    name: minio-dep
+  eventBusName: default
+  template:
+    serviceAccountName: argo-events-sa
+  triggers:
+  - template:
+      name: minio-trigger
+      argoWorkflow:
+        group: argoproj.io
+        kind: Workflow
+        operation: submit
+        parameters:
+        - dest: spec.arguments.parameters.0.value
+          src:
+            dataKey: body.Records.0.s3.object.key
+            dependencyName: minio-dep
+          template: '{{ .Input }}'
+        source:
+          resource:
+            apiVersion: argoproj.io/v1alpha1
+            kind: Workflow
+            metadata:
+              generateName: model-build-job-
+              namespace: default
+            spec:
+              arguments:
+                parameters:
+                - name: image_tag
+                  value: ""
+              entrypoint: pipeline
+              imagePullSecrets:
+              - name: harbor-secret
+              onExit: trigger-gitlab-ecr-sync
+              templates:
+              - name: pipeline
+                steps:
+                - - name: model-build-job
+                    template: model-build
+                - - name: model-package-job
+                    template: model-package
+              - name: model-build
+                nodeSelector:
+                  hybrid-ai.io/node-role: gpu-worker
+                podSpecPatch: '{"runtimeClassName":"nvidia"}'
+                tolerations:
+                - effect: NoSchedule
+                  key: nvidia.com/gpu
+                  operator: Exists
+                container:
+                  image: harbor.intp.me/infra/model-build-image:latest
+                  command:
+                  - python
+                  - /workspace/model_build.py
+                  env:
+                  - name: MINIO_ENDPOINT
+                    value: 10.42.0.88:30900
+                  - name: MINIO_ACCESS_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        key: accessKey
+                        name: minio-secret
+                  - name: MINIO_SECRET_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        key: secretKey
+                        name: minio-secret
+                  resources:
+                    limits:
+                      cpu: "2"
+                      memory: 4Gi
+                      nvidia.com/gpu: "1"
+                    requests:
+                      cpu: "1"
+                      memory: 2Gi
+              - name: model-package
+                steps:
+                - - name: prepare
+                    template: prepare-files
+                - - name: build
+                    template: kaniko-build
+              - name: prepare-files
+                container:
+                  image: python:3.9-slim
+                  command:
+                  - sh
+                  - -c
+                  args:
+                  - |
+                    set -eu
+                    apt-get update -q && apt-get install -y git -q
+                    pip install minio -q
+                    export HOME=/tmp
+
+                    cat > /tmp/.netrc <<NETRC_EOF
+                    machine gitlab.intp.me
+                    login ${GIT_USER}
+                    password ${GIT_TOKEN}
+                    NETRC_EOF
+                    chmod 600 /tmp/.netrc
+
+                    cd /workspace
+                    git -c http.sslVerify=false clone https://gitlab.intp.me/3stacks/predictor-model.git .
+
+                    mkdir -p /workspace/model-artifacts
+                    python3 - <<PYEOF
+                    import os
+                    from minio import Minio
+
+                    client = Minio(
+                        '10.42.0.88:30900',
+                        access_key=os.environ.get('MINIO_ACCESS_KEY'),
+                        secret_key=os.environ.get('MINIO_SECRET_KEY'),
+                        secure=False
+                    )
+                    client.fget_object('artifacts', 'model_weights.pt', '/workspace/model-artifacts/model_weights.pt')
+                    client.fget_object('artifacts', 'scaler.pkl', '/workspace/model-artifacts/scaler.pkl')
+                    print('파일 준비 완료!')
+                    PYEOF
+                  env:
+                  - name: MINIO_ACCESS_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        key: accessKey
+                        name: minio-secret
+                  - name: MINIO_SECRET_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        key: secretKey
+                        name: minio-secret
+                  - name: GIT_USER
+                    valueFrom:
+                      secretKeyRef:
+                        key: username
+                        name: gitlab-secret
+                  - name: GIT_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        key: token
+                        name: gitlab-secret
+                  volumeMounts:
+                  - mountPath: /workspace
+                    name: workspace
+              - name: kaniko-build
+                container:
+                  image: gcr.io/kaniko-project/executor:v1.23.2-debug
+                  command:
+                  - /busybox/sh
+                  - -c
+                  args:
+                  - |
+                    set -eu
+                    RAW_TAG="{{workflow.parameters.image_tag}}"
+                    DECODED_TAG=$(printf '%s' "$RAW_TAG" | sed 's/%2F/\//g')
+                    CLEAN_TAG=$(printf '%s' "$DECODED_TAG" | sed 's:/_SUCCESS$::' | awk -F'/' '{print $NF}')
+                    if [ -z "$CLEAN_TAG" ]; then
+                      CLEAN_TAG="latest"
+                    fi
+
+                    echo "[INFO] RAW_TAG=$RAW_TAG"
+                    echo "[INFO] DECODED_TAG=$DECODED_TAG"
+                    echo "[INFO] CLEAN_TAG=$CLEAN_TAG"
+                    echo "[INFO] harbor resolution:"
+                    getent hosts harbor.intp.me || true
+
+                    /kaniko/executor \
+                      --dockerfile=Dockerfile.predictor \
+                      --context=/workspace \
+                      --cache=true \
+                      --cache-repo=harbor.intp.me/infra/kaniko-cache \
+                      --snapshot-mode=redo \
+                      --registry-certificate=harbor.intp.me=/kaniko/certs/ca.crt \
+                      --destination=harbor.intp.me/models/predictive-model:$CLEAN_TAG
+                  volumeMounts:
+                  - mountPath: /workspace
+                    name: workspace
+                  - mountPath: /kaniko/.docker
+                    name: harbor-creds
+                  - mountPath: /kaniko/certs
+                    name: harbor-ca
+                    readOnly: true
+              - name: trigger-gitlab-ecr-sync
+                container:
+                  image: python:3.9-slim
+                  command:
+                  - sh
+                  - -lc
+                  args:
+                  - |
+                    set -eu
+                    if [ "{{workflow.status}}" != "Succeeded" ]; then
+                      echo "skip GitLab ECR sync trigger: workflow status={{workflow.status}}"
+                      exit 0
+                    fi
+
+                    apt-get update -q && apt-get install -y curl -q
+
+                    RAW_TAG="{{workflow.parameters.image_tag}}"
+                    DECODED_TAG=$(printf '%s' "$RAW_TAG" | sed 's/%2F/\//g')
+                    CLEAN_TAG=$(printf '%s' "$DECODED_TAG" | sed 's:/_SUCCESS$::' | awk -F'/' '{print $NF}')
+
+                    : "${GITLAB_TRIGGER_TOKEN:?missing gitlab-pipeline-trigger token}"
+                    test -s /etc/gitlab/ca.crt
+
+                    echo "[INFO] RAW_TAG=$RAW_TAG"
+                    echo "[INFO] DECODED_TAG=$DECODED_TAG"
+                    echo "[INFO] CLEAN_TAG=$CLEAN_TAG"
+
+                    curl --fail-with-body --show-error --silent \
+                      --cacert /etc/gitlab/ca.crt \
+                      --request POST \
+                      --form "token=${GITLAB_TRIGGER_TOKEN}" \
+                      --form "ref=main" \
+                      --form "variables[IMAGE_TAG]=$CLEAN_TAG" \
+                      "https://gitlab.intp.me/api/v4/projects/1/trigger/pipeline"
+                  env:
+                  - name: GITLAB_TRIGGER_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        key: token
+                        name: gitlab-pipeline-trigger
+                        optional: true
+                  volumeMounts:
+                  - mountPath: /etc/gitlab
+                    name: gitlab-ca
+                    readOnly: true
+              volumeClaimTemplates:
+              - metadata:
+                  name: workspace
+                spec:
+                  accessModes:
+                  - ReadWriteMany
+                  storageClassName: private-nfs-rwx
+                  resources:
+                    requests:
+                      storage: 1Gi
+              volumes:
+              - name: harbor-creds
+                secret:
+                  secretName: harbor-docker-secret
+                  items:
+                  - key: .dockerconfigjson
+                    path: config.json
+              - name: harbor-ca
+                secret:
+                  secretName: harbor-tls-ca
+                  items:
+                  - key: ca.crt
+                    path: ca.crt
+              - name: gitlab-ca
+                secret:
+                  secretName: gitlab-tls-ca
+                  optional: true
+                  items:
+                  - key: ca.crt
+                    path: ca.crt

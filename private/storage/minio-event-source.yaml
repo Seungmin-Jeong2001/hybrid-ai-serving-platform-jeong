@@ -1,0 +1,13 @@
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: minio-event-source
+  namespace: model-build
+spec:
+  eventBusName: default
+  webhook:
+    raw-data-upload:
+      endpoint: /raw-data-upload
+      method: POST
+      port: "12000"
+      url: 0.0.0.0

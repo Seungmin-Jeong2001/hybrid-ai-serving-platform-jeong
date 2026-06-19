@@ -3,3 +3,6 @@ kind: Kustomization
 resources:
   - build-cache-pvc.yaml
   - model-artifacts-pvc.yaml
+  - minio-sensor.yaml
+  - eventbus.yaml
+  - minio-event-source.yaml
