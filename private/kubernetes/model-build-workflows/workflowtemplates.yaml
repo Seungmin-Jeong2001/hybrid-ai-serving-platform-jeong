@@ -7,72 +7,83 @@ metadata:
     app.kubernetes.io/name: model-build-job
     app.kubernetes.io/part-of: hybrid-ai-serving-platform
 spec:
-  entrypoint: model-build
+  entrypoint: pipeline
   serviceAccountName: model-build-workflow
+
+  # Workflow 성공/실패 후 항상 실행됨.
+  # 내부 script에서 Succeeded가 아니면 GitLab trigger를 skip함.
+  onExit: trigger-gitlab-ecr-sync
+
+  imagePullSecrets:
+    - name: harbor-secret
+
   podGC:
     strategy: OnWorkflowCompletion
+
   ttlStrategy:
     secondsAfterCompletion: 86400
     secondsAfterFailure: 604800
+
   arguments:
     parameters:
+      # MinIO Sensor가 raw-data%2Fv1.0.2%2F_SUCCESS 같은 값을 주입함.
+      - name: image_tag
+        value: raw-data%2Fdev%2F_SUCCESS
+
       - name: git_repo_url
         value: https://gitlab.intp.me/3stacks/predictor-model.git
+
       - name: git_ref
         value: main
+
       - name: training_image
         value: harbor.intp.me/infra/model-build-image:latest
-      - name: train_command
-        value: python /workspace/model_build.py
-  volumes:
-    - name: workspace
-      persistentVolumeClaim:
-        claimName: model-build-cache
+
+      - name: minio_endpoint
+        value: 10.42.0.88:30900
+
+      - name: artifact_bucket
+        value: artifacts
+
+      # 현재 성공했던 PoC는 artifacts/model_weights.pt, artifacts/scaler.pkl 기준.
+      - name: model_weight_object
+        value: model_weights.pt
+
+      - name: scaler_object
+        value: scaler.pkl
+
+      - name: harbor_registry
+        value: harbor.intp.me
+
+      - name: harbor_project
+        value: models
+
+      - name: image_name
+        value: predictive-model
+
+      - name: dockerfile_path
+        value: Dockerfile.predictor
+
+      - name: kaniko_cache_repo
+        value: harbor.intp.me/infra/kaniko-cache
+
+      # GitLab trigger 대상 branch.
+      - name: gitlab_trigger_ref
+        value: main
+
+      # GitLab trigger 시 ECR sync job에 넘길 ECR repository 이름.
+      - name: ecr_repository
+        value: predictive-model
+
   templates:
-    - name: model-build
+    - name: pipeline
       steps:
-        - - name: clone-code
-            template: clone-code
-        - - name: train
-            template: train
+        - - name: model-build-job
+            template: model-build
+        - - name: model-package-job
+            template: model-package
 
-    - name: clone-code
-      container:
-        image: python:3.9-slim
-        command: [sh, -c]
-        env:
-          - name: GIT_USER
-            valueFrom:
-              secretKeyRef:
-                name: gitlab-secret
-                key: username
-          - name: GIT_TOKEN
-            valueFrom:
-              secretKeyRef:
-                name: gitlab-secret
-                key: token
-        args:
-          - |
-            set -eu
-            apt-get update -q && apt-get install -y git -q
-            workdir="/workspace/{{workflow.name}}"
-            rm -rf "${workdir}/src"
-            mkdir -p "${workdir}"
-            
-            cat > /tmp/.netrc <<NETRC_EOF
-            machine gitlab.intp.me
-            login ${GIT_USER}
-            password ${GIT_TOKEN}
-            NETRC_EOF
-            chmod 600 /tmp/.netrc
-            
-            export HOME=/tmp
-            git -c http.sslVerify=false clone --depth 1 --branch "{{workflow.parameters.git_ref}}" "{{workflow.parameters.git_repo_url}}" "${workdir}/src"
-        volumeMounts:
-          - name: workspace
-            mountPath: /workspace
-
-    - name: train
+    - name: model-build
       nodeSelector:
         hybrid-ai.io/node-role: gpu-worker
       tolerations:
@@ -82,11 +93,12 @@ spec:
       podSpecPatch: '{"runtimeClassName":"nvidia"}'
       container:
         image: "{{workflow.parameters.training_image}}"
-        workingDir: /workspace/{{workflow.name}}/src
-        command: [sh, -c]
+        command:
+          - python
+          - /workspace/model_build.py
         env:
           - name: MINIO_ENDPOINT
-            value: "10.42.0.88:30900"
+            value: "{{workflow.parameters.minio_endpoint}}"
           - name: MINIO_ACCESS_KEY
             valueFrom:
               secretKeyRef:
@@ -97,10 +109,6 @@ spec:
               secretKeyRef:
                 name: minio-secret
                 key: secretKey
-        args:
-          - |
-            set -eu
-            {{workflow.parameters.train_command}}
         resources:
           requests:
             cpu: "1"
@@ -112,3 +120,246 @@ spec:
         volumeMounts:
           - name: workspace
             mountPath: /workspace
+
+    - name: model-package
+      steps:
+        - - name: prepare
+            template: prepare-files
+        - - name: build
+            template: kaniko-build
+
+    - name: prepare-files
+      container:
+        image: python:3.9-slim
+        command:
+          - sh
+          - -c
+        args:
+          - |
+            set -eu
+
+            apt-get update -q
+            apt-get install -y git -q
+            pip install minio -q
+
+            export HOME=/tmp
+
+            cat > /tmp/.netrc <<NETRC_EOF
+            machine gitlab.intp.me
+            login ${GIT_USER}
+            password ${GIT_TOKEN}
+            NETRC_EOF
+            chmod 600 /tmp/.netrc
+
+            rm -rf /workspace/*
+            cd /workspace
+
+            echo "[INFO] clone model repo"
+            git -c http.sslVerify=false clone \
+              --depth 1 \
+              --branch "{{workflow.parameters.git_ref}}" \
+              "{{workflow.parameters.git_repo_url}}" .
+
+            mkdir -p /workspace/model-artifacts
+
+            echo "[INFO] download model artifacts from MinIO"
+            python3 - <<PYEOF
+            import os
+            from minio import Minio
+
+            endpoint = "{{workflow.parameters.minio_endpoint}}"
+            bucket = "{{workflow.parameters.artifact_bucket}}"
+            model_weight_object = "{{workflow.parameters.model_weight_object}}"
+            scaler_object = "{{workflow.parameters.scaler_object}}"
+
+            client = Minio(
+                endpoint,
+                access_key=os.environ.get("MINIO_ACCESS_KEY"),
+                secret_key=os.environ.get("MINIO_SECRET_KEY"),
+                secure=False,
+            )
+
+            client.fget_object(
+                bucket,
+                model_weight_object,
+                "/workspace/model-artifacts/model_weights.pt",
+            )
+            client.fget_object(
+                bucket,
+                scaler_object,
+                "/workspace/model-artifacts/scaler.pkl",
+            )
+
+            print("model artifact download completed")
+            PYEOF
+
+            echo "[INFO] prepared files"
+            ls -al /workspace
+            ls -al /workspace/model-artifacts
+        env:
+          - name: MINIO_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: minio-secret
+                key: accessKey
+          - name: MINIO_SECRET_KEY
+            valueFrom:
+              secretKeyRef:
+                name: minio-secret
+                key: secretKey
+          - name: GIT_USER
+            valueFrom:
+              secretKeyRef:
+                name: gitlab-secret
+                key: username
+          - name: GIT_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: gitlab-secret
+                key: token
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    - name: kaniko-build
+      container:
+        image: gcr.io/kaniko-project/executor:v1.23.2-debug
+        command:
+          - /busybox/sh
+          - -c
+        args:
+          - |
+            set -eu
+
+            RAW_TAG="{{workflow.parameters.image_tag}}"
+            DECODED_TAG="$(printf '%s' "$RAW_TAG" | sed 's/%2F/\//g')"
+            CLEAN_TAG="$(printf '%s' "$DECODED_TAG" | sed 's:/_SUCCESS$::' | awk -F'/' '{print $NF}')"
+
+            if [ -z "$CLEAN_TAG" ]; then
+              CLEAN_TAG="latest"
+            fi
+
+            echo "[INFO] RAW_TAG=${RAW_TAG}"
+            echo "[INFO] DECODED_TAG=${DECODED_TAG}"
+            echo "[INFO] CLEAN_TAG=${CLEAN_TAG}"
+            echo "[INFO] harbor resolution:"
+            getent hosts "{{workflow.parameters.harbor_registry}}" || true
+
+            /kaniko/executor \
+              --dockerfile="{{workflow.parameters.dockerfile_path}}" \
+              --context=/workspace \
+              --cache=true \
+              --cache-repo="{{workflow.parameters.kaniko_cache_repo}}" \
+              --snapshot-mode=redo \
+              --registry-certificate="{{workflow.parameters.harbor_registry}}"=/kaniko/certs/ca.crt \
+              --destination="{{workflow.parameters.harbor_registry}}/{{workflow.parameters.harbor_project}}/{{workflow.parameters.image_name}}:${CLEAN_TAG}"
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+          - name: harbor-creds
+            mountPath: /kaniko/.docker
+          - name: harbor-ca
+            mountPath: /kaniko/certs
+            readOnly: true
+
+    - name: trigger-gitlab-ecr-sync
+      container:
+        image: curlimages/curl:8.7.1
+        command:
+          - sh
+          - -c
+        args:
+          - |
+            set -eu
+
+            WORKFLOW_STATUS="{{workflow.status}}"
+
+            RAW_TAG="{{workflow.parameters.image_tag}}"
+            DECODED_TAG="$(printf '%s' "$RAW_TAG" | sed 's/%2F/\//g')"
+            CLEAN_TAG="$(printf '%s' "$DECODED_TAG" | sed 's:/_SUCCESS$::' | awk -F'/' '{print $NF}')"
+
+            if [ -z "$CLEAN_TAG" ]; then
+              CLEAN_TAG="latest"
+            fi
+
+            HARBOR_IMAGE="{{workflow.parameters.harbor_registry}}/{{workflow.parameters.harbor_project}}/{{workflow.parameters.image_name}}:${CLEAN_TAG}"
+
+            echo "[INFO] workflow status: ${WORKFLOW_STATUS}"
+            echo "[INFO] image tag: ${CLEAN_TAG}"
+            echo "[INFO] harbor image: ${HARBOR_IMAGE}"
+
+            if [ "${WORKFLOW_STATUS}" != "Succeeded" ]; then
+              echo "[WARN] workflow did not succeed. skip GitLab ECR sync trigger."
+              exit 0
+            fi
+
+            if [ -f /etc/gitlab/ca.crt ]; then
+              CURL_TLS_OPT="--cacert /etc/gitlab/ca.crt"
+            else
+              CURL_TLS_OPT="-k"
+            fi
+
+            echo "[INFO] trigger GitLab ECR sync pipeline"
+
+            curl \
+              --fail \
+              ${CURL_TLS_OPT} \
+              --request POST \
+              --form "token=${GITLAB_TRIGGER_TOKEN}" \
+              --form "ref={{workflow.parameters.gitlab_trigger_ref}}" \
+              --form "variables[IMAGE_TAG]=${CLEAN_TAG}" \
+              --form "variables[HARBOR_IMAGE]=${HARBOR_IMAGE}" \
+              --form "variables[HARBOR_REGISTRY]={{workflow.parameters.harbor_registry}}" \
+              --form "variables[HARBOR_PROJECT]={{workflow.parameters.harbor_project}}" \
+              --form "variables[IMAGE_NAME]={{workflow.parameters.image_name}}" \
+              --form "variables[ECR_REPOSITORY]={{workflow.parameters.ecr_repository}}" \
+              "https://gitlab.intp.me/api/v4/projects/${GITLAB_PROJECT_ID}/trigger/pipeline"
+        env:
+          - name: GITLAB_TRIGGER_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: gitlab-ecr-trigger
+                key: token
+          - name: GITLAB_PROJECT_ID
+            valueFrom:
+              secretKeyRef:
+                name: gitlab-ecr-trigger
+                key: projectId
+        volumeMounts:
+          - name: gitlab-ca
+            mountPath: /etc/gitlab
+            readOnly: true
+
+  volumeClaimTemplates:
+    - metadata:
+        name: workspace
+      spec:
+        accessModes:
+          - ReadWriteMany
+        storageClassName: private-nfs-rwx
+        resources:
+          requests:
+            storage: 1Gi
+
+  volumes:
+    - name: harbor-creds
+      secret:
+        secretName: harbor-docker-secret
+        items:
+          - key: .dockerconfigjson
+            path: config.json
+
+    - name: harbor-ca
+      secret:
+        secretName: harbor-tls-ca
+        items:
+          - key: ca.crt
+            path: ca.crt
+
+    - name: gitlab-ca
+      secret:
+        secretName: gitlab-tls-ca
+        optional: true
+        items:
+          - key: ca.crt
+            path: ca.crt
