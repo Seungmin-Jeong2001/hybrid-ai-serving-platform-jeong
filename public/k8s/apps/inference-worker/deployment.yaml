@@ -40,6 +40,11 @@ spec:
                 configMapKeyRef:
                   name: inference-config
                   key: BOOTSTRAP_SERVERS
+            - name: KAFKA_SECURITY_PROTOCOL
+              valueFrom:
+                configMapKeyRef:
+                  name: inference-config
+                  key: KAFKA_SECURITY_PROTOCOL
             - name: REQUEST_TOPIC
               value: inference-request
             - name: RETRY_TOPIC
@@ -56,9 +61,8 @@ spec:
               value: "5"
             - name: RETRY_POLL_DELAY_SECONDS
               value: "1"
-            # TODO: 최종 이미지 확정 시 엔드포인트 재검토 필요
             - name: PREDICTOR_ENDPOINT
-              value: "/predict"
+              value: "/v1/models/pdm:predict"
             - name: ALERT_STATE_TABLE_NAME
               value: sgs-hasp-equipment-alert-state
             - name: SES_SENDER_EMAIL

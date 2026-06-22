@@ -109,8 +109,8 @@ output "msk_cluster_arn" {
 }
 
 output "msk_bootstrap_brokers" {
-  description = "Plaintext bootstrap brokers for the MSK cluster"
-  value       = aws_msk_cluster.main.bootstrap_brokers
+  description = "TLS bootstrap brokers for the MSK cluster"
+  value       = aws_msk_cluster.main.bootstrap_brokers_tls
 }
 
 output "manage_msk_topics" {
@@ -165,6 +165,16 @@ output "customer_gateway_ids" {
 output "vpn_connection_ids" {
   description = "Site-to-Site VPN connection IDs keyed by site name"
   value       = { for k, vpn in aws_vpn_connection.sites : k => vpn.id }
+}
+
+output "public_hosted_zone_id" {
+  description = "Route53 public hosted zone ID for sgs-hasp.click"
+  value       = data.aws_route53_zone.public.zone_id
+}
+
+output "private_hosted_zone_id" {
+  description = "Route53 private hosted zone ID for sgs-hasp.click"
+  value       = aws_route53_zone.private.zone_id
 }
 
 # Bastion(strongSwan) 자동 설정용 — bh render 가 terraform output -json 으로 소비

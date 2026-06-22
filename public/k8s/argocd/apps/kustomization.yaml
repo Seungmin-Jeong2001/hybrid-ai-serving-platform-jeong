@@ -3,6 +3,10 @@ kind: Kustomization
 resources:
   - policy-app.yaml
   - cert-manager-app.yaml
+  - istio-base-app.yaml
+  - istiod-app.yaml
+  - istio-cni-app.yaml
+  - ztunnel-app.yaml
   - inference-api-app.yaml
   - inference-worker-app.yaml
   - metrics-server-app.yaml

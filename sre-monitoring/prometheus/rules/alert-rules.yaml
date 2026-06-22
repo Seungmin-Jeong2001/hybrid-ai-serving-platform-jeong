@@ -18,6 +18,7 @@ metadata:
   labels:
     app.kubernetes.io/name: sre-monitoring
     app.kubernetes.io/component: alerting
+    release: kube-prometheus-stack
 spec:
   groups:
 
@@ -29,7 +30,6 @@ spec:
       rules:
 
         # 1시간 내 Error Budget을 모두 소진할 속도 → 즉시 대응 필요
-        # burn rate 14.4 = 1시간 소진 (월 30일 기준: 30*24/1 * (1-0.999)/0.001 = 14.4)
         - alert: ErrorBudgetBurnRateCritical
           expr: |
             slo:error_budget_burn_rate:1h > 14.4
@@ -39,6 +39,7 @@ spec:
           labels:
             severity: critical
             team: sre
+            plane: HYBRID
           annotations:
             summary: "Error Budget 급속 소진 (1h 번 레이트: {{ $value | printf \"%.1f\" }}x)"
             description: |
@@ -55,6 +56,7 @@ spec:
           labels:
             severity: warning
             team: sre
+            plane: HYBRID
           annotations:
             summary: "Error Budget 빠른 소진 (6h 번 레이트: {{ $value | printf \"%.1f\" }}x)"
             description: |
@@ -69,6 +71,7 @@ spec:
           labels:
             severity: warning
             team: sre
+            plane: HYBRID
           annotations:
             summary: "Error Budget 10% 미만 ({{ $value | humanizePercentage }} 잔여)"
             description: |
@@ -87,6 +90,7 @@ spec:
           for: 5m
           labels:
             severity: critical
+            plane: PUBLIC
           annotations:
             summary: "Pod CrashLoop: {{ $labels.namespace }}/{{ $labels.pod }}"
             description: |
@@ -102,6 +106,7 @@ spec:
           for: 5m
           labels:
             severity: warning
+            plane: PUBLIC
           annotations:
             summary: "Pod 준비 안됨: {{ $labels.namespace }}/{{ $labels.pod }}"
             description: |
@@ -112,6 +117,7 @@ spec:
             kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
           labels:
             severity: critical
+            plane: PUBLIC
           annotations:
             summary: "OOMKilled: {{ $labels.namespace }}/{{ $labels.pod }}"
             description: |
@@ -126,6 +132,7 @@ spec:
           for: 5m
           labels:
             severity: warning
+            plane: PUBLIC
           annotations:
             summary: "Deployment 레플리카 불일치: {{ $labels.namespace }}/{{ $labels.deployment }}"
             description: |
@@ -144,6 +151,7 @@ spec:
           for: 10m
           labels:
             severity: warning
+            plane: PUBLIC
           annotations:
             summary: "노드 CPU 높음: {{ $labels.instance }} ({{ $value | humanizePercentage }})"
             description: |
@@ -155,6 +163,7 @@ spec:
           for: 10m
           labels:
             severity: warning
+            plane: PUBLIC
           annotations:
             summary: "노드 메모리 높음: {{ $labels.instance }} ({{ $value | humanizePercentage }})"
             description: |
@@ -170,6 +179,7 @@ spec:
           for: 5m
           labels:
             severity: warning
+            plane: PUBLIC
           annotations:
             summary: "디스크 공간 부족: {{ $labels.instance }}:{{ $labels.mountpoint }}"
             description: |
@@ -181,6 +191,7 @@ spec:
           for: 5m
           labels:
             severity: critical
+            plane: PUBLIC
           annotations:
             summary: "노드 NotReady: {{ $labels.node }}"
             description: |
@@ -198,6 +209,7 @@ spec:
           for: 5m
           labels:
             severity: critical
+            plane: MONITORING
           annotations:
             summary: "Prometheus 수집 대상 Down: {{ $labels.job }}/{{ $labels.instance }}"
             description: |
@@ -209,6 +221,7 @@ spec:
           for: 5m
           labels:
             severity: critical
+            plane: MONITORING
           annotations:
             summary: "Prometheus 설정 리로드 실패"
             description: "Prometheus 설정 파일 리로드가 실패했습니다. 설정 파일을 확인하세요."
@@ -225,6 +238,7 @@ spec:
     #       for: 5m
     #       labels:
     #         severity: critical
+    #         plane: PUBLIC
     #       annotations:
     #         summary: "Kafka Consumer Lag 높음: {{ $labels.consumergroup }}/{{ $labels.topic }}"
     #         description: |
@@ -235,6 +249,7 @@ spec:
     #         increase(kafka_topic_partition_current_offset{topic=~".*dlq.*"}[5m]) > 0
     #       labels:
     #         severity: critical
+    #         plane: PUBLIC
     #       annotations:
     #         summary: "DLQ 메시지 감지: {{ $labels.topic }}"
     #         description: |
@@ -246,6 +261,7 @@ spec:
     #       for: 5m
     #       labels:
     #         severity: warning
+    #         plane: PUBLIC
     #       annotations:
     #         summary: "DLQ 발생률 SLO 위반 ({{ $value | humanizePercentage }})"
     #         description: "DLQ 발생률이 1% SLO를 초과했습니다."
@@ -262,6 +278,7 @@ spec:
     #       for: 5m
     #       labels:
     #         severity: critical
+    #         plane: PUBLIC
     #       annotations:
     #         summary: "5xx 에러율 높음 ({{ $value | humanizePercentage }})"
     #         description: "추론 서버 5xx 에러율이 5% SLO를 초과했습니다."
@@ -272,6 +289,7 @@ spec:
     #       for: 5m
     #       labels:
     #         severity: warning
+    #         plane: PUBLIC
     #       annotations:
     #         summary: "P99 레이턴시 높음 ({{ $value | printf \"%.2f\" }}s)"
     #         description: "추론 P99 레이턴시가 5s SLO를 초과했습니다."
@@ -288,6 +306,7 @@ spec:
     #       for: 5m
     #       labels:
     #         severity: warning
+    #         plane: PUBLIC
     #       annotations:
     #         summary: "ArgoCD 앱 동기화 실패: {{ $labels.name }}"
     #         description: "ArgoCD 애플리케이션 {{ $labels.name }}이 OutOfSync 상태입니다."
@@ -298,5 +317,6 @@ spec:
     #       for: 5m
     #       labels:
     #         severity: critical
+    #         plane: PUBLIC
     #       annotations:
     #         summary: "ArgoCD 앱 Degraded: {{ $labels.name }}"

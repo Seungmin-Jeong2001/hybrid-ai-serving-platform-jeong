@@ -1,0 +1,41 @@
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: sre-slack-config
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: sre-monitoring
+spec:
+  route:
+    receiver: infra-alerts
+    groupBy: ['alertname', 'namespace', 'severity', 'plane']
+    groupWait: 30s
+    groupInterval: 5m
+    repeatInterval: 4h
+    routes:
+      - receiver: slo-alerts
+        matchers:
+          - name: team
+            matchType: "="
+            value: sre
+  receivers:
+    - name: infra-alerts
+      slackConfigs:
+        - apiURL:
+            name: slack-webhooks
+            key: infra
+          channel: '#infra-alerts'
+          color: '{{ if eq .Status "resolved" }}good{{ else if eq .GroupLabels.severity "critical" }}danger{{ else }}warning{{ end }}'
+          title: '{{ if eq .Status "resolved" }}[RESOLVED][{{ .GroupLabels.plane }}]{{ else }}[{{ if eq .GroupLabels.severity "critical" }}CRITICAL{{ else }}WARNING{{ end }}][{{ .GroupLabels.plane }}]{{ end }}'
+          text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ "\n" }}{{ .Annotations.description }}{{ end }}'
+          sendResolved: true
+    - name: slo-alerts
+      slackConfigs:
+        - apiURL:
+            name: slack-webhooks
+            key: slo
+          channel: '#slo-alerts'
+          color: '{{ if eq .Status "resolved" }}good{{ else if eq .GroupLabels.severity "critical" }}danger{{ else }}warning{{ end }}'
+          title: '{{ if eq .Status "resolved" }}[RESOLVED]{{ else }}[{{ if eq .GroupLabels.severity "critical" }}CRITICAL{{ else }}WARNING{{ end }}]{{ end }}'
+          text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ "\n" }}{{ .Annotations.description }}{{ end }}'
+          sendResolved: true

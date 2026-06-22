@@ -19,7 +19,7 @@ hybrid-ai-serving-platform/
 │  └─ handoff/
 ├─ public/                 # Public Cloud 역할 작업 영역
 │  ├─ terraform/           # AWS VPC, EKS, ECR, ALB, MSK 등
-│  └─ ansible/             # Public monitoring/service 배포 playbook
+│  └─ ansible/             # Legacy monitoring deployment playbook (reference only)
 ├─ gitops/
 │  └─ kserve/              # ArgoCD가 동기화할 serving manifest
 ├─ packages/

@@ -13,21 +13,22 @@ import httpx
 from kafka import KafkaConsumer, KafkaProducer, TopicPartition
 from kafka.errors import KafkaError
 
-
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger("inference-worker")
 
-
 def _bootstrap_servers() -> str:
     value = os.getenv("BOOTSTRAP_SERVERS", "").strip()
-    if not value or value == "replace-me:9092":
+    if not value or value in {"replace-me:9092", "replace-me:9094"}:
         raise RuntimeError("BOOTSTRAP_SERVERS must be configured")
     return value
 
+def _kafka_security_protocol() -> str:
+    return os.getenv("KAFKA_SECURITY_PROTOCOL", "SSL")
 
+# 예측 API 엔드포인트 URL 구성 (기본값은 KServe 관례 따름)
 def _predict_url() -> str:
     # 기본값은 KServe InferenceService(metadata.name=pdm, RawDeployment) 관례를 따름:
     #   pdm = Predictive Maintenance(예지보전) 모델
@@ -42,80 +43,79 @@ def _predict_url() -> str:
     endpoint = os.getenv("PREDICTOR_ENDPOINT", "/v1/models/pdm:predict")
     return f"{base_url}{endpoint}"
 
-
+# 요청용 Kafka 토픽명 - 워커는 이 토픽을 구독해서 추론 요청 처리
 def _request_topic() -> str:
     return os.getenv("REQUEST_TOPIC", "inference-request")
 
-
+# 재시도용 Kafka 토픽명 - 일시적 오류 시 이 토픽으로 메시지 발행, 워커는 이 토픽도 구독해서 재시도 처리
 def _retry_topic() -> str:
     return os.getenv("RETRY_TOPIC", "inference-retry")
 
-
+# DLQ(Dead Letter Queue) 토픽명 - 재시도 후에도 처리 실패한 메시지 이동
 def _dlq_topic() -> str:
     return os.getenv("DLQ_TOPIC", "inference-dlq")
 
-
+# 워커가 구독할 Kafka 토픽 (처음 요청용 + 재시도용)
 def _subscribed_topics() -> tuple[str, str]:
     return (_request_topic(), _retry_topic())
 
-
+# 워커가 속한 Kafka 컨슈머 그룹명 (같은 그룹의 워커들은 메시지를 나눠서 처리)
 def _consumer_group() -> str:
     return os.getenv("WORKER_CONSUMER_GROUP", "inference-worker-group")
 
-
+# 최대 재시도 횟수 (재시도 후에도 실패하면 DLQ로 이동)
 def _max_retry_count() -> int:
     return int(os.getenv("MAX_RETRY_COUNT", "3"))
 
-
+# 재시도 백오프 스케줄 (초 단위)
 def _retry_backoff_schedule_seconds() -> tuple[int, ...]:
     return (10, 30, 60)
 
-
+# 재시도 시 백오프에 더해지는 무작위 지터 범위 (초 단위)
 def _retry_jitter_seconds() -> int:
     return int(os.getenv("RETRY_JITTER_SECONDS", "5"))
 
-
+# 재시도 폴링 간격 (초 단위) - 다음 재시도 예정인 메시지가 빨리 처리되도록 폴링 간격보다 짧게 설정
 def _retry_poll_delay_seconds() -> float:
     return float(os.getenv("RETRY_POLL_DELAY_SECONDS", "1"))
 
-
+# 결과 저장용 DynamoDB 테이블명
 def _results_table_name() -> str:
     return os.getenv("DYNAMODB_TABLE_NAME", "sgs-hasp-inference-results")
 
-
+# 결과 TTL (초 단위) - DynamoDB 항목이 자동 삭제되기까지의 시간
 def _results_ttl_seconds() -> int:
     return int(os.getenv("RESULTS_TTL_SECONDS", str(90 * 24 * 60 * 60)))  # 기본 90일
 
-
+# 장비별 이상 상태 저장용 DynamoDB 테이블명
 def _alert_state_table_name() -> str:
     return os.getenv("ALERT_STATE_TABLE_NAME", "sgs-hasp-equipment-alert-state")
 
-
-# 고객사 알림 이메일 설정 (AWS SES)
+# 고객사 알림 이메일 설정 (AWS SES) - 보내는 사람 주소
 def _ses_sender_email() -> str:
     return os.getenv("SES_SENDER_EMAIL", "")
 
-
+# 고객사 알림 이메일 설정 (AWS SES) - 받는 사람 주소
 def _ses_recipient_email() -> str:
     return os.getenv("SES_RECIPIENT_EMAIL", "")
 
-
+# 결과 저장용 DynamoDB 테이블 객체 생성 함수
 def _create_results_table():
     return boto3.resource("dynamodb", region_name=os.getenv("AWS_REGION")).Table(
         _results_table_name()
     )
 
-
+# 알림 상태를 저장하는 DynamoDB 테이블 객체 생성 함수
 def _create_alert_state_table():
     return boto3.resource("dynamodb", region_name=os.getenv("AWS_REGION")).Table(
         _alert_state_table_name()
     )
 
-
+# 예측 결과가 이상인지 판단하는 함수 - 예측 결과 문자열이 "normal"이 아니면 이상으로 간주
 def _is_abnormal(prediction: str) -> bool:
     return prediction.lower() != "normal"
 
-
+# 이상 감지 시 SES 이메일 발송 함수
 def _send_alert_email(equipment_id: str, prediction: str, completed_at: int) -> None:
     """이상 감지 시 고객사 담당자에게 SES 이메일 발송"""
     sender = _ses_sender_email()
@@ -148,7 +148,7 @@ def _send_alert_email(equipment_id: str, prediction: str, completed_at: int) -> 
     )
     logger.info("alert email sent equipment_id=%s prediction=%s", equipment_id, prediction)
 
-
+# 장비 상태가 변경될 때만 이메일 발송하도록 체크하는 함수 - 중복 알림 방지
 def _check_and_send_alert(alert_state_table, equipment_id: str, prediction: str, completed_at: int) -> None:
     """장비 상태가 변경될 때만 이메일 발송 (중복 알림 방지)"""
     is_abnormal = _is_abnormal(prediction)
@@ -176,11 +176,12 @@ def _check_and_send_alert(alert_state_table, equipment_id: str, prediction: str,
             equipment_id, current_status, new_status,
         )
 
-
+# 워커가 Kafka 토픽에서 메시지를 읽기 위한 KafkaConsumer 객체 생성 함수
 def _create_consumer() -> KafkaConsumer:
     return KafkaConsumer(
         *_subscribed_topics(),
         bootstrap_servers=_bootstrap_servers(),
+        security_protocol=_kafka_security_protocol(),
         client_id=os.getenv("KAFKA_CONSUMER_CLIENT_ID", "inference-worker"),
         group_id=_consumer_group(),
         enable_auto_commit=False,
@@ -189,10 +190,11 @@ def _create_consumer() -> KafkaConsumer:
         key_deserializer=lambda value: value.decode("utf-8") if value is not None else None,
     )
 
-
+# 워커가 Kafka 토픽으로 메시지를 다시 보내기 위한 KafkaProducer 객체 생성 함수 - retry/DLQ용 메시지 발행에 사용
 def _create_producer() -> KafkaProducer:
     return KafkaProducer(
         bootstrap_servers=_bootstrap_servers(),
+        security_protocol=_kafka_security_protocol(),
         client_id=os.getenv("KAFKA_PRODUCER_CLIENT_ID", "inference-worker"),
         acks="all",
         enable_idempotence=True,
@@ -201,11 +203,11 @@ def _create_producer() -> KafkaProducer:
         key_serializer=lambda value: value.encode("utf-8"),
     )
 
-
+# 현재 epoch 시간 (초 단위) 반환 함수
 def _now_epoch() -> int:
     return int(time.time())
 
-
+# 다음 재시도 시각 계산 함수 - 재시도 횟수에 따른 백오프 + 지터 적용
 def _compute_next_attempt_at(retry_count: int) -> int:
     schedule = _retry_backoff_schedule_seconds()
     delay_index = min(max(retry_count - 1, 0), len(schedule) - 1)
@@ -213,7 +215,7 @@ def _compute_next_attempt_at(retry_count: int) -> int:
     jitter = random.randint(-_retry_jitter_seconds(), _retry_jitter_seconds())
     return _now_epoch() + max(base_delay + jitter, 0)
 
-
+# 추론 결과를 DynamoDB에 저장하는 함수 - TTL 설정 포함
 def _save_result(
     results_table,
     request_id: str,
@@ -234,7 +236,7 @@ def _save_result(
         }
     )
 
-
+# Kafka 토픽에 메시지 발행 함수
 def _publish(
     producer: KafkaProducer,
     topic: str,
@@ -244,7 +246,7 @@ def _publish(
     key = payload.get("equipment_id") or request_id  # 파티션 키: equipment_id (같은 장비 메시지 순서 보장)
     producer.send(topic, key=key, value=payload).get(timeout=30)
 
-
+# 실패한 메시지의 재처리/장애 분석을 위한 페이로드 생성 함수 - 실패 원인 및 메타데이터 포함
 def _build_failure_payload(
     payload: dict[str, Any],
     *,
@@ -260,7 +262,7 @@ def _build_failure_payload(
     failed_payload["last_error"] = error_message
     return failed_payload
 
-
+# 재시도 메시지의 다음 시도 시각이 아직 안 된 경우 폴링 지연 함수 - 재시도 토픽 메시지 처리 시 사용
 def _defer_retry_record(consumer: KafkaConsumer, record, next_attempt_at: int) -> bool:
     if record.topic != _retry_topic():
         return False
@@ -281,7 +283,7 @@ def _defer_retry_record(consumer: KafkaConsumer, record, next_attempt_at: int) -
     time.sleep(sleep_seconds)
     return True
 
-
+# predictor HTTP 호출만 담당하는 함수
 def _process_message(payload: dict[str, Any]) -> dict[str, Any]:
     # retry_count, source_topic 등 워커 내부 메타데이터는 제외하고 predictor에 전달
     # TODO: 최종 이미지 확정 시 페이로드 구조 및 엔드포인트 재검토 필요
@@ -297,7 +299,7 @@ def _process_message(payload: dict[str, Any]) -> dict[str, Any]:
         response.raise_for_status()
         return response.json()
 
-
+# 워커 메인 실행 함수
 def run() -> None:
     logger.info(
         "worker started bootstrap_servers=%s subscribed_topics=%s dlq_topic=%s consumer_group=%s results_table=%s retry_schedule_seconds=%s retry_jitter_seconds=%s",
@@ -315,7 +317,7 @@ def run() -> None:
     alert_state_table = _create_alert_state_table()
 
     try:
-        while True:
+        while True: # Kafka에서 메시지 폴링
             records_map = consumer.poll(timeout_ms=1000, max_records=10)
             should_continue_polling = True
             for _, records in records_map.items():
@@ -412,7 +414,6 @@ def run() -> None:
         consumer.close()
         producer.flush()
         producer.close()
-
 
 if __name__ == "__main__":
     run()
