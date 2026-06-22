@@ -7,24 +7,23 @@ metadata:
     app.kubernetes.io/name: minio-sensor
     app.kubernetes.io/part-of: hybrid-ai-serving-platform
 spec:
-  serviceAccountName: argo-events-sa
+  eventBusName: default
+  template:
+    serviceAccountName: argo-events-sa
 
   dependencies:
-    - name: minio-success
-      eventSourceName: minio-eventsource
-      eventName: dataset-success
-      filters:
-        data:
-          - path: body.Records.0.s3.object.key
-            type: string
-            value:
-              - "^raw-data/.*/_SUCCESS$"
+    - name: minio-dep
+      eventSourceName: minio-event-source
+      eventName: raw-data-upload
 
   triggers:
     - template:
         name: minio-trigger
-        k8s:
-          operation: create
+        argoWorkflow:
+          operation: submit
+          group: argoproj.io
+          version: v1alpha1
+          kind: Workflow
           source:
             resource:
               apiVersion: argoproj.io/v1alpha1
@@ -45,6 +44,7 @@ spec:
                       value: raw-data%2Fdev%2F_SUCCESS
           parameters:
             - src:
-                dependencyName: minio-success
+                dependencyName: minio-dep
                 dataKey: body.Records.0.s3.object.key
               dest: spec.arguments.parameters.0.value
+              operation: overwrite

@@ -1,10 +1,10 @@
 apiVersion: argoproj.io/v1alpha1
 kind: EventSource
 metadata:
-  name: minio-eventsource
+  name: minio-event-source
   namespace: argo-events
   labels:
-    app.kubernetes.io/name: minio-eventsource
+    app.kubernetes.io/name: minio-event-source
     app.kubernetes.io/part-of: hybrid-ai-serving-platform
 spec:
   serviceAccountName: argo-events-sa
