@@ -466,6 +466,10 @@ jobs:
               "if ! command -v kubectl >/dev/null 2>&1; then curl -fsSLo /tmp/kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl && chmod +x /tmp/kubectl && sudo mv /tmp/kubectl /usr/local/bin/kubectl; fi",
               "export KUBECONFIG=/tmp/eks-kubeconfig",
               f"aws eks update-kubeconfig --region {os.environ['AWS_REGION']} --name {os.environ['EKS_CLUSTER_NAME']} --role-arn {os.environ['BOOTSTRAP_ROLE_ARN']} --kubeconfig /tmp/eks-kubeconfig",
+              "for i in $(seq 1 40); do kubectl get serviceaccount -n inference inference-worker >/dev/null 2>&1 && break; sleep 15; done",
+              "kubectl get serviceaccount -n inference inference-worker >/dev/null 2>&1",
+              "for i in $(seq 1 40); do kubectl get serviceaccount -n app dashboard-backend >/dev/null 2>&1 && break; sleep 15; done",
+              "kubectl get serviceaccount -n app dashboard-backend >/dev/null 2>&1",
               f"kubectl annotate serviceaccount -n inference inference-worker eks.amazonaws.com/role-arn='{os.environ['INFERENCE_WORKER_ROLE_ARN']}' --overwrite",
               f"kubectl annotate serviceaccount -n app dashboard-backend eks.amazonaws.com/role-arn='{os.environ['DASHBOARD_BACKEND_ROLE_ARN']}' --overwrite",
               "kubectl rollout restart deployment/inference-worker -n inference || true",
@@ -474,6 +478,10 @@ jobs:
 
           if os.environ.get("ALB_CERTIFICATE_ARN"):
               commands.extend([
+                  "for i in $(seq 1 40); do kubectl get ingress -n inference inference-api >/dev/null 2>&1 && break; sleep 15; done",
+                  "kubectl get ingress -n inference inference-api >/dev/null 2>&1",
+                  "for i in $(seq 1 40); do kubectl get ingress -n app dashboard-frontend >/dev/null 2>&1 && break; sleep 15; done",
+                  "kubectl get ingress -n app dashboard-frontend >/dev/null 2>&1",
                   f"kubectl annotate ingress -n inference inference-api alb.ingress.kubernetes.io/certificate-arn='{os.environ['ALB_CERTIFICATE_ARN']}' --overwrite",
                   f"kubectl annotate ingress -n app dashboard-frontend alb.ingress.kubernetes.io/certificate-arn='{os.environ['ALB_CERTIFICATE_ARN']}' --overwrite",
               ])
