@@ -16,6 +16,7 @@ variables:
   # TRIVY_IMAGE: "${HARBOR_REGISTRY}/docker-hub/aquasec/trivy:latest"
   # 임시 우회용 공식 이미지
   TRIVY_IMAGE: "aquasec/trivy:latest"
+  BASTION_CACHE_DIR: "/opt/hybrid-ai/bastion-cache"
 
 # ==============================================================================
 # 🚨 공통 실패 알림 템플릿
@@ -128,11 +129,15 @@ sync-harbor-to-ecr:
   tags:
     - gpu-worker
   before_script:
-    - apk add --no-cache aws-cli ca-certificates curl skopeo
+    - apk add --no-cache aws-cli ca-certificates skopeo
     - ': "${HARBOR_CA_CERT:?HARBOR_CA_CERT is required}"'
     - if [ -f "$HARBOR_CA_CERT" ]; then cp "$HARBOR_CA_CERT" /usr/local/share/ca-certificates/harbor.intp.me.crt; else printf '%s\n' "$HARBOR_CA_CERT" > /usr/local/share/ca-certificates/harbor.intp.me.crt; fi
     - update-ca-certificates
-    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+    - |
+      TRIVY_ARCHIVE="$(find "${BASTION_CACHE_DIR}/tools/linux-amd64" -maxdepth 1 -name 'trivy_*_Linux-64bit.tar.gz' | sort | tail -n 1)"
+      test -n "$TRIVY_ARCHIVE"
+      tar -xzf "$TRIVY_ARCHIVE" -C /usr/local/bin trivy
+      chmod +x /usr/local/bin/trivy
   script:
     - |
       TARGET_TAG="${IMAGE_TAG:?IMAGE_TAG is required}"
@@ -161,39 +166,37 @@ sync-harbor-to-ecr:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "trigger" || $CI_PIPELINE_SOURCE == "api"'
 
+update-git-manifest:
+  extends: .failure_notification
+  stage: deploy
 
-#더 이상 사용하지 않음
-# update-git-manifest:
-#   extends: .failure_notification
-#   stage: deploy
+  # Harbor 경유 기존 경로
+  # image: harbor.intp.me/docker-hub/library/alpine:3.18
+  # 임시 우회용 공식 이미지
+  image: alpine:3.18
 
-#   # Harbor 경유 기존 경로
-#   # image: harbor.intp.me/docker-hub/library/alpine:3.18
-#   # 임시 우회용 공식 이미지
-#   image: alpine:3.18
-
-#   tags:
-#     - gpu-worker
-#   needs: [sync-harbor-to-ecr]
-#   script:
-#     - |
-#       apk add --no-cache git sed curl
-#       TARGET_TAG="${IMAGE_TAG:?IMAGE_TAG is required}"
-#       NEW_IMAGE="${ECR_ENDPOINT}/${MODEL_IMAGE_NAME}:${TARGET_TAG}"
-#       git clone "https://x-access-token:${GITHUB_PAT}@github.com/SGS-Strategy/hybrid-ai-serving-platform.git" repo
-#       sed -i "s|image:.*|image: ${NEW_IMAGE}|g" repo/public/k8s/serving/predictive-model/pdm-isvc.yaml
-#       cd repo
-#       git config --global user.email "bot@intp.me"
-#       git config --global user.name "MLOps Bot"
-#       git add .
-#       if ! git diff --cached --quiet; then
-#         git commit -m "update image to ${TARGET_TAG}"
-#         git push origin main
-#       else
-#         echo "No changes detected"
-#       fi
-#   rules:
-#     - if: '$CI_PIPELINE_SOURCE == "trigger" || $CI_PIPELINE_SOURCE == "api"'
+  tags:
+    - gpu-worker
+  needs: [sync-harbor-to-ecr]
+  script:
+    - |
+      apk add --no-cache git sed curl
+      TARGET_TAG="${IMAGE_TAG:?IMAGE_TAG is required}"
+      NEW_IMAGE="${ECR_ENDPOINT}/${MODEL_IMAGE_NAME}:${TARGET_TAG}"
+      git clone "https://x-access-token:${GITHUB_PAT}@github.com/SGS-Strategy/hybrid-ai-serving-platform.git" repo
+      sed -i "s|image:.*|image: ${NEW_IMAGE}|g" repo/public/k8s/serving/predictive-model/pdm-isvc.yaml
+      cd repo
+      git config --global user.email "bot@intp.me"
+      git config --global user.name "MLOps Bot"
+      git add .
+      if ! git diff --cached --quiet; then
+        git commit -m "update image to ${TARGET_TAG}"
+        git push origin main
+      else
+        echo "No changes detected"
+      fi
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "trigger" || $CI_PIPELINE_SOURCE == "api"'
 
 notify-success:
   stage: notify
