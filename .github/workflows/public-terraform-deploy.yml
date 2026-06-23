@@ -69,17 +69,7 @@ jobs:
         working-directory: public/terraform
         run: |
           if [[ -n "$DLQ_SLACK_WEBHOOK_URL" ]]; then
-            python - <<'PY'
-            import json
-            import os
-
-            with open("zz-dlq-alert.auto.tfvars", "w", encoding="utf-8") as fp:
-                fp.write(
-                    "dlq_alert_slack_webhook_url = "
-                    + json.dumps(os.environ["DLQ_SLACK_WEBHOOK_URL"])
-                    + "\n"
-                )
-            PY
+            python -c "import json, os; open('zz-dlq-alert.auto.tfvars', 'w', encoding='utf-8').write('dlq_alert_slack_webhook_url = ' + json.dumps(os.environ['DLQ_SLACK_WEBHOOK_URL']) + '\\n')"
           fi
 
       - name: Terraform fmt check
