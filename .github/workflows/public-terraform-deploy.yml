@@ -63,13 +63,23 @@ jobs:
             printf '%s\n' "$TFVARS_CONTENT" > zz-secret.auto.tfvars
           fi
 
-      - name: Write VPN secret tfvars override
+      - name: Write DLQ Slack webhook secret override
         env:
-          VPN_TFVARS_CONTENT: ${{ secrets.PUBLIC_TERRAFORM_VPN_TFVARS }}
+          DLQ_SLACK_WEBHOOK_URL: ${{ secrets.INFRA_ALERTS }}
         working-directory: public/terraform
         run: |
-          if [[ -n "$VPN_TFVARS_CONTENT" ]]; then
-            printf '%s\n' "$VPN_TFVARS_CONTENT" > zzz-vpn.auto.tfvars
+          if [[ -n "$DLQ_SLACK_WEBHOOK_URL" ]]; then
+            python - <<'PY'
+            import json
+            import os
+
+            with open("zz-dlq-alert.auto.tfvars", "w", encoding="utf-8") as fp:
+                fp.write(
+                    "dlq_alert_slack_webhook_url = "
+                    + json.dumps(os.environ["DLQ_SLACK_WEBHOOK_URL"])
+                    + "\n"
+                )
+            PY
           fi
 
       - name: Terraform fmt check
