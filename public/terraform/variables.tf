@@ -269,3 +269,16 @@ variable "vpn_static_route_cidrs" {
   type        = map(list(string))
   default     = {}
 }
+
+variable "dlq_alert_slack_webhook_url" {
+  description = "Slack incoming webhook URL for DLQ alerts; leave empty to skip Lambda webhook delivery"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "dlq_alert_topic_name" {
+  description = "MSK topic name that stores failed inference requests"
+  type        = string
+  default     = "inference-dlq"
+}

@@ -210,3 +210,9 @@ output "vpn_local_vpc_cidr" {
 #   description = "Inbound Route 53 Resolver IPs for forwarding *.amazonaws.com and private hosted zones"
 #   value       = [for ip in aws_route53_resolver_endpoint.inbound.ip_address : ip.ip]
 # }
+
+output "dlq_alert_lambda_name" {
+  description = "Lambda function name for direct DLQ Slack webhook delivery"
+  value       = local.enable_dlq_alert_webhook ? aws_lambda_function.dlq_alarm[0].function_name : null
+  sensitive   = true
+}
