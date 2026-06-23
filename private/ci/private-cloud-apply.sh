@@ -373,8 +373,17 @@ ensure_ssh_key() {
 }
 
 write_ssh_config() {
-  local tmp_config
+  local tmp_config proxy_cmd
   ensure_ssh_key
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    # Kolla: tenant VM은 neutron qdhcp netns 경유로 도달 (DevStack lxc 컨테이너 대체)
+    local netns
+    netns="$(ip netns list 2>/dev/null | grep -oE 'qdhcp-[0-9a-f-]+' | head -1)"
+    [[ -n "${netns}" ]] || { echo "qdhcp netns 없음 — tenant 네트워크 확인" >&2; return 1; }
+    proxy_cmd="sudo ip netns exec ${netns} nc %%h %%p"
+  else
+    proxy_cmd="lxc exec ha-openstack -- nc %%h %%p"
+  fi
   tmp_config="${SSH_CONFIG}.$$"
   {
     printf 'Host *\n'
@@ -385,7 +394,7 @@ write_ssh_config() {
     printf '  CheckHostIP no\n'
     printf '  UserKnownHostsFile /dev/null\n'
     printf '  LogLevel ERROR\n'
-    printf '  ProxyCommand lxc exec ha-openstack -- nc %%h %%p\n'
+    printf '  ProxyCommand %s\n' "${proxy_cmd}"
   } >"${tmp_config}"
   chmod 600 "${tmp_config}"
   mv "${tmp_config}" "${SSH_CONFIG}"
@@ -2649,6 +2658,11 @@ ssh_tunnel_listen_address() {
 ensure_openstack_private_route() {
   local private_cidr router_name gateway
 
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    log "skip private route setup: Kolla provider (VM 접속은 qdhcp netns ProxyCommand 경유)"
+    return 0
+  fi
+
   if ! command -v lxc >/dev/null 2>&1 || ! lxc info ha-openstack >/dev/null 2>&1; then
     log "skip private route setup: ha-openstack container is unavailable"
     return 0
@@ -3092,10 +3106,19 @@ terraform_apply() {
       effective_install_node_dependencies="false"
     fi
   fi
-  public_network_id="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc 'cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack network show public -f value -c id')"
-  public_subnet_id="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc 'cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack subnet list --network public --ip-version 4 -f value -c ID | head -n 1')"
-  public_subnet_cidr="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc "cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack subnet show '${public_subnet_id}' -f value -c cidr")"
-  assign_floating_ips="$(tf_bool_value PRIVATE_CLOUD_ASSIGN_FLOATING_IPS "${PRIVATE_CLOUD_ASSIGN_FLOATING_IPS}")"
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    # Kolla: 외부망은 ext-net (DevStack 'public' 대체), FIP 미사용(접속=in-cluster cloudflared)
+    local _extnet="${HA_KOLLA_EXTERNAL_NETWORK:-ext-net}"
+    public_network_id="$(kolla_os network show "${_extnet}" -f value -c id)"
+    public_subnet_id="$(kolla_os subnet list --network "${_extnet}" --ip-version 4 -f value -c ID | head -n 1)"
+    public_subnet_cidr="$(kolla_os subnet show "${public_subnet_id}" -f value -c cidr)"
+    assign_floating_ips=false
+  else
+    public_network_id="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc 'cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack network show public -f value -c id')"
+    public_subnet_id="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc 'cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack subnet list --network public --ip-version 4 -f value -c ID | head -n 1')"
+    public_subnet_cidr="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc "cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack subnet show '${public_subnet_id}' -f value -c cidr")"
+    assign_floating_ips="$(tf_bool_value PRIVATE_CLOUD_ASSIGN_FLOATING_IPS "${PRIVATE_CLOUD_ASSIGN_FLOATING_IPS}")"
+  fi
   {
     printf 'external_network_id = "%s"\n' "$public_network_id"
     printf 'floating_ip_pool = "public"\n'
@@ -3446,7 +3469,12 @@ bootstrap_k8s() {
   wait_nodes_ssh
   export HA_OPENSTACK_TF_OUTPUT_JSON="${TF_OUTPUT_JSON}"
   export HA_OPENSTACK_SSH_KEY="${SSH_KEY}"
-  export HA_OPENSTACK_SSH_PROXY_CONTAINER="ha-openstack"
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    # Kolla: tenant VM은 neutron qdhcp netns 경유 (DevStack lxc 컨테이너 대체)
+    export HA_OPENSTACK_SSH_PROXY_NETNS="$(ip netns list 2>/dev/null | grep -oE 'qdhcp-[0-9a-f-]+' | head -1)"
+  else
+    export HA_OPENSTACK_SSH_PROXY_CONTAINER="ha-openstack"
+  fi
   export HA_OPENSTACK_SSH_TARGET="auto"
   export HA_OPENSTACK_KUBECONFIG="${KUBECONFIG_PATH}"
   export HA_K8S_API_ENDPOINT="127.0.0.1:${HA_KUBECTL_TUNNEL_PORT}"
