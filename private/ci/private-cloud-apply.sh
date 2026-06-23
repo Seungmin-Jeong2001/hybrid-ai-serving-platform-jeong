@@ -2221,6 +2221,9 @@ sync_openstack_login_user() {
 }
 
 ensure_devstack_egress() {
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    return 0  # Kolla: egress는 호스트 systemd(kolla-egress-nat.service)가 담당
+  fi
   lxc exec ha-openstack -- sudo -u stack -H bash -s <<'LOOKUP_PUBLIC_EGRESS' >"${LOG_DIR}/public-egress.env"
 set -eo pipefail
 cd /opt/stack/devstack
