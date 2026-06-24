@@ -463,6 +463,7 @@ jobs:
           python - <<'PY'
           import os
           import re
+          import json
           from pathlib import Path
 
           root = Path.cwd().parent.parent
@@ -479,13 +480,13 @@ jobs:
               ),
               (
                   root / "public/k8s/apps/inference-api/ingress.yaml",
-                  r"(alb\.ingress\.kubernetes\.io/certificate-arn:\s*).*$",
-                  rf"\1{os.environ['ALB_CERTIFICATE_ARN']}",
+                  r'(alb\.ingress\.kubernetes\.io/certificate-arn:\s*).*$',
+                  r"\1" + json.dumps(os.environ["ALB_CERTIFICATE_ARN"]),
               ),
               (
                   root / "public/k8s/apps/dashboard-frontend/ingress.yaml",
-                  r"(alb\.ingress\.kubernetes\.io/certificate-arn:\s*).*$",
-                  rf"\1{os.environ['ALB_CERTIFICATE_ARN']}",
+                  r'(alb\.ingress\.kubernetes\.io/certificate-arn:\s*).*$',
+                  r"\1" + json.dumps(os.environ["ALB_CERTIFICATE_ARN"]),
               ),
           ]
 
