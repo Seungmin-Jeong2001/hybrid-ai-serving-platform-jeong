@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import os
+import re
 import ssl
 from datetime import datetime, timedelta, timezone
 from urllib import parse, request
@@ -21,9 +22,9 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _post_to_slack(text: str) -> None:
+def _post_to_slack(message: dict) -> None:
     webhook_url = os.environ["SLACK_WEBHOOK_URL"]
-    payload = json.dumps({"text": text}).encode("utf-8")
+    payload = json.dumps(message).encode("utf-8")
     req = request.Request(
         webhook_url,
         data=payload,
@@ -181,6 +182,71 @@ def _collect_recent_pod_logs(label_selector: str, tail_lines: int = 20, max_pods
     return logs
 
 
+def _extract_signal_patterns(text: str) -> list[str]:
+    patterns = [
+        (r"KeyError:\s*'([^']+)'", "application exception KeyError on field {group1}"),
+        (r"ValueError:\s*(.+)", "application exception ValueError"),
+        (r"Traceback \(most recent call last\):", "python traceback observed"),
+        (r"500 Internal Server Error", "HTTP 500 observed"),
+        (r"Connection reset by peer", "connection reset observed"),
+        (r"timed out|Timeout", "timeout observed"),
+        (r"KSERVE_INTERNAL_ERROR", "worker classified request as KSERVE_INTERNAL_ERROR"),
+        (r"HTTPStatusError", "worker observed HTTP status error"),
+        (r"connect|Connection", "connection-related log observed"),
+    ]
+
+    signals = []
+    for pattern, template in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        signal = template
+        if match.lastindex:
+            for index in range(1, match.lastindex + 1):
+                signal = signal.replace(f"{{group{index}}}", match.group(index))
+        signals.append(signal)
+    return signals
+
+
+def _build_observed_signals(
+    payload: dict,
+    kafka_context: dict,
+    worker_status: dict,
+    predictor_status: dict,
+    worker_logs: list[dict],
+    predictor_logs: list[dict],
+) -> list[str]:
+    signals = [
+        f"failure_stage={payload.get('failure_stage', 'unknown')}",
+        f"last_error={payload.get('last_error', 'unknown')}",
+        f"retry_count={payload.get('retry_count', 0)}",
+        f"inference_worker_ready={worker_status.get('ready', 0)}/{worker_status.get('total', 0)}",
+        f"pdm_predictor_ready={predictor_status.get('ready', 0)}/{predictor_status.get('total', 0)}",
+    ]
+
+    for topic, lag in kafka_context.get("lag_by_topic", {}).items():
+        if lag is not None:
+            signals.append(f"kafka_lag_{topic}={lag}")
+
+    for source_name, log_entries in (("worker", worker_logs), ("predictor", predictor_logs)):
+        for entry in log_entries:
+            log_text = entry.get("log", "")
+            pod_name = entry.get("pod", "unknown")
+            extracted = _extract_signal_patterns(log_text)
+            for signal in extracted:
+                signals.append(f"{source_name}_pod={pod_name}: {signal}")
+
+    # Deduplicate while keeping order stable for prompt readability.
+    seen = set()
+    deduped = []
+    for signal in signals:
+        if signal in seen:
+            continue
+        seen.add(signal)
+        deduped.append(signal)
+    return deduped[:20]
+
+
 def _query_msk_lag(topic_name: str) -> int | None:
     region = _env("AWS_REGION", "ap-northeast-2")
     cluster_name = _env("MSK_CLUSTER_NAME")
@@ -266,6 +332,7 @@ def _heuristic_summary(payload: dict, kafka_context: dict, worker_status: dict, 
 def _build_prompt(payload: dict, kafka_context: dict, worker_status: dict, predictor_status: dict) -> str:
     worker_logs = payload.get("_worker_logs", [])
     predictor_logs = payload.get("_predictor_logs", [])
+    observed_signals = payload.get("_observed_signals", [])
     return f"""
 You are an SRE copilot for an asynchronous inference platform.
 Analyze the incident context and respond in JSON with the following keys:
@@ -278,6 +345,7 @@ Rules:
 - Do not claim a network issue unless the logs or metrics explicitly indicate connectivity failure.
 - Prefer application-level causes when logs include concrete exceptions or HTTP 5xx evidence.
 - Recommended actions must be specific to the observed signals, not generic troubleshooting advice.
+- Prioritize the observed_signals section over raw logs when they conflict.
 
 Incident context:
 {json.dumps(
@@ -293,6 +361,7 @@ Incident context:
         "kafka": kafka_context,
         "worker": worker_status,
         "predictor": predictor_status,
+        "observed_signals": observed_signals,
         "recent_worker_logs": worker_logs,
         "recent_predictor_logs": predictor_logs,
     },
@@ -376,7 +445,15 @@ def _format_topic_lag(kafka_context: dict) -> str:
     return ", ".join(parts) if parts else "n/a"
 
 
-def _build_message(payload: dict, kafka_context: dict, worker_status: dict, predictor_status: dict, summary: dict) -> str:
+def _severity_color(summary: dict) -> str:
+    return "danger"
+
+
+def _severity_title(environment: str) -> str:
+    return f"[CRITICAL][{environment}]"
+
+
+def _build_message(payload: dict, kafka_context: dict, worker_status: dict, predictor_status: dict, summary: dict) -> dict:
     environment = os.getenv("ENVIRONMENT", "public").upper()
     request_id = payload.get("request_id", "unknown")
     factory_id = payload.get("factory_id", "unknown")
@@ -388,22 +465,27 @@ def _build_message(payload: dict, kafka_context: dict, worker_status: dict, pred
     recommended_actions = summary.get("recommended_actions", [])
     cause_lines = "\n".join(f"{idx}. {cause}" for idx, cause in enumerate(likely_causes, start=1)) or "1. No cause generated"
     action_lines = "\n".join(f"{idx}. {action}" for idx, action in enumerate(recommended_actions, start=1)) or "1. No action generated"
-
-    return (
-        f"[CRITICAL][{environment}]\n"
-        f"Inference incident detected\n\n"
-        f"Request ID: {request_id}\n"
-        f"Factory ID: {factory_id}\n"
-        f"Equipment ID: {equipment_id}\n"
-        f"Failed At: {failure_stage}\n"
-        f"Reason: {last_error}\n"
-        f"Retry Count: {retry_count}\n"
-        f"Kafka Lag: {_format_topic_lag(kafka_context)}\n"
-        f"Inference Worker: {worker_status.get('ready', 0)}/{worker_status.get('total', 0)} ready, restarts={worker_status.get('restarts', 0)}\n"
-        f"PDM Predictor: {predictor_status.get('ready', 0)}/{predictor_status.get('total', 0)} ready, restarts={predictor_status.get('restarts', 0)}\n\n"
-        f"Likely Causes:\n{cause_lines}\n\n"
-        f"Recommended Actions:\n{action_lines}"
+    body = (
+        f"{equipment_id} 요청이 {failure_stage} 단계에서 최종 실패해 DLQ로 이동했습니다.\n\n"
+        f"- Request ID: {request_id}\n"
+        f"- Error: {last_error}\n"
+        f"- Retry: {retry_count}회 초과\n"
+        f"- Kafka Lag: {_format_topic_lag(kafka_context)}\n"
+        f"- Worker: {worker_status.get('ready', 0)}/{worker_status.get('total', 0)} Ready\n"
+        f"- Predictor: {predictor_status.get('ready', 0)}/{predictor_status.get('total', 0)} Ready\n\n"
+        f"원인 후보\n{cause_lines}\n\n"
+        f"즉시 조치\n{action_lines}"
     )
+    return {
+        "attachments": [
+            {
+                "color": _severity_color(summary),
+                "title": f"{_severity_title(environment)} Inference DLQ 발생",
+                "text": body,
+                "mrkdwn_in": ["text"],
+            }
+        ]
+    }
 
 
 def handler(event, _context):
@@ -426,6 +508,15 @@ def handler(event, _context):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("predictor_log_collection_failed selector=%s error=%s", _env("PREDICTOR_SELECTOR", "serving.kserve.io/inferenceservice=pdm"), exc)
                 payload["_predictor_logs"] = []
+
+            payload["_observed_signals"] = _build_observed_signals(
+                payload,
+                kafka_context,
+                worker_status,
+                predictor_status,
+                payload["_worker_logs"],
+                payload["_predictor_logs"],
+            )
             try:
                 summary = _invoke_bedrock_summary(payload, kafka_context, worker_status, predictor_status)
             except Exception as exc:  # noqa: BLE001
