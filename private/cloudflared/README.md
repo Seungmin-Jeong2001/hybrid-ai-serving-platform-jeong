@@ -7,7 +7,8 @@
 ## 노출 도메인
 | 도메인 | 백엔드 |
 |---|---|
-| minio.intp.me | `minio-console.minio-tenant.svc:9090` (ClusterIP) |
+| minio.intp.me | `minio.minio-tenant.svc:80` → 9000 (**S3 API**, mc/SDK용) |
+| minio-console.intp.me | `minio-console.minio-tenant.svc:9090` (**웹 콘솔**) |
 | gitlab.intp.me | `10.42.0.61:80` (GitLab VM) |
 | harbor.intp.me | `10.42.0.127:80` (Harbor VM) |
 | openstack.intp.me | `192.168.0.250:80` (Kolla Horizon VIP) |

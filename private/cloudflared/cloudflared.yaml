@@ -17,6 +17,8 @@ data:
     credentials-file: /etc/cloudflared/creds/credentials.json
     ingress:
       - hostname: minio.intp.me
+        service: http://minio.minio-tenant.svc.cluster.local:80
+      - hostname: minio-console.intp.me
         service: http://minio-console.minio-tenant.svc.cluster.local:9090
       - hostname: gitlab.intp.me
         service: http://10.42.0.61:80
