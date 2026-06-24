@@ -519,6 +519,7 @@ jobs:
         run: |
           HOSTED_ZONE_ID="$(terraform output -raw public_hosted_zone_id)"
           PRIVATE_HOSTED_ZONE_ID="$(terraform output -raw private_hosted_zone_id)"
+          ALB_CERTIFICATE_ARN="$(terraform output -raw alb_certificate_arn)"
 
           if ! command -v kubectl >/dev/null 2>&1; then
             curl -fsSLo /tmp/kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
@@ -532,6 +533,27 @@ jobs:
             --name "${EKS_CLUSTER_NAME}" \
             --role-arn "${BOOTSTRAP_ROLE_ARN}" \
             --kubeconfig "${KUBECONFIG}"
+
+          kubectl annotate application -n argocd inference-api argocd.argoproj.io/refresh=hard --overwrite >/dev/null 2>&1 || true
+          kubectl annotate application -n argocd dashboard-frontend argocd.argoproj.io/refresh=hard --overwrite >/dev/null 2>&1 || true
+
+          for ((i=1; i<=40; i++)); do
+            INFERENCE_SYNC=$(kubectl get application -n argocd inference-api -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+            DASHBOARD_SYNC=$(kubectl get application -n argocd dashboard-frontend -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+            INFERENCE_CERT=$(kubectl get ingress -n inference inference-api -o jsonpath='{.metadata.annotations.alb\.ingress\.kubernetes\.io/certificate-arn}' 2>/dev/null || true)
+            DASHBOARD_CERT=$(kubectl get ingress -n app dashboard-frontend -o jsonpath='{.metadata.annotations.alb\.ingress\.kubernetes\.io/certificate-arn}' 2>/dev/null || true)
+
+            if [[ "${INFERENCE_SYNC}" == "Synced" && \
+                  "${DASHBOARD_SYNC}" == "Synced" && \
+                  "${INFERENCE_CERT}" == "${ALB_CERTIFICATE_ARN}" && \
+                  "${DASHBOARD_CERT}" == "${ALB_CERTIFICATE_ARN}" ]]; then
+              echo "ArgoCD applications synced and ingress annotations applied."
+              break
+            fi
+
+            echo "Waiting for ArgoCD sync (${i}/40): inference=${INFERENCE_SYNC}, dashboard=${DASHBOARD_SYNC}"
+            sleep 15
+          done
 
           ALB_DNS=""
           for ((i=1; i<=40; i++)); do
@@ -554,7 +576,10 @@ jobs:
 
           if [[ -z "${ALB_DNS}" || "${ALB_DNS}" == "None" ]]; then
             echo "Internal ALB hostname not found from ingress status."
+            kubectl get application -n argocd inference-api dashboard-frontend -o wide || true
             kubectl get ingress -A || true
+            kubectl describe ingress -n inference inference-api || true
+            kubectl describe ingress -n app dashboard-frontend || true
             exit 1
           fi
 
