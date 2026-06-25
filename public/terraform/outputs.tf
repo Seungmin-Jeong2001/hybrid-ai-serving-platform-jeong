@@ -234,12 +234,12 @@ output "dlq_alert_lambda_name" {
 
 output "incident_copilot_agent_id" {
   description = "Bedrock Agent ID for the Inference Incident Copilot"
-  value       = local.enable_dlq_alert_webhook ? try(aws_cloudformation_stack.incident_copilot_agent[0].outputs["AgentId"], null) : null
+  value       = local.enable_dlq_alert_webhook ? try(aws_bedrockagent_agent.incident_copilot[0].id, null) : null
   sensitive   = true
 }
 
 output "incident_copilot_agent_alias_id" {
   description = "Bedrock Agent alias ID for the Inference Incident Copilot"
-  value       = local.enable_dlq_alert_webhook ? try(aws_cloudformation_stack.incident_copilot_agent[0].outputs["AgentAliasId"], null) : null
+  value       = local.enable_dlq_alert_webhook ? try(aws_bedrockagent_agent_alias.incident_copilot[0].agent_alias_id, null) : null
   sensitive   = true
 }
