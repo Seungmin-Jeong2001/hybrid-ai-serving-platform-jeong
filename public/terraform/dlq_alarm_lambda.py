@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import ssl
+import uuid
 from datetime import datetime, timedelta, timezone
 from urllib import parse, request
 
@@ -182,6 +183,77 @@ def _collect_recent_pod_logs(label_selector: str, tail_lines: int = 20, max_pods
     return logs
 
 
+def _list_pods(label_selector: str, max_pods: int = 3) -> list[dict]:
+    namespace = _env("EKS_NAMESPACE", "inference")
+    selector = parse.quote(label_selector, safe="=,")
+    payload = _query_k8s_json(f"/api/v1/namespaces/{namespace}/pods?labelSelector={selector}")
+    return payload.get("items", [])[:max_pods]
+
+
+def _collect_pod_events(label_selector: str, max_pods: int = 2, max_events_per_pod: int = 5) -> list[dict]:
+    namespace = _env("EKS_NAMESPACE", "inference")
+    pods = _list_pods(label_selector, max_pods=max_pods)
+    collected = []
+
+    for pod in pods:
+        pod_name = pod.get("metadata", {}).get("name", "unknown")
+        field_selector = parse.quote(f"involvedObject.name={pod_name}", safe="=,")
+        payload = _query_k8s_json(
+            f"/api/v1/namespaces/{namespace}/events?fieldSelector={field_selector}"
+        )
+        items = payload.get("items", [])[-max_events_per_pod:]
+        collected.append(
+            {
+                "pod": pod_name,
+                "events": [
+                    {
+                        "type": item.get("type", "Unknown"),
+                        "reason": item.get("reason", "Unknown"),
+                        "message": item.get("message", ""),
+                    }
+                    for item in items
+                ],
+            }
+        )
+    return collected
+
+
+def _collect_namespace_warning_events(limit: int = 10) -> list[dict]:
+    namespace = _env("EKS_NAMESPACE", "inference")
+    payload = _query_k8s_json(f"/api/v1/namespaces/{namespace}/events")
+    items = payload.get("items", [])
+    warning_events = [
+        {
+            "involved_object": item.get("involvedObject", {}).get("name", "unknown"),
+            "reason": item.get("reason", "Unknown"),
+            "message": item.get("message", ""),
+            "type": item.get("type", "Unknown"),
+        }
+        for item in items
+        if item.get("type") == "Warning"
+    ]
+    return warning_events[-limit:]
+
+
+def _collect_deployment_status(label_selector: str) -> list[dict]:
+    namespace = _env("EKS_NAMESPACE", "inference")
+    selector = parse.quote(label_selector, safe="=,")
+    payload = _query_k8s_json(
+        f"/apis/apps/v1/namespaces/{namespace}/deployments?labelSelector={selector}"
+    )
+    items = payload.get("items", [])
+    return [
+        {
+            "name": item.get("metadata", {}).get("name", "unknown"),
+            "desired": item.get("spec", {}).get("replicas", 0),
+            "ready": item.get("status", {}).get("readyReplicas", 0),
+            "updated": item.get("status", {}).get("updatedReplicas", 0),
+            "available": item.get("status", {}).get("availableReplicas", 0),
+        }
+        for item in items
+    ]
+
+
 def _extract_signal_patterns(text: str) -> list[str]:
     patterns = [
         (r"KeyError:\s*'([^']+)'", "predictor 입력 데이터에 {group1} 필드 누락 징후"),
@@ -311,6 +383,176 @@ def _build_observed_signals(
     return deduped[:20]
 
 
+def _available_triage_tools() -> dict[str, str]:
+    return {
+        "collect_worker_logs": "최근 inference-worker 로그를 조회한다",
+        "collect_predictor_logs": "최근 pdm-predictor 로그를 조회한다",
+        "collect_worker_events": "inference-worker 관련 Kubernetes 이벤트를 조회한다",
+        "collect_predictor_events": "pdm-predictor 관련 Kubernetes 이벤트를 조회한다",
+        "collect_namespace_warning_events": "inference 네임스페이스의 Warning 이벤트를 조회한다",
+        "collect_worker_deployment_status": "inference-worker Deployment 상태를 조회한다",
+        "collect_predictor_deployment_status": "pdm-predictor Deployment 상태를 조회한다",
+    }
+
+
+def _heuristic_triage_plan(payload: dict, observed_signals: list[str]) -> dict:
+    failure_stage = str(payload.get("failure_stage", "unknown"))
+    last_error = str(payload.get("last_error", ""))
+    plan = []
+
+    if failure_stage == "predictor-http":
+        plan.extend([
+            "collect_predictor_logs",
+            "collect_worker_logs",
+            "collect_predictor_events",
+            "collect_worker_events",
+        ])
+        if "reset" in last_error.lower() or "timeout" in last_error.lower():
+            plan.append("collect_namespace_warning_events")
+            plan.append("collect_predictor_deployment_status")
+    elif failure_stage == "payload-validation":
+        plan.extend([
+            "collect_worker_logs",
+            "collect_worker_events",
+        ])
+    elif failure_stage == "result-storage":
+        plan.extend([
+            "collect_worker_logs",
+            "collect_namespace_warning_events",
+        ])
+    else:
+        plan.extend([
+            "collect_worker_logs",
+            "collect_predictor_logs",
+            "collect_namespace_warning_events",
+        ])
+
+    if any("retry" in signal and "lag" in signal for signal in observed_signals):
+        plan.append("collect_worker_deployment_status")
+
+    deduped = []
+    seen = set()
+    for tool in plan:
+        if tool in seen:
+            continue
+        seen.add(tool)
+        deduped.append(tool)
+
+    return {
+        "source": "heuristic",
+        "tools": deduped[:5],
+    }
+
+
+def _invoke_bedrock_triage_plan(payload: dict, observed_signals: list[str]) -> dict:
+    model_id = _env("BEDROCK_MODEL_ID")
+    if not model_id:
+        return _heuristic_triage_plan(payload, observed_signals)
+
+    prompt = {
+        "task": "Choose up to 5 additional investigation tools for this incident.",
+        "rules": [
+            "Return JSON only.",
+            "Select only from the provided tool names.",
+            "Prefer tools that best match the failure_stage and observed_signals.",
+            "Do not choose every tool. Choose only the most relevant ones.",
+        ],
+        "available_tools": _available_triage_tools(),
+        "incident": {
+            "failure_stage": payload.get("failure_stage"),
+            "last_error": payload.get("last_error"),
+            "retry_count": payload.get("retry_count"),
+            "observed_signals": observed_signals,
+        },
+        "response_schema": {
+            "tools": ["tool_name_1", "tool_name_2"],
+            "reason": "short explanation",
+        },
+    }
+
+    bedrock = boto3.client("bedrock-runtime", region_name=_env("AWS_REGION", "ap-northeast-2"))
+    response = bedrock.invoke_model(
+        modelId=model_id,
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps(
+            {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 300,
+                "temperature": 0.1,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": json.dumps(prompt, ensure_ascii=False)}],
+                    }
+                ],
+            }
+        ),
+    )
+    body = json.loads(response["body"].read())
+    text = "".join(block.get("text", "") for block in body.get("content", []) if block.get("type") == "text").strip()
+    parsed = json.loads(text)
+    tools = [tool for tool in parsed.get("tools", []) if tool in _available_triage_tools()]
+    if not tools:
+        return _heuristic_triage_plan(payload, observed_signals)
+    return {
+        "source": "bedrock",
+        "tools": tools[:5],
+        "reason": parsed.get("reason", ""),
+    }
+
+
+def _safe_triage_plan(payload: dict, observed_signals: list[str]) -> dict:
+    try:
+        plan = _invoke_bedrock_triage_plan(payload, observed_signals)
+        logger.info(
+            "triage_plan_selected request_id=%s source=%s tools=%s",
+            payload.get("request_id", "unknown"),
+            plan.get("source", "unknown"),
+            ",".join(plan.get("tools", [])),
+        )
+        return plan
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "triage_plan_fallback request_id=%s error=%s",
+            payload.get("request_id", "unknown"),
+            exc,
+        )
+        return _heuristic_triage_plan(payload, observed_signals)
+
+
+def _run_triage_tool(tool_name: str) -> dict:
+    worker_selector = _env("WORKER_SELECTOR", "app=inference-worker")
+    predictor_selector = _env("PREDICTOR_SELECTOR", "serving.kserve.io/inferenceservice=pdm")
+
+    if tool_name == "collect_worker_logs":
+        return {"tool": tool_name, "data": _collect_recent_pod_logs(worker_selector, tail_lines=40, max_pods=1)}
+    if tool_name == "collect_predictor_logs":
+        return {"tool": tool_name, "data": _collect_recent_pod_logs(predictor_selector, tail_lines=40, max_pods=1)}
+    if tool_name == "collect_worker_events":
+        return {"tool": tool_name, "data": _collect_pod_events(worker_selector)}
+    if tool_name == "collect_predictor_events":
+        return {"tool": tool_name, "data": _collect_pod_events(predictor_selector)}
+    if tool_name == "collect_namespace_warning_events":
+        return {"tool": tool_name, "data": _collect_namespace_warning_events()}
+    if tool_name == "collect_worker_deployment_status":
+        return {"tool": tool_name, "data": _collect_deployment_status(worker_selector)}
+    if tool_name == "collect_predictor_deployment_status":
+        return {"tool": tool_name, "data": _collect_deployment_status(predictor_selector)}
+    raise ValueError(f"unsupported triage tool: {tool_name}")
+
+
+def _collect_triage_tool_results(plan: dict) -> list[dict]:
+    results = []
+    for tool_name in plan.get("tools", []):
+        try:
+            results.append(_run_triage_tool(tool_name))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("triage_tool_failed tool=%s error=%s", tool_name, exc)
+            results.append({"tool": tool_name, "error": str(exc)})
+    return results
+
+
 def _query_msk_lag(topic_name: str) -> int | None:
     region = _env("AWS_REGION", "ap-northeast-2")
     cluster_name = _env("MSK_CLUSTER_NAME")
@@ -397,6 +639,8 @@ def _build_prompt(payload: dict, kafka_context: dict, worker_status: dict, predi
     worker_logs = payload.get("_worker_logs", [])
     predictor_logs = payload.get("_predictor_logs", [])
     observed_signals = payload.get("_observed_signals", [])
+    triage_plan = payload.get("_triage_plan", {})
+    triage_tool_results = payload.get("_triage_tool_results", [])
     return f"""
 You are an SRE copilot for an asynchronous inference platform.
 Analyze the incident context and respond in JSON with the following keys:
@@ -434,6 +678,8 @@ Incident context:
         "worker": worker_status,
         "predictor": predictor_status,
         "observed_signals": observed_signals,
+        "triage_plan": triage_plan,
+        "triage_tool_results": triage_tool_results,
         "recent_worker_logs": worker_logs,
         "recent_predictor_logs": predictor_logs,
     },
@@ -442,7 +688,108 @@ Incident context:
 """.strip()
 
 
+def _build_agent_input_text(payload: dict, kafka_context: dict, worker_status: dict, predictor_status: dict) -> str:
+    observed_signals = payload.get("_observed_signals", [])
+    return f"""
+당신은 비동기 추론 플랫폼의 장애 분석 에이전트입니다.
+아래 사건 정보를 바탕으로, 필요한 경우에만 action group 함수를 선택적으로 호출해 추가 증거를 수집하세요.
+모든 함수를 호출하지 말고, 현재 failure_stage와 observed_signals를 기준으로 가장 관련 있는 함수만 최소한으로 호출하세요.
+
+최종 응답은 반드시 JSON 하나만 반환하세요.
+응답 스키마:
+{{
+  "likely_causes": ["완전한 한국어 문장", "..."],
+  "recommended_actions": ["완전한 한국어 문장", "..."],
+  "confidence": "high|medium|low"
+}}
+
+규칙:
+- likely_causes와 recommended_actions는 각각 최대 3개까지만 작성하세요.
+- 원인 후보는 반드시 관찰된 증거를 포함한 완전한 한국어 문장으로 쓰세요.
+- 즉시 조치는 반드시 확인해야 할 정확한 대상 컴포넌트를 포함하세요. 예: predictor 로그, inference-worker 로그, retry 토픽 lag, Kubernetes Warning 이벤트
+- 근거가 부족하면 무엇이 부족한지 분명히 쓰고 추측하지 마세요.
+- 네트워크 문제라고 단정하려면 로그나 이벤트에 연결 실패 근거가 있어야 합니다.
+
+사건 정보:
+{json.dumps(
+    {
+        "request_id": payload.get("request_id"),
+        "factory_id": payload.get("factory_id"),
+        "equipment_id": payload.get("equipment_id"),
+        "timestamp": payload.get("timestamp"),
+        "failure_stage": payload.get("failure_stage"),
+        "retry_count": payload.get("retry_count"),
+        "source_topic": payload.get("source_topic"),
+        "last_error": payload.get("last_error"),
+        "kafka": kafka_context,
+        "worker": worker_status,
+        "predictor": predictor_status,
+        "observed_signals": observed_signals,
+    },
+    ensure_ascii=False,
+)}
+""".strip()
+
+
+def _extract_json_object(text: str) -> dict:
+    text = text.strip()
+    if not text:
+        raise ValueError("empty model response")
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("no JSON object found in model response")
+    return json.loads(text[start : end + 1])
+
+
+def _invoke_bedrock_agent_summary(payload: dict, kafka_context: dict, worker_status: dict, predictor_status: dict) -> dict:
+    agent_id = _env("BEDROCK_AGENT_ID")
+    agent_alias_id = _env("BEDROCK_AGENT_ALIAS_ID")
+    if not agent_id or not agent_alias_id:
+        raise ValueError("bedrock agent is not configured")
+
+    client = boto3.client("bedrock-agent-runtime", region_name=_env("AWS_REGION", "ap-northeast-2"))
+    session_id = payload.get("request_id") or str(uuid.uuid4())
+    input_text = _build_agent_input_text(payload, kafka_context, worker_status, predictor_status)
+
+    response = client.invoke_agent(
+        agentId=agent_id,
+        agentAliasId=agent_alias_id,
+        sessionId=session_id,
+        inputText=input_text,
+        enableTrace=True,
+    )
+
+    parts = []
+    for event in response.get("completion", []):
+        chunk = event.get("chunk")
+        if chunk and chunk.get("bytes"):
+            parts.append(chunk["bytes"].decode("utf-8"))
+
+    parsed = _extract_json_object("".join(parts))
+    parsed["source"] = "bedrock-agent"
+    logger.info(
+        "incident_summary_source=bedrock-agent request_id=%s agent_id=%s alias_id=%s confidence=%s",
+        payload.get("request_id", "unknown"),
+        agent_id,
+        agent_alias_id,
+        parsed.get("confidence", "unknown"),
+    )
+    return parsed
+
+
 def _invoke_bedrock_summary(payload: dict, kafka_context: dict, worker_status: dict, predictor_status: dict) -> dict:
+    agent_id = _env("BEDROCK_AGENT_ID")
+    agent_alias_id = _env("BEDROCK_AGENT_ALIAS_ID")
+    if agent_id and agent_alias_id:
+        return _invoke_bedrock_agent_summary(payload, kafka_context, worker_status, predictor_status)
+
     model_id = _env("BEDROCK_MODEL_ID")
     if not model_id:
         likely_causes, recommended_actions = _heuristic_summary(payload, kafka_context, worker_status, predictor_status)
@@ -479,7 +826,7 @@ def _invoke_bedrock_summary(payload: dict, kafka_context: dict, worker_status: d
     )
     body = json.loads(response["body"].read())
     text = "".join(block.get("text", "") for block in body.get("content", []) if block.get("type") == "text").strip()
-    parsed = json.loads(text)
+    parsed = _extract_json_object(text)
     parsed["source"] = "bedrock"
     logger.info(
         "incident_summary_source=bedrock request_id=%s model_id=%s confidence=%s",
@@ -589,6 +936,8 @@ def handler(event, _context):
                 payload["_worker_logs"],
                 payload["_predictor_logs"],
             )
+            payload["_triage_plan"] = _safe_triage_plan(payload, payload["_observed_signals"])
+            payload["_triage_tool_results"] = _collect_triage_tool_results(payload["_triage_plan"])
             try:
                 summary = _invoke_bedrock_summary(payload, kafka_context, worker_status, predictor_status)
             except Exception as exc:  # noqa: BLE001
