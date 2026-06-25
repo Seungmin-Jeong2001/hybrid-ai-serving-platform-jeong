@@ -41,6 +41,14 @@ data "archive_file" "dlq_alarm_lambda" {
   output_path = "${path.module}/dlq_alarm_lambda.zip"
 }
 
+data "archive_file" "incident_copilot_action_group_lambda" {
+  count = local.enable_dlq_alert_webhook ? 1 : 0
+
+  type        = "zip"
+  source_file = "${path.module}/incident_copilot_action_group_lambda.py"
+  output_path = "${path.module}/incident_copilot_action_group_lambda.zip"
+}
+
 data "aws_iam_policy_document" "dlq_alarm_lambda_assume" {
   count = local.enable_dlq_alert_webhook ? 1 : 0
 
@@ -112,6 +120,7 @@ data "aws_iam_policy_document" "dlq_alarm_lambda_runtime" {
     actions = [
       "bedrock:InvokeModel",
       "bedrock:InvokeModelWithResponseStream",
+      "bedrock:InvokeAgent",
     ]
     resources = ["*"]
   }
@@ -156,7 +165,7 @@ resource "aws_lambda_function" "dlq_alarm" {
   handler          = "dlq_alarm_lambda.handler"
   filename         = data.archive_file.dlq_alarm_lambda[0].output_path
   source_code_hash = data.archive_file.dlq_alarm_lambda[0].output_base64sha256
-  timeout          = 30
+  timeout          = 60
 
   vpc_config {
     subnet_ids         = aws_subnet.eks_private[*].id
@@ -178,6 +187,11 @@ resource "aws_lambda_function" "dlq_alarm" {
       REQUEST_TOPIC_NAME    = "inference-request"
       RETRY_TOPIC_NAME      = "inference-retry"
       WORKER_CONSUMER_GROUP = "inference-worker-group"
+      BEDROCK_AGENT_ID      = try(aws_cloudformation_stack.incident_copilot_agent[0].outputs["AgentId"], "")
+      BEDROCK_AGENT_ALIAS_ID = try(
+        aws_cloudformation_stack.incident_copilot_agent[0].outputs["AgentAliasId"],
+        ""
+      )
     }
   }
 
@@ -186,6 +200,233 @@ resource "aws_lambda_function" "dlq_alarm" {
   })
 
   depends_on = [aws_eks_access_policy_association.dlq_alarm_lambda_view]
+}
+
+resource "aws_lambda_function" "incident_copilot_action_group" {
+  count = local.enable_dlq_alert_webhook ? 1 : 0
+
+  function_name    = "${var.project_name}-incident-copilot-action-group"
+  role             = aws_iam_role.dlq_alarm_lambda[0].arn
+  runtime          = "python3.11"
+  handler          = "incident_copilot_action_group_lambda.handler"
+  filename         = data.archive_file.incident_copilot_action_group_lambda[0].output_path
+  source_code_hash = data.archive_file.incident_copilot_action_group_lambda[0].output_base64sha256
+  timeout          = 30
+
+  vpc_config {
+    subnet_ids         = aws_subnet.eks_private[*].id
+    security_group_ids = [aws_security_group.dlq_alert_lambda[0].id]
+  }
+
+  environment {
+    variables = {
+      EKS_CLUSTER_NAME   = aws_eks_cluster.main.name
+      EKS_NAMESPACE      = "inference"
+      WORKER_SELECTOR    = "app=inference-worker"
+      PREDICTOR_SELECTOR = "serving.kserve.io/inferenceservice=pdm"
+    }
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-incident-copilot-action-group"
+  })
+
+  depends_on = [aws_eks_access_policy_association.dlq_alarm_lambda_view]
+}
+
+data "aws_iam_policy_document" "incident_copilot_agent_assume" {
+  count = local.enable_dlq_alert_webhook ? 1 : 0
+
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["bedrock.amazonaws.com"]
+    }
+
+    actions = ["sts:AssumeRole"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+
+    condition {
+      test     = "ArnLike"
+      variable = "AWS:SourceArn"
+      values   = ["arn:aws:bedrock:${var.aws_region}:${data.aws_caller_identity.current.account_id}:agent/*"]
+    }
+  }
+}
+
+resource "aws_iam_role" "incident_copilot_agent" {
+  count = local.enable_dlq_alert_webhook ? 1 : 0
+
+  name               = "${var.project_name}-incident-copilot-agent"
+  assume_role_policy = data.aws_iam_policy_document.incident_copilot_agent_assume[0].json
+
+  tags = local.common_tags
+}
+
+data "aws_iam_policy_document" "incident_copilot_agent_runtime" {
+  count = local.enable_dlq_alert_webhook ? 1 : 0
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream",
+      "bedrock:GetFoundationModel",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "incident_copilot_agent_runtime" {
+  count = local.enable_dlq_alert_webhook ? 1 : 0
+
+  name   = "${var.project_name}-incident-copilot-agent-runtime"
+  role   = aws_iam_role.incident_copilot_agent[0].id
+  policy = data.aws_iam_policy_document.incident_copilot_agent_runtime[0].json
+}
+
+resource "aws_lambda_permission" "incident_copilot_action_group_bedrock" {
+  count = local.enable_dlq_alert_webhook ? 1 : 0
+
+  statement_id   = "AllowBedrockInvokeActionGroup"
+  action         = "lambda:InvokeFunction"
+  function_name  = aws_lambda_function.incident_copilot_action_group[0].function_name
+  principal      = "bedrock.amazonaws.com"
+  source_account = data.aws_caller_identity.current.account_id
+  source_arn     = "arn:aws:bedrock:${var.aws_region}:${data.aws_caller_identity.current.account_id}:agent/*"
+}
+
+resource "aws_cloudformation_stack" "incident_copilot_agent" {
+  count = local.enable_dlq_alert_webhook ? 1 : 0
+
+  name = "${var.project_name}-incident-copilot-agent"
+
+  template_body = jsonencode({
+    AWSTemplateFormatVersion = "2010-09-09"
+    Description              = "Inference Incident Copilot Bedrock Agent"
+    Resources = {
+      IncidentCopilotAgent = {
+        Type = "AWS::Bedrock::Agent"
+        Properties = {
+          AgentName               = "${var.project_name}-${var.environment != "" ? var.environment : "public"}-incident-copilot"
+          AgentResourceRoleArn    = aws_iam_role.incident_copilot_agent[0].arn
+          AutoPrepare             = true
+          FoundationModel         = var.incident_copilot_bedrock_model_id
+          IdleSessionTTLInSeconds = 900
+          Instruction = join(" ", [
+            "You are Inference Incident Copilot for an asynchronous inference platform.",
+            "Your job is to investigate DLQ incidents by selectively invoking only the most relevant action-group functions.",
+            "Do not call every function. Choose only the minimum functions required to confirm the root-cause hypothesis.",
+            "Prioritize concrete evidence from Kubernetes logs, events, and deployment status.",
+            "Respond only in JSON with keys likely_causes, recommended_actions, confidence.",
+            "likely_causes and recommended_actions must be arrays of up to 3 complete Korean sentences.",
+            "recommended_actions must name the exact component to inspect, such as predictor logs, inference-worker logs, retry topic lag, or Kubernetes warning events.",
+            "If evidence is insufficient, explicitly say which evidence is missing instead of guessing.",
+          ])
+          ActionGroups = [
+            {
+              ActionGroupName  = "incident-triage"
+              ActionGroupState = "ENABLED"
+              Description      = "Collect targeted Kubernetes evidence for inference incidents"
+              ActionGroupExecutor = {
+                Lambda = aws_lambda_function.incident_copilot_action_group[0].arn
+              }
+              FunctionSchema = {
+                Functions = [
+                  {
+                    Name                = "collect_worker_logs"
+                    Description         = "Collect recent logs from the inference-worker pod"
+                    RequireConfirmation = "DISABLED"
+                  },
+                  {
+                    Name                = "collect_predictor_logs"
+                    Description         = "Collect recent logs from the pdm-predictor pod"
+                    RequireConfirmation = "DISABLED"
+                  },
+                  {
+                    Name                = "collect_worker_events"
+                    Description         = "Collect recent Kubernetes events related to inference-worker"
+                    RequireConfirmation = "DISABLED"
+                  },
+                  {
+                    Name                = "collect_predictor_events"
+                    Description         = "Collect recent Kubernetes events related to pdm-predictor"
+                    RequireConfirmation = "DISABLED"
+                  },
+                  {
+                    Name                = "collect_namespace_warning_events"
+                    Description         = "Collect recent warning events from the inference namespace"
+                    RequireConfirmation = "DISABLED"
+                  },
+                  {
+                    Name                = "collect_worker_deployment_status"
+                    Description         = "Collect inference-worker deployment rollout status"
+                    RequireConfirmation = "DISABLED"
+                  },
+                  {
+                    Name                = "collect_predictor_deployment_status"
+                    Description         = "Collect pdm-predictor deployment rollout status"
+                    RequireConfirmation = "DISABLED"
+                  },
+                  {
+                    Name                = "collect_worker_status"
+                    Description         = "Collect aggregate readiness and restart status for inference-worker pods"
+                    RequireConfirmation = "DISABLED"
+                  },
+                  {
+                    Name                = "collect_predictor_status"
+                    Description         = "Collect aggregate readiness and restart status for pdm-predictor pods"
+                    RequireConfirmation = "DISABLED"
+                  },
+                ]
+              }
+            }
+          ]
+        }
+      }
+      IncidentCopilotAlias = {
+        Type = "AWS::Bedrock::AgentAlias"
+        Properties = {
+          AgentId        = { Ref = "IncidentCopilotAgent" }
+          AgentAliasName = "prod"
+          Description    = "Production alias for the inference incident copilot"
+          RoutingConfiguration = [
+            {
+              AgentVersion = "DRAFT"
+            }
+          ]
+        }
+      }
+    }
+    Outputs = {
+      AgentId = {
+        Value = { Ref = "IncidentCopilotAgent" }
+      }
+      AgentArn = {
+        Value = { "Fn::GetAtt" = ["IncidentCopilotAgent", "AgentArn"] }
+      }
+      AgentAliasId = {
+        Value = { "Fn::GetAtt" = ["IncidentCopilotAlias", "AgentAliasId"] }
+      }
+      AgentAliasArn = {
+        Value = { "Fn::GetAtt" = ["IncidentCopilotAlias", "AgentAliasArn"] }
+      }
+    }
+  })
+
+  tags = local.common_tags
+
+  depends_on = [
+    aws_iam_role_policy.incident_copilot_agent_runtime,
+    aws_lambda_permission.incident_copilot_action_group_bedrock,
+  ]
 }
 
 resource "aws_lambda_event_source_mapping" "dlq_alarm_msk" {
