@@ -236,9 +236,15 @@ variable "argocd_chart_version" {
 }
 
 variable "alb_certificate_arn" {
-  description = "ACM certificate ARN used by the internal ALB ingress resources"
+  description = "Optional override for the ACM certificate ARN used by the internal ALB ingress resources; when empty Terraform auto-discovers a matching ACM certificate"
   type        = string
   default     = ""
+}
+
+variable "alb_certificate_domain" {
+  description = "Primary ACM certificate domain name to discover automatically for the internal ALB ingress resources"
+  type        = string
+  default     = "*.sgs-hasp.click"
 }
 
 variable "additional_eks_admin_role_arns" {
@@ -253,6 +259,12 @@ variable "enable_site_to_site_vpn" {
   description = "Whether to create the Site-to-Site VPN resources"
   type        = bool
   default     = true
+}
+
+variable "enable_s3_interface_endpoint" {
+  description = "S3 인터페이스 엔드포인트 생성 여부 (온프레미스 VPN→S3 직접 접근=ECR-over-VPN에 필요, 비용 발생)"
+  type        = bool
+  default     = false
 }
 
 variable "customer_gateways" {

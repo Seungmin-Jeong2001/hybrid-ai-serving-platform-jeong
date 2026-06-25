@@ -5,6 +5,14 @@ resource "aws_security_group" "msk" {
   vpc_id      = aws_vpc.main.id
 
   ingress {
+    description = "Allow broker-to-broker and Lambda event source mapping traffic within the MSK security group"
+    from_port   = 9092
+    to_port     = 9098
+    protocol    = "tcp"
+    self        = true
+  }
+
+  ingress {
     description = "Allow Kafka TLS traffic from EKS private subnets"
     from_port   = 9094
     to_port     = 9094

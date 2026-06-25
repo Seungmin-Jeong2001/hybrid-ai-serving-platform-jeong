@@ -1,12 +1,17 @@
 import base64
 import json
+import logging
 import os
+import re
 import ssl
 from datetime import datetime, timedelta, timezone
 from urllib import parse, request
 
 import boto3
 from botocore.signers import RequestSigner
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 
 def _env(name: str, default: str = "") -> str:
@@ -17,9 +22,9 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _post_to_slack(text: str) -> None:
+def _post_to_slack(message: dict) -> None:
     webhook_url = os.environ["SLACK_WEBHOOK_URL"]
-    payload = json.dumps({"text": text}).encode("utf-8")
+    payload = json.dumps(message).encode("utf-8")
     req = request.Request(
         webhook_url,
         data=payload,
@@ -93,6 +98,23 @@ def _query_k8s_json(path: str) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _query_k8s_text(path: str) -> str:
+    region = _env("AWS_REGION", "ap-northeast-2")
+    cluster_name = os.environ["EKS_CLUSTER_NAME"]
+    endpoint, ssl_context = _load_cluster_connection()
+    token = _build_eks_bearer_token(cluster_name, region)
+    req = request.Request(
+        f"{endpoint}{path}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "text/plain",
+        },
+        method="GET",
+    )
+    with request.urlopen(req, timeout=5, context=ssl_context) as response:
+        return response.read().decode("utf-8")
+
+
 def _summarize_pods(label_selector: str) -> dict:
     namespace = _env("EKS_NAMESPACE", "inference")
     selector = parse.quote(label_selector, safe="=,")
@@ -138,6 +160,155 @@ def _summarize_pods(label_selector: str) -> dict:
         "phases": phases,
         "pods": pods,
     }
+
+
+def _collect_recent_pod_logs(label_selector: str, tail_lines: int = 20, max_pods: int = 1) -> list[dict]:
+    namespace = _env("EKS_NAMESPACE", "inference")
+    selector = parse.quote(label_selector, safe="=,")
+    payload = _query_k8s_json(f"/api/v1/namespaces/{namespace}/pods?labelSelector={selector}")
+    items = payload.get("items", [])[:max_pods]
+
+    logs = []
+    for item in items:
+        pod_name = item.get("metadata", {}).get("name", "unknown")
+        log_path = (
+            f"/api/v1/namespaces/{namespace}/pods/{pod_name}/log"
+            f"?tailLines={tail_lines}&timestamps=true"
+        )
+        logs.append({
+            "pod": pod_name,
+            "log": _query_k8s_text(log_path),
+        })
+    return logs
+
+
+def _extract_signal_patterns(text: str) -> list[str]:
+    patterns = [
+        (r"KeyError:\s*'([^']+)'", "predictor 입력 데이터에 {group1} 필드 누락 징후"),
+        (r"ValueError:\s*(.+)", "애플리케이션 ValueError 발생"),
+        (r"TypeError:\s*(.+)", "애플리케이션 TypeError 발생"),
+        (r"Traceback \(most recent call last\):", "파이썬 traceback 발생"),
+        (r"500 Internal Server Error|HTTP/1\.[01] 500", "predictor HTTP 500 발생"),
+        (r"502 Bad Gateway|HTTP/1\.[01] 502", "업스트림 502 응답 발생"),
+        (r"Connection reset by peer", "연결 중 peer reset 발생"),
+        (r"timed out|Timeout", "타임아웃 발생"),
+        (r"KSERVE_INTERNAL_ERROR", "worker가 KSERVE_INTERNAL_ERROR로 분류"),
+        (r"HTTPStatusError", "worker가 HTTP 상태 오류 감지"),
+        (r"predictor response missing predictions", "predictor 응답에 predictions 누락"),
+        (r"predictor response missing class_name", "predictor 응답에 class_name 누락"),
+        (r"payload must be an object", "요청 payload 객체 형식 오류"),
+        (r"missing required field: ([A-Za-z0-9_]+)", "요청 필수 필드 {group1} 누락"),
+        (r"invalid field type for ([A-Za-z0-9_]+)", "요청 필드 {group1} 타입 오류"),
+        (r"JSONDecodeError", "JSON 파싱 오류"),
+        (r"Connection refused", "대상 서비스 연결 거부"),
+    ]
+
+    signals = []
+    for pattern, template in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        signal = template
+        if match.lastindex:
+            for index in range(1, match.lastindex + 1):
+                signal = signal.replace(f"{{group{index}}}", match.group(index))
+        signals.append(signal)
+    return signals
+
+
+def _derive_diagnostic_signals(
+    payload: dict,
+    kafka_context: dict,
+    worker_status: dict,
+    predictor_status: dict,
+    worker_logs: list[dict],
+    predictor_logs: list[dict],
+) -> list[str]:
+    joined_worker_logs = "\n".join(entry.get("log", "") for entry in worker_logs)
+    joined_predictor_logs = "\n".join(entry.get("log", "") for entry in predictor_logs)
+    last_error = str(payload.get("last_error", ""))
+    failure_stage = str(payload.get("failure_stage", "unknown"))
+    retry_lag = kafka_context.get("lag_by_topic", {}).get("inference-retry")
+
+    diagnostics = []
+
+    predictor_ready = predictor_status.get("ready", 0)
+    predictor_total = predictor_status.get("total", 0)
+    worker_ready = worker_status.get("ready", 0)
+    worker_total = worker_status.get("total", 0)
+
+    if "KeyError" in joined_predictor_logs and "sensor" in joined_predictor_logs:
+        diagnostics.append("진단: predictor 입력 스키마 또는 feature 필드 누락 가능성이 높음")
+
+    if "payload must be an object" in joined_worker_logs or "missing required field" in joined_worker_logs or "invalid field type" in joined_worker_logs:
+        diagnostics.append("진단: inference 요청 payload 형식 오류 가능성이 높음")
+
+    if ("predictor response missing predictions" in joined_worker_logs or "predictor response missing class_name" in joined_worker_logs):
+        diagnostics.append("진단: predictor 응답 스키마 불일치 가능성이 높음")
+
+    if "500 Internal Server Error" in joined_predictor_logs and predictor_total > 0 and predictor_ready == predictor_total:
+        diagnostics.append("진단: predictor 파드는 Ready 상태지만 애플리케이션 내부에서 HTTP 500이 발생함")
+
+    if "Connection reset by peer" in last_error and predictor_total > 0 and predictor_ready == predictor_total and worker_total > 0 and worker_ready == worker_total:
+        diagnostics.append("진단: worker와 predictor 파드는 모두 Ready이며, predictor 처리 중 연결이 비정상 종료되었을 가능성이 높음")
+
+    if failure_stage == "predictor-http" and "KSERVE_INTERNAL_ERROR" in joined_worker_logs:
+        diagnostics.append("진단: predictor HTTP 호출 단계에서 반복적인 내부 오류가 발생함")
+
+    if isinstance(retry_lag, int) and retry_lag >= 10:
+        diagnostics.append(f"진단: retry 토픽 backlog가 {retry_lag}건 이상으로 누적됨")
+
+    return diagnostics[:6]
+
+
+def _build_observed_signals(
+    payload: dict,
+    kafka_context: dict,
+    worker_status: dict,
+    predictor_status: dict,
+    worker_logs: list[dict],
+    predictor_logs: list[dict],
+) -> list[str]:
+    signals = [
+        f"failure_stage={payload.get('failure_stage', 'unknown')}",
+        f"last_error={payload.get('last_error', 'unknown')}",
+        f"retry_count={payload.get('retry_count', 0)}",
+        f"inference_worker_ready={worker_status.get('ready', 0)}/{worker_status.get('total', 0)}",
+        f"pdm_predictor_ready={predictor_status.get('ready', 0)}/{predictor_status.get('total', 0)}",
+    ]
+
+    for topic, lag in kafka_context.get("lag_by_topic", {}).items():
+        if lag is not None:
+            signals.append(f"kafka_lag_{topic}={lag}")
+
+    for source_name, log_entries in (("worker", worker_logs), ("predictor", predictor_logs)):
+        for entry in log_entries:
+            log_text = entry.get("log", "")
+            pod_name = entry.get("pod", "unknown")
+            extracted = _extract_signal_patterns(log_text)
+            for signal in extracted:
+                signals.append(f"{source_name}_pod={pod_name}: {signal}")
+
+    signals.extend(
+        _derive_diagnostic_signals(
+            payload,
+            kafka_context,
+            worker_status,
+            predictor_status,
+            worker_logs,
+            predictor_logs,
+        )
+    )
+
+    # Deduplicate while keeping order stable for prompt readability.
+    seen = set()
+    deduped = []
+    for signal in signals:
+        if signal in seen:
+            continue
+        seen.add(signal)
+        deduped.append(signal)
+    return deduped[:20]
 
 
 def _query_msk_lag(topic_name: str) -> int | None:
@@ -223,12 +394,30 @@ def _heuristic_summary(payload: dict, kafka_context: dict, worker_status: dict, 
 
 
 def _build_prompt(payload: dict, kafka_context: dict, worker_status: dict, predictor_status: dict) -> str:
+    worker_logs = payload.get("_worker_logs", [])
+    predictor_logs = payload.get("_predictor_logs", [])
+    observed_signals = payload.get("_observed_signals", [])
     return f"""
 You are an SRE copilot for an asynchronous inference platform.
 Analyze the incident context and respond in JSON with the following keys:
-- likely_causes: array of up to 3 short strings
-- recommended_actions: array of up to 3 short strings
+- likely_causes: array of up to 3 short Korean strings
+- recommended_actions: array of up to 3 short Korean strings
 - confidence: one of high, medium, low
+
+Rules:
+- Base your answer only on the observed context below.
+- Do not claim a network issue unless the logs or metrics explicitly indicate connectivity failure.
+- Prefer application-level causes when logs include concrete exceptions or HTTP 5xx evidence.
+- Recommended actions must be specific to the observed signals, not generic troubleshooting advice.
+- Prioritize the observed_signals section over raw logs when they conflict.
+- Write likely_causes and recommended_actions in Korean.
+- Write each item as a complete Korean sentence, not a short noun phrase.
+- Each likely_causes item must include the concrete evidence or signal it is based on when possible.
+- Each recommended_actions item must mention the exact component to inspect, such as predictor 로그, inference-worker 로그, retry 토픽 lag, or 요청 payload.
+- If the evidence points to an application error or malformed request, prefer that over generic infrastructure or network explanations.
+- If observed_signals already contain a diagnosis-style statement starting with "진단:", use it directly instead of replacing it with vague generic wording.
+- Avoid vague labels such as "프로세스 내부 예외", "외부 서비스 연결 실패", or "요청 데이터 문제" unless you also explain the observed evidence.
+- If evidence is insufficient, explicitly say which evidence is missing instead of inventing a broad generic cause.
 
 Incident context:
 {json.dumps(
@@ -244,6 +433,9 @@ Incident context:
         "kafka": kafka_context,
         "worker": worker_status,
         "predictor": predictor_status,
+        "observed_signals": observed_signals,
+        "recent_worker_logs": worker_logs,
+        "recent_predictor_logs": predictor_logs,
     },
     ensure_ascii=False,
 )}
@@ -254,6 +446,10 @@ def _invoke_bedrock_summary(payload: dict, kafka_context: dict, worker_status: d
     model_id = _env("BEDROCK_MODEL_ID")
     if not model_id:
         likely_causes, recommended_actions = _heuristic_summary(payload, kafka_context, worker_status, predictor_status)
+        logger.info(
+            "incident_summary_source=fallback reason=no_model_id request_id=%s",
+            payload.get("request_id", "unknown"),
+        )
         return {
             "likely_causes": likely_causes,
             "recommended_actions": recommended_actions,
@@ -285,6 +481,12 @@ def _invoke_bedrock_summary(payload: dict, kafka_context: dict, worker_status: d
     text = "".join(block.get("text", "") for block in body.get("content", []) if block.get("type") == "text").strip()
     parsed = json.loads(text)
     parsed["source"] = "bedrock"
+    logger.info(
+        "incident_summary_source=bedrock request_id=%s model_id=%s confidence=%s",
+        payload.get("request_id", "unknown"),
+        model_id,
+        parsed.get("confidence", "unknown"),
+    )
     return parsed
 
 
@@ -292,6 +494,11 @@ def _safe_collect_pod_status(label_selector: str) -> dict:
     try:
         return _summarize_pods(label_selector)
     except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "pod_status_collection_failed selector=%s error=%s",
+            label_selector,
+            exc,
+        )
         return {
             "total": 0,
             "running": 0,
@@ -310,7 +517,15 @@ def _format_topic_lag(kafka_context: dict) -> str:
     return ", ".join(parts) if parts else "n/a"
 
 
-def _build_message(payload: dict, kafka_context: dict, worker_status: dict, predictor_status: dict, summary: dict) -> str:
+def _severity_color(summary: dict) -> str:
+    return "danger"
+
+
+def _severity_title(environment: str) -> str:
+    return f"🚨 [CRITICAL][{environment}]"
+
+
+def _build_message(payload: dict, kafka_context: dict, worker_status: dict, predictor_status: dict, summary: dict) -> dict:
     environment = os.getenv("ENVIRONMENT", "public").upper()
     request_id = payload.get("request_id", "unknown")
     factory_id = payload.get("factory_id", "unknown")
@@ -322,22 +537,27 @@ def _build_message(payload: dict, kafka_context: dict, worker_status: dict, pred
     recommended_actions = summary.get("recommended_actions", [])
     cause_lines = "\n".join(f"{idx}. {cause}" for idx, cause in enumerate(likely_causes, start=1)) or "1. No cause generated"
     action_lines = "\n".join(f"{idx}. {action}" for idx, action in enumerate(recommended_actions, start=1)) or "1. No action generated"
-
-    return (
-        f"[CRITICAL][{environment}]\n"
-        f"Inference incident detected\n\n"
-        f"Request ID: {request_id}\n"
-        f"Factory ID: {factory_id}\n"
-        f"Equipment ID: {equipment_id}\n"
-        f"Failed At: {failure_stage}\n"
-        f"Reason: {last_error}\n"
-        f"Retry Count: {retry_count}\n"
-        f"Kafka Lag: {_format_topic_lag(kafka_context)}\n"
-        f"Inference Worker: {worker_status.get('ready', 0)}/{worker_status.get('total', 0)} ready, restarts={worker_status.get('restarts', 0)}\n"
-        f"PDM Predictor: {predictor_status.get('ready', 0)}/{predictor_status.get('total', 0)} ready, restarts={predictor_status.get('restarts', 0)}\n\n"
-        f"Likely Causes:\n{cause_lines}\n\n"
-        f"Recommended Actions:\n{action_lines}"
+    body = (
+        f"{equipment_id} 요청이 {failure_stage} 단계에서 최종 실패해 DLQ로 이동했습니다.\n\n"
+        f"- Request ID: {request_id}\n"
+        f"- Error: {last_error}\n"
+        f"- Retry: {retry_count}회 초과\n"
+        f"- Kafka Lag: {_format_topic_lag(kafka_context)}\n"
+        f"- Worker: {worker_status.get('ready', 0)}/{worker_status.get('total', 0)} Ready\n"
+        f"- Predictor: {predictor_status.get('ready', 0)}/{predictor_status.get('total', 0)} Ready\n\n"
+        f"원인 후보\n{cause_lines}\n\n"
+        f"즉시 조치\n{action_lines}"
     )
+    return {
+        "attachments": [
+            {
+                "color": _severity_color(summary),
+                "title": f"{_severity_title(environment)} Inference DLQ 발생",
+                "text": body,
+                "mrkdwn_in": ["text"],
+            }
+        ]
+    }
 
 
 def handler(event, _context):
@@ -350,9 +570,34 @@ def handler(event, _context):
             worker_status = _safe_collect_pod_status(_env("WORKER_SELECTOR", "app=inference-worker"))
             predictor_status = _safe_collect_pod_status(_env("PREDICTOR_SELECTOR", "serving.kserve.io/inferenceservice=pdm"))
             try:
+                payload["_worker_logs"] = _collect_recent_pod_logs(_env("WORKER_SELECTOR", "app=inference-worker"))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("worker_log_collection_failed selector=%s error=%s", _env("WORKER_SELECTOR", "app=inference-worker"), exc)
+                payload["_worker_logs"] = []
+
+            try:
+                payload["_predictor_logs"] = _collect_recent_pod_logs(_env("PREDICTOR_SELECTOR", "serving.kserve.io/inferenceservice=pdm"))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("predictor_log_collection_failed selector=%s error=%s", _env("PREDICTOR_SELECTOR", "serving.kserve.io/inferenceservice=pdm"), exc)
+                payload["_predictor_logs"] = []
+
+            payload["_observed_signals"] = _build_observed_signals(
+                payload,
+                kafka_context,
+                worker_status,
+                predictor_status,
+                payload["_worker_logs"],
+                payload["_predictor_logs"],
+            )
+            try:
                 summary = _invoke_bedrock_summary(payload, kafka_context, worker_status, predictor_status)
             except Exception as exc:  # noqa: BLE001
                 likely_causes, recommended_actions = _heuristic_summary(payload, kafka_context, worker_status, predictor_status)
+                logger.exception(
+                    "incident_summary_fallback request_id=%s error=%s",
+                    payload.get("request_id", "unknown"),
+                    exc,
+                )
                 summary = {
                     "likely_causes": likely_causes,
                     "recommended_actions": recommended_actions,
@@ -360,5 +605,10 @@ def handler(event, _context):
                     "source": f"fallback:{exc}",
                 }
             _post_to_slack(_build_message(payload, kafka_context, worker_status, predictor_status, summary))
+            logger.info(
+                "incident_alert_sent request_id=%s summary_source=%s",
+                payload.get("request_id", "unknown"),
+                summary.get("source", "unknown"),
+            )
             sent += 1
     return {"statusCode": 200, "records": sent}

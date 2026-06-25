@@ -90,6 +90,16 @@ HA_DEVSTACK_CONTAINER_CACHE_RESTORE="${HA_DEVSTACK_CONTAINER_CACHE_RESTORE:-true
 HA_DEVSTACK_CONTAINER_CACHE_REFRESH="${HA_DEVSTACK_CONTAINER_CACHE_REFRESH:-true}"
 HA_DEVSTACK_CONTAINER_CACHE_COW_DRIVERS="${HA_DEVSTACK_CONTAINER_CACHE_COW_DRIVERS:-btrfs,zfs,lvm}"
 HA_DEVSTACK_CONTAINER_CACHE_VERSION="${HA_DEVSTACK_CONTAINER_CACHE_VERSION:-20260610.1}"
+
+# ── OpenStack 백엔드 선택 (DevStack → Kolla 마이그레이션) ──────────────
+# /etc/kolla/globals.yml 존재 시 자동으로 kolla. devstack 강제는 HA_OPENSTACK_PROVIDER=devstack.
+HA_OPENSTACK_PROVIDER="${HA_OPENSTACK_PROVIDER:-$([ -f /etc/kolla/globals.yml ] && echo kolla || echo devstack)}"
+HA_KOLLA_VENV="${HA_KOLLA_VENV:-${HOME}/.ha/kolla-venv}"
+HA_KOLLA_DEPLOY_SCRIPT="${HA_KOLLA_DEPLOY_SCRIPT:-${ROOT}/private/openstack-kolla/deploy-kolla.sh}"
+HA_KOLLA_ADMIN_OPENRC="${HA_KOLLA_ADMIN_OPENRC:-/etc/kolla/admin-openrc.sh}"
+# tenant VM ProxyCommand용 nc 래퍼 (qdhcp netns 안에서 nc만 실행, 좁은 NOPASSWD sudoers와 함께)
+HA_KOLLA_NETNS_NC="${HA_KOLLA_NETNS_NC:-/usr/local/sbin/ha-netns-nc}"
+
 PRIVATE_CLOUD_BASE_DOMAIN="${PRIVATE_CLOUD_BASE_DOMAIN:-${HA_BASE_DOMAIN:-intp.me}}"
 OS_PASSWORD_INPUT_PROVIDED=false
 [[ -n "${OS_PASSWORD+x}" ]] && OS_PASSWORD_INPUT_PROVIDED=true
@@ -365,8 +375,14 @@ ensure_ssh_key() {
 }
 
 write_ssh_config() {
-  local tmp_config
+  local tmp_config proxy_cmd
   ensure_ssh_key
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    # Kolla: tenant VM은 qdhcp netns nc 래퍼 경유 (FIP 미사용 → VM 네트워크 노출 최소화)
+    proxy_cmd="sudo ${HA_KOLLA_NETNS_NC} %h %p"
+  else
+    proxy_cmd="lxc exec ha-openstack -- nc %h %p"
+  fi
   tmp_config="${SSH_CONFIG}.$$"
   {
     printf 'Host *\n'
@@ -377,7 +393,7 @@ write_ssh_config() {
     printf '  CheckHostIP no\n'
     printf '  UserKnownHostsFile /dev/null\n'
     printf '  LogLevel ERROR\n'
-    printf '  ProxyCommand lxc exec ha-openstack -- nc %%h %%p\n'
+    [[ -n "${proxy_cmd}" ]] && printf '  ProxyCommand %s\n' "${proxy_cmd}"
   } >"${tmp_config}"
   chmod 600 "${tmp_config}"
   mv "${tmp_config}" "${SSH_CONFIG}"
@@ -411,8 +427,17 @@ ensure_lxc_proxy_device_unlocked() {
   return "${rc}"
 }
 
+# 호스트→VM 서비스 엔드포인트: Kolla=FIP(target):service_port 직접, DevStack=127.0.0.1:upstream(LXD)
+host_svc_ep() {
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then printf '%s:%s' "$1" "$2"; else printf '127.0.0.1:%s' "$3"; fi
+}
+
 ensure_lxc_proxy_device() {
   local lock_file lock_fd rc
+  # Kolla: 호스트가 OpenStack Floating IP로 VM 서비스에 직접 접근 → LXD proxy device 불필요 (no-op)
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    return 0
+  fi
   lock_file="${ROOT}/.ha/openstack/lxc-config.lock"
   mkdir -p "$(dirname "${lock_file}")"
   exec {lock_fd}>"${lock_file}"
@@ -1699,6 +1724,10 @@ CLEANUP_OPENSTACK_ORPHANS_BEFORE_APPLY
 }
 
 preflight_openstack_quota() {
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    log "skip quota preflight: Kolla provider (기존 VM reconciled, 쿼터 충족)"
+    return 0
+  fi
   local prefix control_count build_count gpu_count gitlab_count harbor_count
   local control_flavor build_flavor gpu_flavor gitlab_flavor harbor_flavor
 
@@ -1944,6 +1973,10 @@ PREFLIGHT_OPENSTACK_QUOTA
 }
 
 preflight_host_capacity() {
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    log "skip host capacity preflight: Kolla provider (bare-metal nova, DevStack 컨테이너 없음)"
+    return 0
+  fi
   local apply_prefix="$1"
   local control_count="$2"
   local control_flavor="$3"
@@ -2205,6 +2238,9 @@ sync_openstack_login_user() {
 }
 
 ensure_devstack_egress() {
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    return 0  # Kolla: egress는 호스트 systemd(kolla-egress-nat.service)가 담당
+  fi
   lxc exec ha-openstack -- sudo -u stack -H bash -s <<'LOOKUP_PUBLIC_EGRESS' >"${LOG_DIR}/public-egress.env"
 set -eo pipefail
 cd /opt/stack/devstack
@@ -2641,6 +2677,11 @@ ssh_tunnel_listen_address() {
 ensure_openstack_private_route() {
   local private_cidr router_name gateway
 
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    log "skip private route setup: Kolla provider (VM 접속은 qdhcp netns ProxyCommand 경유)"
+    return 0
+  fi
+
   if ! command -v lxc >/dev/null 2>&1 || ! lxc info ha-openstack >/dev/null 2>&1; then
     log "skip private route setup: ha-openstack container is unavailable"
     return 0
@@ -2788,6 +2829,59 @@ setup_reverse_proxy() {
   fi
 }
 
+# ── Kolla provider 함수 (DevStack lxc-exec 경로 대체) ───────────────────
+# Kolla openrc로 openstack 실행 (DevStack의 'lxc exec ha-openstack -- source openrc' 대체)
+kolla_os() {
+  (
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "${HA_KOLLA_VENV}/bin/activate"
+    # shellcheck disable=SC1091
+    source "${HA_KOLLA_ADMIN_OPENRC}"
+    openstack "$@"
+  )
+}
+
+# terraform이 참조하는 flavor 보장 (Kolla 네이티브, 멱등 — 있으면 no-op)
+_kolla_ensure_flavor() {
+  local name="$1" ram="$2" vcpus="$3" disk="$4"
+  if kolla_os flavor show "$name" >/dev/null 2>&1; then
+    kolla_os flavor set --property "hw_rng:allowed=True" "$name" >/dev/null 2>&1 || true
+    return 0
+  fi
+  kolla_os flavor create --ram "$ram" --vcpus "$vcpus" --disk "$disk" "$name" >/dev/null
+  kolla_os flavor set --property "hw_rng:allowed=True" "$name" >/dev/null 2>&1 || true
+}
+
+ensure_flavors_kolla() {
+  _kolla_ensure_flavor "${HA_DEVSTACK_CONTROL_FLAVOR_NAME}" "${HA_DEVSTACK_CONTROL_FLAVOR_RAM}" "${HA_DEVSTACK_CONTROL_FLAVOR_VCPUS}" "${HA_DEVSTACK_CONTROL_FLAVOR_DISK}"
+  _kolla_ensure_flavor "${HA_DEVSTACK_WORKER_FLAVOR_NAME}" "${HA_DEVSTACK_WORKER_FLAVOR_RAM}" "${HA_DEVSTACK_WORKER_FLAVOR_VCPUS}" "${HA_DEVSTACK_WORKER_FLAVOR_DISK}"
+  _kolla_ensure_flavor "${HA_DEVSTACK_GITLAB_FLAVOR_NAME}" "${HA_DEVSTACK_GITLAB_FLAVOR_RAM}" "${HA_DEVSTACK_GITLAB_FLAVOR_VCPUS}" "${HA_DEVSTACK_GITLAB_FLAVOR_DISK}"
+  _kolla_ensure_flavor "${HA_DEVSTACK_HARBOR_FLAVOR_NAME}" "${HA_DEVSTACK_HARBOR_FLAVOR_RAM}" "${HA_DEVSTACK_HARBOR_FLAVOR_VCPUS}" "${HA_DEVSTACK_HARBOR_FLAVOR_DISK}"
+  _kolla_ensure_flavor "${HA_OPENSTACK_GPU_FLAVOR_NAME}" "${HA_OPENSTACK_GPU_FLAVOR_RAM}" "${HA_OPENSTACK_GPU_FLAVOR_VCPUS}" "${HA_OPENSTACK_GPU_FLAVOR_DISK}"
+  kolla_os flavor set --property "pci_passthrough:alias=nvidia-gpu:1" --property "hw:pci_numa_affinity_policy=preferred" "${HA_OPENSTACK_GPU_FLAVOR_NAME}" >/dev/null 2>&1 || true
+}
+
+# apply 모드: Kolla 헬스 검증 (재배포·컨테이너 조작 없음 = 멱등·무파괴)
+kolla_apply_check() {
+  [[ -f "${HA_KOLLA_ADMIN_OPENRC}" ]] || { log "error: ${HA_KOLLA_ADMIN_OPENRC} 없음 — deploy-kolla.sh로 먼저 배포 필요"; return 1; }
+  [[ -d "${HA_KOLLA_VENV}" ]] || { log "error: kolla venv(${HA_KOLLA_VENV}) 없음 — deploy-kolla.sh 먼저"; return 1; }
+  if kolla_os endpoint list >/dev/null 2>&1; then
+    log "Kolla OpenStack 정상 (keystone endpoint 응답)"
+  else
+    log "error: Kolla OpenStack 미응답 — 컨트롤플레인 점검 필요"
+    return 1
+  fi
+  ensure_flavors_kolla
+}
+
+# reinstall 모드: Kolla 배포 스크립트 호출 (deploy-kolla.sh가 멱등 처리)
+kolla_reinstall() {
+  log "Kolla 배포/재구성: ${HA_KOLLA_DEPLOY_SCRIPT}"
+  bash "${HA_KOLLA_DEPLOY_SCRIPT}"
+  ensure_flavors_kolla
+}
+
 devstack_reinstall() {
   local product_id
   create_devstack_container
@@ -2841,6 +2935,26 @@ devstack_openrc_password() {
 }
 
 use_local_devstack_openstack_env() {
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    # Kolla Keystone 인증: admin-openrc(URL/project/domains/admin) 기반 + keystone v3 보장
+    set +u
+    # shellcheck disable=SC1090
+    . "${HA_KOLLA_ADMIN_OPENRC}" >/dev/null 2>&1 || true
+    set -u
+    [[ -n "${OS_AUTH_URL:-}" ]] || export OS_AUTH_URL="http://192.168.0.250:5000"
+    [[ "${OS_AUTH_URL}" == */v3 ]] || export OS_AUTH_URL="${OS_AUTH_URL%/}/v3"
+    # CI 로그인 자격(3stacks 등)이 제공되면 우선 적용
+    if [[ "${HA_OPENSTACK_LOGIN_PASSWORD_INPUT_PROVIDED:-false}" == "true" ]]; then
+      export OS_USERNAME="${HA_OPENSTACK_LOGIN_USERNAME:-${OS_USERNAME:-3stacks}}"
+      export OS_PASSWORD="${HA_OPENSTACK_LOGIN_PASSWORD}"
+      export OS_PROJECT_NAME="${HA_OPENSTACK_LOGIN_PROJECT_NAME:-${OS_PROJECT_NAME:-admin}}"
+      export OS_USER_DOMAIN_NAME="${HA_OPENSTACK_LOGIN_USER_DOMAIN_NAME:-${OS_USER_DOMAIN_NAME:-Default}}"
+      export OS_PROJECT_DOMAIN_NAME="${HA_OPENSTACK_LOGIN_PROJECT_DOMAIN_NAME:-${OS_PROJECT_DOMAIN_NAME:-Default}}"
+    fi
+    export OS_REGION_NAME="${OS_REGION_NAME:-RegionOne}"
+    export OS_IDENTITY_API_VERSION=3
+    return
+  fi
   export OS_AUTH_URL="${HA_DEVSTACK_AUTH_URL:-http://127.0.0.1:18081/identity/v3}"
   export OS_USERNAME="${HA_OPENSTACK_LOGIN_USERNAME:-${HA_DEVSTACK_USERNAME:-admin}}"
   local devstack_password
@@ -3031,13 +3145,25 @@ terraform_apply() {
       effective_install_node_dependencies="false"
     fi
   fi
-  public_network_id="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc 'cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack network show public -f value -c id')"
-  public_subnet_id="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc 'cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack subnet list --network public --ip-version 4 -f value -c ID | head -n 1')"
-  public_subnet_cidr="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc "cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack subnet show '${public_subnet_id}' -f value -c cidr")"
-  assign_floating_ips="$(tf_bool_value PRIVATE_CLOUD_ASSIGN_FLOATING_IPS "${PRIVATE_CLOUD_ASSIGN_FLOATING_IPS}")"
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    # Kolla: 외부망은 ext-net (DevStack 'public' 대체), FIP 미사용(접속=in-cluster cloudflared)
+    local _extnet="${HA_KOLLA_EXTERNAL_NETWORK:-ext-net}"
+    public_network_id="$(kolla_os network show "${_extnet}" -f value -c id)"
+    public_subnet_id="$(kolla_os subnet list --network "${_extnet}" --ip-version 4 -f value -c ID | head -n 1)"
+    public_subnet_cidr="$(kolla_os subnet show "${public_subnet_id}" -f value -c cidr)"
+    # Kolla: FIP 미사용 (호스트→VM=qdhcp netns, 외부접속=in-cluster cloudflared) → VM 네트워크 노출 0
+    assign_floating_ips=false
+    fip_pool="${_extnet}"
+  else
+    public_network_id="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc 'cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack network show public -f value -c id')"
+    public_subnet_id="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc 'cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack subnet list --network public --ip-version 4 -f value -c ID | head -n 1')"
+    public_subnet_cidr="$(lxc exec ha-openstack -- sudo -u stack -H bash -lc "cd /opt/stack/devstack && set +u && source openrc admin admin >/dev/null && set -u && openstack subnet show '${public_subnet_id}' -f value -c cidr")"
+    assign_floating_ips="$(tf_bool_value PRIVATE_CLOUD_ASSIGN_FLOATING_IPS "${PRIVATE_CLOUD_ASSIGN_FLOATING_IPS}")"
+    fip_pool="public"
+  fi
   {
     printf 'external_network_id = "%s"\n' "$public_network_id"
-    printf 'floating_ip_pool = "public"\n'
+    printf 'floating_ip_pool = "%s"\n' "${fip_pool:-public}"
     printf 'assign_floating_ips = %s\n' "$assign_floating_ips"
     printf 'install_node_dependencies = %s\n' "${effective_install_node_dependencies}"
     printf 'ssh_allowed_cidrs = ["%s"]\n' "$public_subnet_cidr"
@@ -3385,7 +3511,12 @@ bootstrap_k8s() {
   wait_nodes_ssh
   export HA_OPENSTACK_TF_OUTPUT_JSON="${TF_OUTPUT_JSON}"
   export HA_OPENSTACK_SSH_KEY="${SSH_KEY}"
-  export HA_OPENSTACK_SSH_PROXY_CONTAINER="ha-openstack"
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    # Kolla: tenant VM은 qdhcp netns nc 래퍼 경유 (DevStack lxc 대체)
+    export HA_OPENSTACK_SSH_PROXY_NETNS_NC="${HA_KOLLA_NETNS_NC}"
+  else
+    export HA_OPENSTACK_SSH_PROXY_CONTAINER="ha-openstack"
+  fi
   export HA_OPENSTACK_SSH_TARGET="auto"
   export HA_OPENSTACK_KUBECONFIG="${KUBECONFIG_PATH}"
   export HA_K8S_API_ENDPOINT="127.0.0.1:${HA_KUBECTL_TUNNEL_PORT}"
@@ -3569,6 +3700,8 @@ PY
     'export MINIO_SERVER_URL="http://127.0.0.1:9000"' \
     "export MINIO_BROWSER_REDIRECT_URL=\"https://${MINIO_CONSOLE_DOMAIN}\""
   kubectl -n minio-tenant create secret generic minio-creds-secret --from-literal=accessKey="${minio_root_user}" --from-literal=secretKey="${minio_root_password}" --dry-run=client -o yaml | kubectl apply -f -
+  kubectl apply -f "${ROOT}/private/kubernetes/namespaces.yaml"
+  kubectl -n model-build create secret generic minio-client-credentials --from-literal=accessKey="${minio_root_user}" --from-literal=secretKey="${minio_root_password}" --dry-run=client -o yaml | kubectl apply -f -
   kubectl -n minio-tenant create secret generic model-admin --from-literal=CONSOLE_ACCESS_KEY="${minio_console_user}" --from-literal=CONSOLE_SECRET_KEY="${minio_console_password}" --dry-run=client -o yaml | kubectl apply -f -
   kubectl -n minio-tenant create secret generic minio-configuration --from-literal=config.env="${minio_config_env}" --dry-run=client -o yaml | kubectl apply -f -
   sed -E "s/storage: [0-9]+Gi/storage: ${MINIO_VOLUME_SIZE}Gi/g" "${ROOT}/private/storage/minio-tenant.yaml" | kubectl apply -f -
@@ -3804,8 +3937,12 @@ sudo journalctl -u hybrid-ai-gitlab-bootstrap.service -n 100 --no-pager || true
 sudo cat /var/lib/hybrid-ai/gitlab-bootstrap/status.env 2>/dev/null || true
 REMOTE
   ensure_lxc_proxy_device gitlab-proxy "tcp:127.0.0.1:${GITLAB_UPSTREAM_PORT}" "tcp:${target}:80"
-  curl -fsS "http://127.0.0.1:${GITLAB_UPSTREAM_PORT}/users/sign_in" >/dev/null 2>&1 \
-    || curl -fsS "http://127.0.0.1:${GITLAB_UPSTREAM_PORT}/-/readiness" >/dev/null
+  if [[ "${HA_OPENSTACK_PROVIDER}" != "kolla" ]]; then
+    local _gl_ep; _gl_ep="$(host_svc_ep "${target}" 80 "${GITLAB_UPSTREAM_PORT}")"
+    curl -fsS "http://${_gl_ep}/users/sign_in" >/dev/null 2>&1 \
+      || curl -fsS "http://${_gl_ep}/-/readiness" >/dev/null
+  fi
+  # Kolla: 호스트 직접 체크 생략 (위 VM 내부 self-check + cloudflared gitlab.intp.me로 검증)
 }
 
 setup_harbor() {
@@ -3918,8 +4055,12 @@ sudo cat /var/lib/hybrid-ai/harbor-bootstrap/status.env 2>/dev/null || true
 REMOTE
 
   ensure_lxc_proxy_device harbor-proxy "tcp:127.0.0.1:${HARBOR_UPSTREAM_PORT}" "tcp:${target}:${HARBOR_HTTP_PORT}"
-  curl -fsS "http://127.0.0.1:${HARBOR_UPSTREAM_PORT}/api/v2.0/ping" >/dev/null 2>&1 \
-    || curl -fsS "http://127.0.0.1:${HARBOR_UPSTREAM_PORT}/api/v2.0/health" >/dev/null
+  if [[ "${HA_OPENSTACK_PROVIDER}" != "kolla" ]]; then
+    local _hb_ep; _hb_ep="$(host_svc_ep "${target}" "${HARBOR_HTTP_PORT}" "${HARBOR_UPSTREAM_PORT}")"
+    curl -fsS "http://${_hb_ep}/api/v2.0/ping" >/dev/null 2>&1 \
+      || curl -fsS "http://${_hb_ep}/api/v2.0/health" >/dev/null
+  fi
+  # Kolla: 호스트 직접 체크 생략 (VM 내부 health + cloudflared harbor.intp.me로 검증)
 
   # Persist the kaniko robot credentials to a run-independent path. The k8s pull
   # secret is created later by the platform phase (setup_model_build_platform),
@@ -4146,6 +4287,14 @@ run_tools_phases() {
 }
 
 run_devstack_steps() {
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    if [[ "${MODE}" == "reinstall" ]]; then
+      phase kolla_reinstall kolla_reinstall
+    else
+      phase kolla_apply_check kolla_apply_check
+    fi
+    return
+  fi
   if [[ "${MODE}" == "reinstall" ]]; then
     phase devstack_reinstall devstack_reinstall
   else
@@ -4154,6 +4303,11 @@ run_devstack_steps() {
 }
 
 run_proxy_steps() {
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    # Kolla: 외부 접속은 in-cluster cloudflared(private/cloudflared)가 담당 → 레거시 LXD 프록시/터널/DNS 불필요
+    skip_phase setup_reverse_proxy "Kolla: 접속은 in-cluster cloudflared 담당 (레거시 프록시 스킵)"
+    return
+  fi
   phase ensure_openstack_private_route ensure_openstack_private_route
   phase setup_minio_entrypoints setup_minio_entrypoints
   phase setup_reverse_proxy setup_reverse_proxy
@@ -4162,6 +4316,11 @@ run_proxy_steps() {
 }
 
 run_images_steps() {
+  if [[ "${HA_OPENSTACK_PROVIDER}" == "kolla" ]]; then
+    # Kolla: VM 이미지는 glance에서 직접 관리(*-restore) → DevStack 캐시 단계 불필요
+    skip_phase prepare_cached_images "Kolla: 이미지는 glance에서 직접 관리 (캐시 스킵)"
+    return
+  fi
   phase prepare_cached_images prepare_cached_images
 }
 

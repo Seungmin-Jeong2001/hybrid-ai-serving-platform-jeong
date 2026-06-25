@@ -6,6 +6,7 @@
 | --- | --- |
 | Floating IP | VM별 FIP 미사용 |
 | 외부 진입점 | `ssh.intp.me` / reverse proxy |
+| AWS VPN 진입점 | MacMini Bastion Linux gateway |
 | 내부 VM 주소 | 문서에는 DNS만 고정, 실제 IP는 조회 명령으로 확인 |
 | 내부 DNS zone | `internal.intp.me` |
 | K8s Service DNS | `*.svc.cluster.local` |
@@ -47,6 +48,7 @@
 | K8s Pod/Workflow/Runner -> K8s service | `*.svc.cluster.local` |
 | K8s Pod -> 등록된 VM node | `*.internal.intp.me` |
 | VM -> VM | `*.internal.intp.me` |
+| VM/Pod -> AWS ECR/STS | Bastion Site-to-Site VPN + Route53 Inbound Resolver |
 | 외부 사용자 -> 관리 UI | 기존 public URL, reverse proxy 경유 |
 | 등록 안 된 standalone VM | FIP 대신 private IP 사용 후 internal DNS 등록 |
 
@@ -193,6 +195,17 @@ K8s Service DNS와 port 확인:
 ```bash
 KUBECONFIG=.ha/openstack/kubeconfig kubectl get svc -A
 ```
+
+AWS private endpoint DNS 확인:
+
+```bash
+KUBECONFIG=.ha/openstack/kubeconfig kubectl -n model-build run ecr-dns-check \
+  --rm -i --restart=Never \
+  --image=busybox:1.36 \
+  --command -- nslookup api.ecr.ap-northeast-2.amazonaws.com
+```
+
+이 결과가 public IP로 나오면 ECR push는 아직 VPN/VPCE 경로가 아니다. `private/bastion/configure-private-dns.sh`로 CoreDNS 조건부 forwarding을 적용하고, AWS VPC CIDR route가 Bastion gateway를 향하는지 확인한다.
 
 K8s node/pod IP가 필요할 때만 조회:
 

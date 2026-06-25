@@ -55,9 +55,9 @@ jobs:
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           echo "value=arn:aws:iam::${ACCOUNT_ID}:role/sgs-hasp-eks-bootstrap-admin" >> "$GITHUB_OUTPUT"
 
-      - name: Write optional secret tfvars override
+      - name: Write optional tfvars override (non-sensitive variable)
         env:
-          TFVARS_CONTENT: ${{ secrets.PUBLIC_TERRAFORM_TFVARS }}
+          TFVARS_CONTENT: ${{ vars.PUBLIC_TERRAFORM_TFVARS }}
         working-directory: public/terraform
         run: |
           if [[ -n "$TFVARS_CONTENT" ]]; then
@@ -356,6 +356,10 @@ jobs:
               "if ! command -v kubectl >/dev/null 2>&1; then curl -fsSLo /tmp/kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl && chmod +x /tmp/kubectl && sudo mv /tmp/kubectl /usr/local/bin/kubectl; fi",
               "if ! command -v terraform >/dev/null 2>&1; then curl -fsSLo /tmp/terraform.zip https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip && python3 - <<'INNER'\nimport zipfile\nwith zipfile.ZipFile('/tmp/terraform.zip') as zf:\n    zf.extractall('/tmp/terraform-bin')\nINNER\nsudo mv /tmp/terraform-bin/terraform /usr/local/bin/terraform && sudo chmod +x /usr/local/bin/terraform; fi",
               "export KUBECONFIG=/tmp/eks-kubeconfig",
+              f"ASSUME_ROLE_OUTPUT=$(aws sts assume-role --role-arn {os.environ['BOOTSTRAP_ROLE_ARN']} --role-session-name terraform-incluster --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)",
+              "if [ -z \"$ASSUME_ROLE_OUTPUT\" ] || [ \"$ASSUME_ROLE_OUTPUT\" = \"None\" ]; then echo 'Failed to assume bootstrap role.'; exit 1; fi",
+              "read AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<< \"$ASSUME_ROLE_OUTPUT\"",
+              "export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN",
               f"aws eks update-kubeconfig --region {os.environ['AWS_REGION']} --name {os.environ['EKS_CLUSTER_NAME']} --role-arn {os.environ['BOOTSTRAP_ROLE_ARN']} --kubeconfig /tmp/eks-kubeconfig",
               "rm -rf /tmp/hasp-bootstrap && mkdir -p /tmp/hasp-bootstrap",
               f"echo {os.environ['INCLUSTER_TF_B64']} | base64 -d > /tmp/hasp-bootstrap/terraform-incluster.tar.gz",
@@ -454,10 +458,12 @@ jobs:
           export INFERENCE_WORKER_ROLE_ARN="$(terraform output -raw inference_worker_role_arn)"
           export DASHBOARD_BACKEND_ROLE_ARN="$(terraform output -raw dashboard_backend_role_arn)"
           export ALB_CERTIFICATE_ARN="$(terraform output -raw alb_certificate_arn)"
+          [[ -n "${ALB_CERTIFICATE_ARN}" ]] || { echo "alb_certificate_arn is empty"; exit 1; }
 
           python - <<'PY'
           import os
           import re
+          import json
           from pathlib import Path
 
           root = Path.cwd().parent.parent
@@ -474,13 +480,13 @@ jobs:
               ),
               (
                   root / "public/k8s/apps/inference-api/ingress.yaml",
-                  r"(alb\.ingress\.kubernetes\.io/certificate-arn:\s*).*$",
-                  rf"\1{os.environ['ALB_CERTIFICATE_ARN']}",
+                  r'(alb\.ingress\.kubernetes\.io/certificate-arn:\s*).*$',
+                  r"\1" + json.dumps(os.environ["ALB_CERTIFICATE_ARN"]),
               ),
               (
                   root / "public/k8s/apps/dashboard-frontend/ingress.yaml",
-                  r"(alb\.ingress\.kubernetes\.io/certificate-arn:\s*).*$",
-                  rf"\1{os.environ['ALB_CERTIFICATE_ARN']}",
+                  r'(alb\.ingress\.kubernetes\.io/certificate-arn:\s*).*$',
+                  r"\1" + json.dumps(os.environ["ALB_CERTIFICATE_ARN"]),
               ),
           ]
 
@@ -505,77 +511,6 @@ jobs:
           fi
           git commit -m "chore: refresh public runtime manifest values"
           git push origin "HEAD:${GITHUB_REF_NAME}"
-
-      - name: Update Route53 A records for Internal ALB
-        if: ${{ inputs.action == 'apply' && steps.resolve_instance.outputs.value != '' }}
-        working-directory: public/terraform
-        run: |
-          HOSTED_ZONE_ID="$(terraform output -raw public_hosted_zone_id)"
-          PRIVATE_HOSTED_ZONE_ID="$(terraform output -raw private_hosted_zone_id)"
-
-          # ArgoCD sync 후 ALB 생성까지 대기
-          sleep 30
-
-          # Internal ALB DNS 주소 조회
-          ALB_DNS=$(aws elbv2 describe-load-balancers \
-            --region "${AWS_REGION}" \
-            --query "LoadBalancers[?Scheme=='internal'].DNSName" \
-            --output text | head -1)
-
-          if [[ -z "${ALB_DNS}" || "${ALB_DNS}" == "None" ]]; then
-            echo "Internal ALB not found, skipping Route53 update."
-            exit 0
-          fi
-
-          # ALB의 Hosted Zone ID 조회
-          ALB_HOSTED_ZONE_ID=$(aws elbv2 describe-load-balancers \
-            --region "${AWS_REGION}" \
-            --query "LoadBalancers[?DNSName=='${ALB_DNS}'].CanonicalHostedZoneId" \
-            --output text)
-
-          echo "ALB DNS: ${ALB_DNS}"
-          echo "ALB Hosted Zone ID: ${ALB_HOSTED_ZONE_ID}"
-
-          # Public Hosted Zone - dashboard, api 둘 다 UPSERT (A Alias)
-          for DOMAIN in "dashboard.sgs-hasp.click" "api.sgs-hasp.click"; do
-            aws route53 change-resource-record-sets \
-              --hosted-zone-id "${HOSTED_ZONE_ID}" \
-              --change-batch "{
-                \"Changes\": [{
-                  \"Action\": \"UPSERT\",
-                  \"ResourceRecordSet\": {
-                    \"Name\": \"${DOMAIN}\",
-                    \"Type\": \"A\",
-                    \"AliasTarget\": {
-                      \"HostedZoneId\": \"${ALB_HOSTED_ZONE_ID}\",
-                      \"DNSName\": \"${ALB_DNS}\",
-                      \"EvaluateTargetHealth\": true
-                    }
-                  }
-                }]
-              }"
-            echo "Public Route53 updated: ${DOMAIN} -> ${ALB_DNS}"
-          done
-
-          # Private Hosted Zone - CNAME 업데이트
-          if [[ -n "${PRIVATE_HOSTED_ZONE_ID}" && "${PRIVATE_HOSTED_ZONE_ID}" != "None" ]]; then
-            for DOMAIN in "dashboard.sgs-hasp.click" "api.sgs-hasp.click"; do
-              aws route53 change-resource-record-sets \
-                --hosted-zone-id "${PRIVATE_HOSTED_ZONE_ID}" \
-                --change-batch "{
-                  \"Changes\": [{
-                    \"Action\": \"UPSERT\",
-                    \"ResourceRecordSet\": {
-                      \"Name\": \"${DOMAIN}\",
-                      \"Type\": \"CNAME\",
-                      \"TTL\": 60,
-                      \"ResourceRecords\": [{\"Value\": \"${ALB_DNS}\"}]
-                    }
-                  }]
-                }"
-              echo "Private Route53 updated: ${DOMAIN} -> ${ALB_DNS}"
-            done
-          fi
 
       - name: Clean up ENIs before destroy
         if: ${{ inputs.action == 'destroy' }}

@@ -723,6 +723,38 @@ download_file() {
   curl -fsSL "$url" -o "$target"
 }
 
+# 의존성 소스 모드: bundle(로컬 에어갭 번들) | mirror(Bastion HTTP) | public(공인 CDN)
+# HA_DEPS_BUNDLE_DIR / HA_DEPS_MIRROR_URL 설정 시 Bastion 미러 사용, SHA 검증은 동일 유지.
+dep_source_mode() {
+  if [[ -n "${HA_DEPS_BUNDLE_DIR:-}" ]]; then
+    printf '%s\n' bundle
+  elif [[ -n "${HA_DEPS_MIRROR_URL:-}" ]]; then
+    printf '%s\n' mirror
+  else
+    printf '%s\n' public
+  fi
+}
+
+# fetch_dep <상대경로> <대상> — bundle 은 복사, mirror 는 다운로드. public 모드면 1 반환.
+fetch_dep() {
+  local rel="$1" target="$2"
+  case "$(dep_source_mode)" in
+    bundle) install -m 644 "${HA_DEPS_BUNDLE_DIR%/}/${rel}" "$target" ;;
+    mirror) download_file "${HA_DEPS_MIRROR_URL%/}/${rel}" "$target" ;;
+    *) return 1 ;;
+  esac
+}
+
+# read_dep_latest <tool> — bh bundle 이 생성한 latest 매니페스트 읽기.
+read_dep_latest() {
+  local tool="$1"
+  case "$(dep_source_mode)" in
+    bundle) cat "${HA_DEPS_BUNDLE_DIR%/}/${tool}/latest" 2>/dev/null ;;
+    mirror) curl -fsSL "${HA_DEPS_MIRROR_URL%/}/${tool}/latest" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
 sha256_file() {
   local path="$1"
 
@@ -757,6 +789,13 @@ latest_terraform_version() {
     return
   fi
 
+  if [[ "$(dep_source_mode)" != public ]]; then
+    version="$(read_dep_latest terraform)"
+    [[ -n "$version" ]] || die "mirror/bundle 에 terraform/latest 없음; HA_TERRAFORM_VERSION 설정"
+    printf '%s\n' "$version"
+    return
+  fi
+
   json="$(curl -fsSL https://checkpoint-api.hashicorp.com/v1/check/terraform)" ||
     die "could not resolve Terraform version; set HA_TERRAFORM_VERSION"
 
@@ -768,6 +807,14 @@ latest_terraform_version() {
 latest_kubectl_version() {
   if [[ -n "${HA_KUBECTL_VERSION:-}" ]]; then
     printf '%s\n' "$HA_KUBECTL_VERSION"
+    return
+  fi
+
+  if [[ "$(dep_source_mode)" != public ]]; then
+    local version
+    version="$(read_dep_latest kubectl)"
+    [[ -n "$version" ]] || die "mirror/bundle 에 kubectl/latest 없음; HA_KUBECTL_VERSION 설정"
+    printf '%s\n' "$version"
     return
   fi
 
@@ -837,9 +884,14 @@ install_terraform_dep() {
   archive="${tmp_dir}/${filename}"
   sums="${tmp_dir}/terraform_${version}_SHA256SUMS"
 
-  info "Installing terraform ${version} to ${HA_DEPS_DIR}"
-  download_file "https://releases.hashicorp.com/terraform/${version}/${filename}" "$archive"
-  download_file "https://releases.hashicorp.com/terraform/${version}/terraform_${version}_SHA256SUMS" "$sums"
+  info "Installing terraform ${version} to ${HA_DEPS_DIR} ($(dep_source_mode))"
+  if [[ "$(dep_source_mode)" != public ]]; then
+    fetch_dep "terraform/${version}/${filename}" "$archive"
+    fetch_dep "terraform/${version}/SHA256SUMS" "$sums"
+  else
+    download_file "https://releases.hashicorp.com/terraform/${version}/${filename}" "$archive"
+    download_file "https://releases.hashicorp.com/terraform/${version}/terraform_${version}_SHA256SUMS" "$sums"
+  fi
 
   expected="$(awk -v file="$filename" '$2 == file { print $1 }' "$sums")"
   [[ -n "$expected" ]] || die "could not find checksum for ${filename}"
@@ -872,9 +924,14 @@ install_kubectl_dep() {
   binary="${tmp_dir}/kubectl"
   checksum="${tmp_dir}/kubectl.sha256"
 
-  info "Installing kubectl ${version} to ${HA_DEPS_DIR}"
-  download_file "https://dl.k8s.io/release/${version}/bin/${os}/${arch}/kubectl" "$binary"
-  download_file "https://dl.k8s.io/release/${version}/bin/${os}/${arch}/kubectl.sha256" "$checksum"
+  info "Installing kubectl ${version} to ${HA_DEPS_DIR} ($(dep_source_mode))"
+  if [[ "$(dep_source_mode)" != public ]]; then
+    fetch_dep "kubectl/${version}/bin/${os}/${arch}/kubectl" "$binary"
+    fetch_dep "kubectl/${version}/bin/${os}/${arch}/kubectl.sha256" "$checksum"
+  else
+    download_file "https://dl.k8s.io/release/${version}/bin/${os}/${arch}/kubectl" "$binary"
+    download_file "https://dl.k8s.io/release/${version}/bin/${os}/${arch}/kubectl.sha256" "$checksum"
+  fi
 
   expected="$(tr -d '[:space:]' <"$checksum")"
   [[ -n "$expected" ]] || die "could not find checksum for kubectl ${version}"

@@ -11,6 +11,7 @@ private/
   kubernetes/            # Namespace, RBAC, ResourceQuota, NetworkPolicy 기준
   gpu-worker/            # GPU node, RuntimeClass, validation job 기준
   storage/               # NFS, MinIO, build cache, artifact PVC 기준
+  bastion/               # MacMini/Linux Bastion VPN gateway와 dependency cache 기준
   reverse-proxy/         # 관리자 UI reverse proxy와 DNS 기준
   handoff/               # 다른 역할에 넘길 인프라 산출물/계획
 ```

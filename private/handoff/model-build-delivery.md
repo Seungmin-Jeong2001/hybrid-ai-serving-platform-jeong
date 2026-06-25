@@ -465,14 +465,12 @@ mc cat "minio/artifacts/manifests/<project>/<tag>/release.json" | jq .
 | Dataset download 실패 | `model-build/minio-client-credentials`, MinIO bucket/prefix | secret 누락 또는 prefix 오타 |
 | Train pod pending | GPU node label/taint, quota | `hybrid-ai.io/node-role=gpu-worker`, GPU resource 확인 |
 | Kaniko push 실패 | `harbor-kaniko-push` secret, Harbor robot 권한 | robot credential, Harbor project 확인 |
-| ECR copy 실패 | AWS credential, ECR repo, network egress | ECR login, repo 존재, NAT/VPN/endpoint 경로 확인 |
+| ECR copy 실패 | AWS credential, ECR repo, network egress | ECR login, repo 존재, Bastion VPN route, Route53 Resolver DNS 확인 |
 | Release manifest 누락 | `promote:ecr` job log, MinIO path | image copy 이후 manifest upload 단계 실패 |
 
 ## 다음 구현 권장 순서
 
-1. `model-build/minio-client-credentials` 자동 생성 추가.
-2. `model-build-runner`에 Argo Workflow submit RBAC 추가.
-3. build-worker GitLab Runner 설치와 등록을 `private-cloud-apply.sh` phase로 자동화.
-4. model repo에 `.gitlab-ci.yml` template 추가.
-5. ECR promotion credential 방식을 확정. 운영 기준은 AWS OIDC assume-role.
-6. release manifest를 MinIO와 GitLab artifact에 모두 남기고, public deploy는 ECR digest만 읽게 변경.
+1. build-worker GitLab Runner 설치와 등록을 `private-cloud-apply.sh` phase로 자동화.
+2. model repo `.gitlab-ci.yml`에서 runtime internet download를 Bastion cache 또는 Harbor mirror image로 대체.
+3. ECR promotion credential 방식을 확정. 운영 기준은 AWS OIDC assume-role.
+4. release manifest를 MinIO와 GitLab artifact에 모두 남기고, public deploy는 ECR digest만 읽게 변경.
