@@ -288,6 +288,22 @@ variable "vpn_static_route_cidrs" {
   default     = {}
 }
 
+# MacMini bastion 등 전용 VPN 게이트웨이 (customer_gateways와 분리 관리, 동일 VGW에 연결)
+variable "vpn_gateways" {
+  description = "Map of dedicated VPN gateways (e.g. MacMini bastion) keyed by name; each creates its own customer gateway + VPN connection on the shared VGW"
+  type = map(object({
+    ip      = string
+    bgp_asn = number
+  }))
+  default = {}
+}
+
+variable "vpn_gateway_static_route_cidrs" {
+  description = "Static route CIDR blocks per vpn_gateways entry (edge customer_gateways의 CIDR과 중복 금지)"
+  type        = map(list(string))
+  default     = {}
+}
+
 variable "dlq_alert_slack_webhook_url" {
   description = "Slack incoming webhook URL for DLQ alerts; leave empty to skip Lambda webhook delivery"
   type        = string
@@ -305,4 +321,10 @@ variable "incident_copilot_bedrock_model_id" {
   description = "Amazon Bedrock model ID used by the inference incident copilot Lambda"
   type        = string
   default     = "anthropic.claude-3-haiku-20240307-v1:0"
+}
+
+variable "incident_copilot_monitoring_url" {
+  description = "Optional monitoring dashboard URL shown in Incident Copilot Slack alerts"
+  type        = string
+  default     = ""
 }

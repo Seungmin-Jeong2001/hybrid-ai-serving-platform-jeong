@@ -3704,6 +3704,9 @@ PY
   kubectl -n model-build create secret generic minio-client-credentials --from-literal=accessKey="${minio_root_user}" --from-literal=secretKey="${minio_root_password}" --dry-run=client -o yaml | kubectl apply -f -
   kubectl -n minio-tenant create secret generic model-admin --from-literal=CONSOLE_ACCESS_KEY="${minio_console_user}" --from-literal=CONSOLE_SECRET_KEY="${minio_console_password}" --dry-run=client -o yaml | kubectl apply -f -
   kubectl -n minio-tenant create secret generic minio-configuration --from-literal=config.env="${minio_config_env}" --dry-run=client -o yaml | kubectl apply -f -
+  # argo-events 이벤트소스 자격증명도 MinIO root와 동일하게 reconcile (멱등 — root 변경 시 동기화, 안 하면 minio-event-source 인증 깨짐)
+  kubectl create namespace argo-events --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
+  kubectl -n argo-events create secret generic minio-secret --from-literal=accessKey="${minio_root_user}" --from-literal=secretKey="${minio_root_password}" --dry-run=client -o yaml | kubectl apply -f -
   sed -E "s/storage: [0-9]+Gi/storage: ${MINIO_VOLUME_SIZE}Gi/g" "${ROOT}/private/storage/minio-tenant.yaml" | kubectl apply -f -
   for _ in {1..60}; do
     pod_count="$(kubectl get pods -n minio-tenant -l v1.min.io/tenant=hybrid-ai --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')"
