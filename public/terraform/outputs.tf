@@ -47,7 +47,7 @@ output "ses_alert_recipient_email" {
 
 output "alb_certificate_arn" {
   description = "ACM certificate ARN used by the internal ALB ingress resources"
-  value       = var.alb_certificate_arn
+  value       = local.effective_alb_certificate_arn
 }
 
 output "account_id" {
@@ -74,6 +74,11 @@ output "ebs_csi_driver_role_arn" {
 output "aws_load_balancer_controller_role_arn" {
   description = "IAM role ARN for the aws-load-balancer-controller service account (IRSA)"
   value       = aws_iam_role.aws_load_balancer_controller.arn
+}
+
+output "argocd_image_updater_role_arn" {
+  description = "IAM role ARN for the argocd-image-updater-controller service account (IRSA)"
+  value       = aws_iam_role.argocd_image_updater.arn
 }
 
 output "eks_bootstrap_admin_role_arn" {
@@ -229,5 +234,17 @@ output "vpn_local_vpc_cidr" {
 output "dlq_alert_lambda_name" {
   description = "Lambda function name for the inference incident copilot webhook delivery"
   value       = local.enable_dlq_alert_webhook ? aws_lambda_function.dlq_alarm[0].function_name : null
+  sensitive   = true
+}
+
+output "incident_copilot_agent_id" {
+  description = "Bedrock Agent ID for the Inference Incident Copilot"
+  value       = local.enable_dlq_alert_webhook ? try(aws_bedrockagent_agent.incident_copilot[0].id, null) : null
+  sensitive   = true
+}
+
+output "incident_copilot_agent_alias_id" {
+  description = "Bedrock Agent alias ID for the Inference Incident Copilot"
+  value       = local.enable_dlq_alert_webhook ? try(aws_bedrockagent_agent_alias.incident_copilot[0].agent_alias_id, null) : null
   sensitive   = true
 }

@@ -236,9 +236,15 @@ variable "argocd_chart_version" {
 }
 
 variable "alb_certificate_arn" {
-  description = "ACM certificate ARN used by the internal ALB ingress resources"
+  description = "Optional override for the ACM certificate ARN used by the internal ALB ingress resources; when empty Terraform auto-discovers a matching ACM certificate"
   type        = string
   default     = ""
+}
+
+variable "alb_certificate_domain" {
+  description = "Primary ACM certificate domain name to discover automatically for the internal ALB ingress resources"
+  type        = string
+  default     = "*.sgs-hasp.click"
 }
 
 variable "additional_eks_admin_role_arns" {
@@ -258,7 +264,7 @@ variable "enable_site_to_site_vpn" {
 variable "enable_s3_interface_endpoint" {
   description = "S3 인터페이스 엔드포인트 생성 여부 (온프레미스 VPN→S3 직접 접근=ECR-over-VPN에 필요, 비용 발생)"
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "customer_gateways" {
@@ -315,4 +321,10 @@ variable "incident_copilot_bedrock_model_id" {
   description = "Amazon Bedrock model ID used by the inference incident copilot Lambda"
   type        = string
   default     = "anthropic.claude-3-haiku-20240307-v1:0"
+}
+
+variable "incident_copilot_monitoring_url" {
+  description = "Optional monitoring dashboard URL shown in Incident Copilot Slack alerts"
+  type        = string
+  default     = ""
 }
