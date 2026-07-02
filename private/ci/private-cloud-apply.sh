@@ -3546,7 +3546,7 @@ bootstrap_k8s() {
     gitlab_ip="$(first_gitlab_ip || true)"
     if [[ -n "${gitlab_ip}" ]]; then
       log "fetching GitLab runner token from GitLab VM for K8s bootstrapping"
-      export GITLAB_TOKEN="$(ssh -F "${SSH_CONFIG}" "${gitlab_ip}" 'sudo cat /var/lib/hybrid-ai/gitlab-bootstrap/runner-token' 2>/dev/null || true)"
+      export GITLAB_RUNNER_AUTH_TOKEN="$(ssh -F "${SSH_CONFIG}" "${gitlab_ip}" 'sudo cat /var/lib/hybrid-ai/gitlab-bootstrap/runner-token' 2>/dev/null || true)"
       export GITLAB_URL="${GITLAB_EXTERNAL_URL}"
     fi
   fi

@@ -853,14 +853,24 @@ wait_for_kubernetes_api() {
 # ==============================================================================
 install_gitlab_runner_automation() {
   local master_host="$1"
+  local install_script="${ROOT}/private/gitlab-runner/install.sh"
+  local values_file="${ROOT}/private/gitlab-runner/values.yaml"
+  local install_script_b64
+  local values_file_b64
 
   info "--------------------------------------------------------"
   info "Fox: GitLab Runner 무인 배포 및 사설 인프라 연동 자동화를 가동합니다."
   info "--------------------------------------------------------"
   local target_gitlab_url="${GITLAB_URL:-https://gitlab.intp.me}"
-  local target_gitlab_token="${GITLAB_TOKEN:-GLRT-PLACEHOLDER-TOKEN}"
+  local target_gitlab_token="${GITLAB_RUNNER_AUTH_TOKEN:-}"
 
   info "  Target 사설 GitLab 엔드포인트: ${target_gitlab_url}"
+
+  [[ -f "$install_script" ]] || die "GitLab Runner install script not found: ${install_script}"
+  [[ -f "$values_file" ]] || die "GitLab Runner values file not found: ${values_file}"
+
+  install_script_b64="$(base64 -w0 < "$install_script")"
+  values_file_b64="$(base64 -w0 < "$values_file")"
 
   local gitlab_domain
   gitlab_domain="${target_gitlab_url#*://}" # "gitlab.intp.me" 추출
@@ -877,12 +887,21 @@ install_gitlab_runner_automation() {
   
   info "  Detected GitLab VM Private IP: ${gitlab_ip}"
 
-  # 마스터 노드 원격 진입 후 백엔드 비대화형 자원 패키징 시작
-  ssh_node "$master_host" bash -s -- "$target_gitlab_url" "$target_gitlab_token" "$gitlab_ip" <<'REMOTE'
+  # 마스터 노드 원격 진입 후 Runner install 자산을 임시 디렉터리에 주입해 실행
+  ssh_node "$master_host" bash -s -- \
+    "$target_gitlab_url" \
+    "$target_gitlab_token" \
+    "$gitlab_ip" \
+    "$install_script_b64" \
+    "$values_file_b64" <<'REMOTE'
 set -euo pipefail
 gl_url="$1"
-gl_token="$2"
+runner_auth_token="$2"
 gl_ip="$3"
+install_script_b64="$4"
+values_file_b64="$5"
+workdir="$(mktemp -d)"
+trap 'rm -rf "$workdir"' EXIT
 
 # 1. 마스터 노드 내부에 Helm v3 패키지 관리자 다운로드 및 기동
 if ! command -v helm >/dev/null 2>&1; then
@@ -890,9 +909,10 @@ if ! command -v helm >/dev/null 2>&1; then
   curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 fi
 
-# 2. 오피셜 깃랩 차트 레포지토리 동기화 및 인덱스 싱크
-helm repo add gitlab https://charts.gitlab.io --force-update >/dev/null
-helm repo update >/dev/null
+# 2. 설치 스크립트와 values 파일을 master에 임시 배치
+printf '%s' "$install_script_b64" | base64 -d > "${workdir}/install.sh"
+printf '%s' "$values_file_b64" | base64 -d > "${workdir}/values.yaml"
+chmod 700 "${workdir}/install.sh"
 
 # 3. 팀 아키텍처 규칙에 따른 모델 빌드 격리 방(Namespace) 선행 생성
 sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf create namespace model-build --dry-run=client -o yaml | sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -
@@ -904,36 +924,21 @@ sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf -n model-build create secre
   --dry-run=client -o yaml | sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -
 rm -f gitlab.intp.me.crt
 
-echo "Deploying GitLab Runner with Private Harbor Cache configurations..."
-# 이미지 주소를 사내 Harbor 사설 프록시 대역(harbor.intp.me/docker-hub/gitlab/...)으로 원상 복구 및 설정 자동화
-sudo helm --kubeconfig=/etc/kubernetes/admin.conf upgrade --install gitlab-runner gitlab/gitlab-runner \
-  --namespace model-build \
-  --set gitlabUrl="${gl_url}" \
-  --set runnerRegistrationToken="${gl_token}" \
-  --set rbac.create=false \
-  --set rbac.serviceAccountName=model-build-runner \
-  --set runners.tags="gpu-worker,argo" \
-  --set image.registry="harbor.intp.me" \
-  --set image.image="docker-hub/gitlab/gitlab-runner" \
-  --set runners.helpers.image="harbor.intp.me/docker-hub/gitlab/gitlab-runner-helper" \
-  --set certsSecretName="gitlab-runner-certs" \
-  --set-json "hostAliases=[{\"ip\":\"${gl_ip}\",\"hostnames\":[\"gitlab.intp.me\"]}]" \
-  --set-json 'envVars=[{"name":"GITLAB_RUNNER_DISABLE_SSL_VERIFICATION","value":"true"}]' \
-  --set runners.config="[[runners]]
-    name = \"private-argo-controller-runner\"
-    executor = \"kubernetes\"
-    [runners.kubernetes]
-      namespace = \"model-build\"
-      privileged = true
-      service_account = \"model-build-runner\"
-      image = \"harbor.intp.me/docker-hub/library/alpine:latest\"
-      memory_request = \"2Gi\"
-      memory_limit = \"10Gi\"
-      image_pull_secrets = [\"harbor-kaniko-push\"]
-      [[runners.kubernetes.volumes.pvc]]
-        name = \"build-cache\"
-        claim_name = \"model-build-cache\"
-        mount_path = \"/cache\""
+# 5. 분리된 install.sh를 kubeconfig 기반으로 실행
+echo "Deploying GitLab Runner with dedicated provisioning assets..."
+if [[ -n "$runner_auth_token" ]]; then
+  export GITLAB_RUNNER_AUTH_TOKEN="$runner_auth_token"
+fi
+export GITLAB_URL="$gl_url"
+export GITLAB_RUNNER_HOST_ALIAS_IP="${gl_ip:-100.110.101.77}"
+export GITLAB_RUNNER_NAMESPACE="model-build"
+export GITLAB_RUNNER_RELEASE="gitlab-runner"
+export GITLAB_RUNNER_CHART_VERSION="0.89.1"
+export GITLAB_RUNNER_CERT_SECRET_NAME="gitlab-runner-certs"
+export HARBOR_PULL_SECRET_NAME="harbor-kaniko-push"
+export KUBECTL_SUDO="true"
+export KUBECTL_KUBECONFIG="/etc/kubernetes/admin.conf"
+"${workdir}/install.sh"
 
 echo "🎉 GitLab Runner 제한망 배포 신호 탄막 전송 완료!"
 REMOTE

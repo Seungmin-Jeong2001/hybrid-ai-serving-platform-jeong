@@ -102,60 +102,46 @@ kubectl -n model-build create secret generic minio-client-credentials \
 
 ## Runner 배치 기준
 
-권장 배치는 build-worker VM의 shell executor입니다.
+현재 기준 Runner 배치는 `model-build` namespace에 설치되는 Helm chart 기반 Kubernetes executor입니다.
 
 ```text
 GitLab VM
   -> pipeline scheduling, runner token
 
-build-worker VM
-  -> gitlab-runner shell executor
-  -> kubectl/argo/aws/skopeo or crane/mc installed
-  -> Kubernetes API, GitLab, Harbor, ECR 접근
-
 Kubernetes model-build namespace
-  -> Argo Workflow 생성
-  -> GPU training pod와 Kaniko pod 실행
+  -> gitlab-runner Deployment/Pod
+  -> GitLab CI Job 수신
+  -> Kubernetes executor로 job pod 생성
+
+GPU worker / build worker node
+  -> runner job pod 또는 후속 workload pod 실행
+  -> Kubernetes API, GitLab, Harbor, ECR 접근
 ```
 
-Docker-in-Docker runner는 기본 선택이 아닙니다. image build는 Kaniko pod가 수행하고, Runner는 workflow submit과 promotion만 담당합니다.
+Docker-in-Docker runner는 기본 선택이 아닙니다. image build는 Kaniko pod가 수행하고, Runner는 workflow submit과 promotion을 Kubernetes executor로 수행합니다.
 
 ## Runner 등록 절차
 
-GitLab bootstrap이 만든 runner token을 GitLab VM에서 읽어 build-worker runner 등록에 사용합니다.
+GitLab bootstrap이 만든 runner token을 GitLab VM에서 읽어 Kubernetes 내 GitLab Runner chart secret에 주입합니다.
 
 ```bash
 # GitLab VM에서 token 확인
 sudo cat /var/lib/hybrid-ai/gitlab-bootstrap/runner-token
 
-# build-worker VM에서 실행
-export GITLAB_URL="https://gitlab.intp.me"
+# control-plane에서 실행
 export GITLAB_RUNNER_AUTH_TOKEN="<runner-token-from-gitlab-vm>"
-
-sudo gitlab-runner register \
-  --non-interactive \
-  --url "${GITLAB_URL}" \
-  --token "${GITLAB_RUNNER_AUTH_TOKEN}" \
-  --executor "shell" \
-  --description "hybrid-ai-build-worker-01" \
-  --tag-list "model-build,private-cloud" \
-  --run-untagged="false" \
-  --locked="false"
+./private/gitlab-runner/install.sh
 ```
 
-Runner host에는 최소한 아래 도구가 있어야 합니다.
+Runner provisioning host에는 최소한 아래 도구가 있어야 합니다.
 
 ```text
-gitlab-runner
 kubectl
-argo
-aws
-skopeo 또는 crane
-mc
-jq
+helm
+openssl
 ```
 
-Runner는 `model-build` tag가 붙은 job만 받게 둡니다. GPU 작업 자체는 runner host에서 실행하지 않고 Argo workflow pod가 `hybrid-ai.io/node-role: gpu-worker` nodeSelector로 GPU worker에 배치됩니다.
+Runner는 `gpu-worker,private,ecr-sync,model-build` tag 집합을 사용합니다. GPU 작업 자체는 runner manager pod에서 실행하지 않고, Kubernetes executor가 생성한 job pod나 Argo workflow pod가 `hybrid-ai.io/node-role: gpu-worker` 또는 별도 node selector 기준으로 배치됩니다.
 
 ## Runner RBAC
 
