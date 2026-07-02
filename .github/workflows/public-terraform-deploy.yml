@@ -13,6 +13,22 @@ on:
           - apply
           - destroy
           - repair-vpn-state
+          - force-unlock
+      lock_id:
+        description: Lock ID to release when action=force-unlock (terraform state lock UUID)
+        required: false
+        default: ""
+        type: string
+      trigger_bastion_vpn:
+        description: After apply, push the TF output to the bastion repo and dispatch its VPN render/apply (no public egress data plane)
+        required: false
+        default: false
+        type: boolean
+      trigger_private:
+        description: Ask the bastion to chain-trigger the private cloud re-apply once the VPN tunnel is up
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   id-token: write
@@ -81,6 +97,20 @@ jobs:
       - name: Terraform init
         working-directory: public/terraform
         run: terraform init
+
+      - name: Force-unlock Terraform state
+        if: ${{ inputs.action == 'force-unlock' }}
+        working-directory: public/terraform
+        env:
+          LOCK_ID: ${{ inputs.lock_id }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${LOCK_ID}" ]]; then
+            echo "::error::lock_id input is required for force-unlock"
+            exit 1
+          fi
+          terraform force-unlock -force "${LOCK_ID}"
+          echo "Released state lock ${LOCK_ID}."
 
       - name: Repair MacMini VPN Terraform state
         if: ${{ inputs.action == 'repair-vpn-state' }}
@@ -252,7 +282,7 @@ jobs:
       - name: Terraform plan
         if: ${{ inputs.action == 'apply' || inputs.action == 'plan' }}
         working-directory: public/terraform
-        run: terraform plan -out=tfplan
+        run: terraform plan -lock-timeout=5m -out=tfplan
 
       - name: Disable Bedrock action groups when apply will remove them
         if: ${{ inputs.action == 'apply' }}
@@ -433,7 +463,7 @@ jobs:
       - name: Rebuild Terraform plan after Bedrock disable
         if: ${{ inputs.action == 'apply' && steps.disable_bedrock_apply.outputs.disabled == 'true' }}
         working-directory: public/terraform
-        run: terraform plan -out=tfplan
+        run: terraform plan -lock-timeout=5m -out=tfplan
 
       - name: Upload tfplan artifact
         if: ${{ inputs.action == 'apply' || inputs.action == 'plan' }}
@@ -445,7 +475,7 @@ jobs:
       - name: Terraform apply
         if: ${{ inputs.action == 'apply' }}
         working-directory: public/terraform
-        run: terraform apply -auto-approve tfplan
+        run: terraform apply -lock-timeout=5m -auto-approve tfplan
 
       - name: Resolve SSM bootstrap instance
         id: resolve_instance
@@ -589,6 +619,38 @@ jobs:
 
           echo "MSK topics sync timed out."
           exit 1
+
+      - name: Sync Terraform output to bastion and dispatch VPN render
+        if: ${{ inputs.action == 'apply' && inputs.trigger_bastion_vpn }}
+        working-directory: public/terraform
+        env:
+          GH_TOKEN: ${{ secrets.BASTION_DISPATCH_TOKEN }}
+          BASTION_REPO: ${{ vars.BASTION_REPO || 'SGS-Strategy/bastion-host' }}
+          BASTION_PROVISION_REF: ${{ vars.BASTION_PROVISION_REF || 'main' }}
+          TRIGGER_PRIVATE: ${{ inputs.trigger_private }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::BASTION_DISPATCH_TOKEN secret (Actions:write + Secrets:write on ${BASTION_REPO}) is required to drive the bastion VPN chain"
+            exit 1
+          fi
+          # terraform output -json carries the *sensitive* VPN pre-shared keys that
+          # `bh render` consumes. Never let it touch logs or a plain artifact: pipe it
+          # straight into an encrypted Actions secret on the bastion repo. The bastion
+          # then reaches AWS only over the IPsec tunnel — no public egress data plane.
+          umask 077
+          terraform output -json > "${RUNNER_TEMP}/public-tf-output.json"
+          gh secret set PUBLIC_TF_OUTPUT_JSON \
+            --repo "${BASTION_REPO}" \
+            < "${RUNNER_TEMP}/public-tf-output.json"
+          rm -f "${RUNNER_TEMP}/public-tf-output.json"
+          gh workflow run provision.yml \
+            --repo "${BASTION_REPO}" \
+            --ref "${BASTION_PROVISION_REF}" \
+            -f mode=vpn \
+            -f run_vpn_bootstrap=true \
+            -f trigger_private="${TRIGGER_PRIVATE}"
+          echo "Dispatched ${BASTION_REPO} provision (mode=vpn, trigger_private=${TRIGGER_PRIVATE})."
 
       - name: Pre-destroy Kubernetes cleanup
         if: ${{ inputs.action == 'destroy' && steps.resolve_instance.outputs.value != '' }}
@@ -930,7 +992,7 @@ jobs:
       - name: Terraform destroy plan
         if: ${{ inputs.action == 'destroy' }}
         working-directory: public/terraform
-        run: terraform plan -destroy -refresh=false -out=tfdestroy
+        run: terraform plan -lock-timeout=5m -destroy -refresh=false -out=tfdestroy
 
       - name: Upload destroy plan artifact
         if: ${{ inputs.action == 'destroy' }}
@@ -942,4 +1004,4 @@ jobs:
       - name: Terraform destroy
         if: ${{ inputs.action == 'destroy' }}
         working-directory: public/terraform
-        run: terraform apply -auto-approve tfdestroy
+        run: terraform apply -lock-timeout=5m -auto-approve tfdestroy

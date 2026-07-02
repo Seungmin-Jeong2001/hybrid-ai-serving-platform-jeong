@@ -10,11 +10,24 @@ spec:
   eventBusName: default
   template:
     serviceAccountName: argo-events-sa
+  # Apply:
+  # kubectl apply -f private/kubernetes/model-build-workflows/minio-sensor.yaml
+  #
+  # Verify:
+  # kubectl get sensor minio-sensor -n argo-events -o jsonpath='
+  # eventName={.spec.dependencies[0].eventName}
+  # dataKey={.spec.triggers[0].template.argoWorkflow.parameters[0].src.dataKey}
+  # '
+  # echo
+  #
+  # Expected:
+  # eventName=dataset-success
+  # dataKey=notification.0.s3.object.key
 
   dependencies:
     - name: minio-dep
       eventSourceName: minio-event-source
-      eventName: raw-data-upload
+      eventName: dataset-success
 
   triggers:
     - template:
@@ -45,6 +58,6 @@ spec:
           parameters:
             - src:
                 dependencyName: minio-dep
-                dataKey: body.Records.0.s3.object.key
+                dataKey: notification.0.s3.object.key
               dest: spec.arguments.parameters.0.value
               operation: overwrite
