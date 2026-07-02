@@ -1,5 +1,6 @@
-# Example backend config for the GitLab OIDC / ECR promotion IAM module.
-# Keep this module in remote state before using it from GitHub Actions.
+# Example backend config for optional Terraform adoption of the GitLab OIDC ECR promotion IAM resources.
+# The current operating model for this GitLab OIDC integration is administrator-created and reviewed.
+# Use this backend only when promoting this GitLab OIDC reference module to Terraform-managed infrastructure.
 bucket       = "sgs-hasp-tfstate"
 key          = "private/aws-oidc/terraform.tfstate"
 region       = "ap-northeast-2"

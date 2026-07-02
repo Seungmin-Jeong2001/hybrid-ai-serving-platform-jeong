@@ -1,12 +1,15 @@
 # GitLab OIDC for AWS ECR Promotion
 
-GitLab CI에서 장기 AWS Access Key 없이 ECR push를 수행하기 위한 OIDC 구성입니다. 이 디렉터리는 Harbor에 있는 이미지를 AWS ECR로 promotion 하는 파이프라인이 `AssumeRoleWithWebIdentity` 방식으로 임시 자격 증명을 받도록 AWS IAM 리소스를 코드화합니다.
+이 디렉터리는 GitLab OIDC 기반 ECR Promotion을 위한 AWS IAM 설정을 설명합니다. 범위는 GitLab CI가 Harbor 이미지를 AWS ECR `predictive-model` 저장소로 promotion 할 때 필요한 GitLab OIDC Provider, GitLab ECR Promotion IAM Role, 해당 trust policy, ECR push inline policy, 그리고 GitLab CI/CD Variable `GITLAB_ECR_PROMOTION_ROLE_ARN`에 한정합니다.
+
+현재 운영 방식에서는 이 GitLab OIDC ECR Promotion IAM 리소스를 관리자가 수동 생성/검토합니다. 이 디렉터리의 Terraform 파일은 같은 구성을 재현하거나, 향후 이 GitLab OIDC 구성을 Terraform 관리 대상으로 전환할 때 참고하는 reference/adoption 용도로 유지합니다.
 
 ## 목적
 
 - GitLab CI가 OIDC ID Token을 사용해 AWS STS에서 임시 자격 증명을 발급받도록 구성합니다.
 - Harbor -> ECR promotion pipeline에 필요한 최소 IAM 권한만 부여합니다.
 - ECR repository 생성 권한은 포함하지 않고, 기존 `predictive-model` repository만 대상으로 제한합니다.
+- 기본 private cloud provisioning 흐름에서는 `private/aws-oidc`를 자동 apply 하지 않습니다.
 
 ## 전체 흐름
 
@@ -30,79 +33,127 @@ flowchart LR
     Skopeo --> ECR[AWS ECR predictive-model:tag]
 ```
 
-## 생성 리소스
+## 현재 운영 범위
 
-- `aws_iam_openid_connect_provider`
-  - issuer: `https://gitlab.intp.me`
-  - audience: `sts.amazonaws.com`
-- `aws_iam_role`
-  - name: `gitlab-ecr-promotion-role`
-  - trust policy:
-    - `gitlab.intp.me:aud = sts.amazonaws.com`
-    - `gitlab.intp.me:sub = project_path:3stacks/predictor-model:ref_type:branch:ref:main`
-- `aws_iam_role_policy`
-  - `ecr:GetAuthorizationToken` on `*`
-  - selected ECR push/pull actions on `predictive-model` only
+- GitLab OIDC Provider
+- GitLab ECR Promotion IAM Role
+- 해당 Role의 trust policy
+- 해당 Role의 ECR push inline policy
+- GitLab CI/CD Variable `GITLAB_ECR_PROMOTION_ROLE_ARN`
 
-## 사용 방법
+이 문서는 AWS IAM 전체 운영 정책을 정의하지 않습니다. 현재 수동 생성/검토 절차와 Terraform reference는 위 GitLab OIDC ECR Promotion 리소스 범위에만 적용됩니다.
 
-```bash
-cd private/aws-oidc
-cp backend.example.hcl backend.hcl
-terraform init -backend-config=backend.hcl
-```
+## Terraform 파일의 역할
 
-Terraform 인증은 `aws configure`, `AWS_PROFILE`, SSO, 환경변수 등 외부 방식에 맡깁니다. 코드 안에는 AWS Access Key나 Secret Key를 넣지 않습니다.
+- `main.tf`
+  - GitLab OIDC Provider, ECR Promotion Role, trust policy, ECR push inline policy의 기준 구성을 표현합니다.
+- `variables.tf`
+  - GitLab issuer, project/ref 조건, AWS account/region, ECR repository 값을 정의합니다.
+- `outputs.tf`
+  - GitLab CI/CD에 등록할 `GITLAB_ECR_PROMOTION_ROLE_ARN` 값을 확인하는 용도입니다.
+- `backend.tf`
+  - 향후 이 GitLab OIDC 구성을 Terraform 관리 대상으로 전환할 때 S3 remote state를 사용하기 위한 backend 선언입니다.
+- `backend.example.hcl`
+  - 향후 adoption/import 시 사용할 remote state 예시입니다.
 
-이 모듈은 현재 `./ha apply` 또는 `Private Cloud Controller` 기본 DAG에 자동 연결되어 있지 않습니다. 기본 private cloud 프로비저닝은 `private/openstack` Terraform만 실행하고, `private/aws-oidc`는 별도 수동/선택 적용 모듈로 취급해야 안전합니다.
+이 파일들은 현재 기본 GitHub Actions private cloud provisioning 흐름에서 자동 실행되지 않습니다.
 
-## Remote State
+## 수동 생성/검토 기준
 
-이 모듈은 GitHub Actions에서 실행할 경우 반드시 remote state를 사용해야 합니다. GitHub-hosted runner에서 local state로 실행하면 매 실행마다 state가 비어 있는 상태로 시작하므로, 이미 콘솔에 있는 OIDC Provider / IAM Role / inline policy를 다시 생성하려고 시도할 수 있습니다.
+### 1. GitLab OIDC Provider
 
-현재 레포의 AWS S3 backend 패턴은 아래와 같습니다.
+- Provider URL: `https://gitlab.intp.me`
+- Audience: `sts.amazonaws.com`
+- Provider ARN: `arn:aws:iam::808379768010:oidc-provider/gitlab.intp.me`
 
-- public Terraform bucket: `sgs-hasp-tfstate`
-- public root key: `terraform/terraform.tfstate`
-- in-cluster key: `terraform/incluster.tfstate`
-- lock 방식: `use_lockfile = true`
+### 2. GitLab ECR Promotion IAM Role
+
+- Role name: `gitlab-ecr-promotion-role`
+- Role ARN: `arn:aws:iam::808379768010:role/gitlab-ecr-promotion-role`
+
+Trust Policy 기준:
+
+- Principal Federated:
+  - `arn:aws:iam::808379768010:oidc-provider/gitlab.intp.me`
+- Action:
+  - `sts:AssumeRoleWithWebIdentity`
+- Condition:
+  - `gitlab.intp.me:aud = sts.amazonaws.com`
+  - `gitlab.intp.me:sub = project_path:3stacks/predictor-model:ref_type:branch:ref:main`
+
+### 3. ECR Push Inline Policy
+
+- Policy name: `gitlab-ecr-promotion-role-policy`
+- `ecr:GetAuthorizationToken`은 Resource `*`
+- ECR push 관련 권한은 `arn:aws:ecr:ap-northeast-2:808379768010:repository/predictive-model`로 제한
+- `ecr:CreateRepository`는 부여하지 않음
+
+허용 대상 액션:
+
+- `ecr:BatchCheckLayerAvailability`
+- `ecr:BatchGetImage`
+- `ecr:CompleteLayerUpload`
+- `ecr:DescribeImages`
+- `ecr:DescribeRepositories`
+- `ecr:GetDownloadUrlForLayer`
+- `ecr:InitiateLayerUpload`
+- `ecr:ListImages`
+- `ecr:PutImage`
+- `ecr:UploadLayerPart`
+
+### 4. GitLab CI/CD Variables
+
+GitLab CI/CD에는 아래 값을 등록해 사용합니다.
+
+- `GITLAB_ECR_PROMOTION_ROLE_ARN`
+- `AWS_REGION`
+- `AWS_ACCOUNT_ID`
+- `ECR_ENDPOINT`
+- `ECR_REPOSITORY`
+- `ECR_REGISTRY_ID`
+
+변수 정책:
+
+- `AWS_ROLE_ARN`은 GitHub Actions 자체 AssumeRole 용도와 충돌할 수 있으므로 GitLab ECR Promotion 용도로 사용하지 않습니다.
+- `AWS_ACCESS_KEY_ID`와 `AWS_SECRET_ACCESS_KEY`는 GitLab ECR Promotion 인증 변수로 사용하지 않습니다.
+- `AWS_SESSION_TOKEN`이 기존에 등록되어 있었다면 제거하고, 없었다면 새로 등록하지 않습니다.
+- GitLab OIDC 방식에서는 CI Job 런타임에 AWS STS가 임시 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`을 발급하고 job 내부에서만 export 합니다.
+
+## 기본 실행 정책
+
+- 기본 private cloud provisioning 흐름에서는 `private/aws-oidc`를 자동 apply 하지 않습니다.
+- `./ha apply`와 `Private Cloud Controller` 기본 DAG는 현재 `private/openstack` Terraform을 중심으로 동작합니다.
+- `private/aws-oidc`는 GitLab OIDC ECR Promotion 구성을 설명하고 재현하기 위한 별도 reference/adoption 모듈입니다.
+- 현재 `private-cloud-apply.sh`와 `.github/workflows/private-cloud-remote.yml`은 AWS IAM 리소스를 생성하지 않고, GitLab CI 설정에 필요한 `GITLAB_ECR_PROMOTION_ROLE_ARN` 전달만 유지합니다.
+
+## 향후 Terraform 관리로 전환하는 경우
+
+현재 기본 운영에서는 GitLab OIDC ECR Promotion IAM 구성을 관리자가 수동 생성/검토합니다. 향후 이 GitLab OIDC ECR Promotion 구성을 Terraform 관리 대상으로 전환하려면, 먼저 S3 remote state를 연결한 뒤 기존 콘솔 리소스를 import 해서 같은 state로 관리해야 합니다.
+
+### Remote State
+
+GitHub Actions 같은 일회성 실행 환경에서 local state를 사용하면 매 실행마다 state가 비어 있는 상태로 시작할 수 있습니다. 그 상태에서 `private/aws-oidc`를 바로 apply 하면 기존 GitLab OIDC Provider, IAM Role, inline policy를 다시 만들려고 시도할 수 있으므로 remote state가 선행되어야 합니다.
+
+현재 레포의 backend 패턴을 따라 이 모듈은 아래 key를 예시로 사용합니다.
+
+- bucket: `sgs-hasp-tfstate`
+- key: `private/aws-oidc/terraform.tfstate`
 - region: `ap-northeast-2`
+- lock 방식: `use_lockfile = true`
 
-이 모듈은 같은 bucket/region 패턴을 따르되 key를 분리해 사용합니다.
-
-- 권장 key: `private/aws-oidc/terraform.tfstate`
-
-예시 backend config:
-
-```hcl
-bucket       = "sgs-hasp-tfstate"
-key          = "private/aws-oidc/terraform.tfstate"
-region       = "ap-northeast-2"
-use_lockfile = true
-encrypt      = true
-```
-
-remote state 준비 후 권장 실행 순서:
+예시:
 
 ```bash
 cd private/aws-oidc
 cp backend.example.hcl backend.hcl
 terraform init -backend-config=backend.hcl
-terraform plan
 ```
 
-신규 환경이라면 remote state를 먼저 연결한 뒤 `terraform apply`로 생성할 수 있습니다. 기존 콘솔 리소스가 이미 있는 환경이라면 `terraform apply` 전에 import를 먼저 수행하고, `terraform plan`으로 drift를 확인한 뒤부터 `plan/apply`로 관리해야 합니다.
+### Import 후 관리
 
-## Existing Console Resources
+기존 콘솔 리소스가 있는 현재 환경에서는 import 전에 바로 apply 하면 기존 OIDC Provider/Role과 충돌할 수 있습니다. 이 adoption 절차는 기본 private cloud provisioning DAG에서 자동 수행하지 않습니다.
 
-현재 환경에는 아래 AWS 리소스가 이미 콘솔에 존재합니다.
-
-- OIDC Provider: `arn:aws:iam::808379768010:oidc-provider/gitlab.intp.me`
-- IAM Role: `arn:aws:iam::808379768010:role/gitlab-ecr-promotion-role`
-
-따라서 첫 `terraform apply` 전에 반드시 import를 먼저 수행해야 합니다. 그렇지 않으면 Terraform은 state에 리소스가 없다고 판단해 새로 생성하려고 시도하고, AWS에서 `EntityAlreadyExists` 또는 유사한 중복 생성 오류가 발생할 수 있습니다.
-
-권장 import 절차:
+권장 절차:
 
 ```bash
 cd private/aws-oidc
@@ -124,39 +175,18 @@ terraform import \
 terraform plan
 ```
 
-이 import가 끝나면 이후부터는 같은 remote state를 기준으로 기존 리소스를 재사용/관리할 수 있습니다.
+이후부터는 같은 remote state를 기준으로 drift를 확인하고 `plan/apply`로 관리할 수 있습니다.
 
-적용 후 GitLab CI/CD Variable에는 아래 값을 등록합니다.
+## Terraform Output 사용
+
+Terraform으로 role ARN을 확인할 때는 아래 출력을 사용합니다.
 
 ```text
 GITLAB_ECR_PROMOTION_ROLE_ARN=<terraform output -raw gitlab_ecr_promotion_role_arn>
 ```
 
-AWS 인증 변수 정책:
+## 보안 메모
 
-- GitLab CI/CD에는 AWS 인증용으로 `GITLAB_ECR_PROMOTION_ROLE_ARN`만 등록합니다.
-- `AWS_ROLE_ARN`은 GitHub Actions 자체 AssumeRole 용도와 충돌할 수 있으므로, GitLab ECR Promotion 용도로 사용하지 않습니다.
-- `AWS_ACCESS_KEY_ID`와 `AWS_SECRET_ACCESS_KEY`는 제거 대상입니다.
-- `AWS_SESSION_TOKEN`이 기존에 등록되어 있었다면 제거하고, 없었다면 새로 등록하지 않습니다.
-- OIDC 방식에서는 GitLab CI Job 런타임에 AWS STS가 임시 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`을 발급하며, 이 값은 job 내부에서만 export 되어 사용됩니다.
-- Terraform output으로 얻은 role ARN을 GitLab CI/CD Variable `GITLAB_ECR_PROMOTION_ROLE_ARN`에 넣어 사용합니다.
-
-## 변수 기본값
-
-- `aws_region = "ap-northeast-2"`
-- `aws_account_id = "808379768010"`
-- `gitlab_oidc_url = "https://gitlab.intp.me"`
-- `gitlab_oidc_host = "gitlab.intp.me"`
-- `gitlab_project_sub = "project_path:3stacks/predictor-model:ref_type:branch:ref:main"`
-- `role_name = "gitlab-ecr-promotion-role"`
-- `ecr_repository_name = "predictive-model"`
-
-## 운영 메모
-
-- 이 Terraform은 ECR repository를 생성하지 않습니다.
-- `ecr:CreateRepository` 권한도 의도적으로 부여하지 않습니다.
-- GitLab issuer 인증서 thumbprint는 `tls_certificate` data source로 조회합니다.
-- `gitlab.intp.me`에 Terraform 실행 환경에서 TLS로 접근 가능해야 OIDC provider plan/apply가 원활합니다.
-- 기본 DAG에서 자동 실행되지 않으므로, GitHub Actions에 연결할 때도 import 완료와 remote state 사용을 선행 조건으로 둬야 합니다.
-- 향후 GitHub Actions에 연결할 경우에도 기본값은 비활성화가 권장됩니다.
-- 자동 실행이 필요하다면 `workflow_dispatch` input으로 명시적으로 켜는 방식이 가장 안전합니다.
+- 실제 AWS Access Key, Secret Key, Session Token은 이 디렉터리의 코드나 문서에 저장하지 않습니다.
+- `backend.hcl`, `terraform.tfstate`, `terraform.tfstate.backup`, `.terraform/`는 커밋하지 않습니다.
+- 실제 GitLab PAT, Harbor password, runner token 같은 민감 값도 이 디렉터리에 넣지 않습니다.
