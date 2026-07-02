@@ -275,8 +275,16 @@ package:
 promote:ecr:
   stage: promote
   tags: [model-build]
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: sts.amazonaws.com
   needs: [package]
   script:
+    - aws sts assume-role-with-web-identity --role-arn "${AWS_ROLE_ARN}" --role-session-name "promote-${CI_PIPELINE_ID}" --web-identity-token "${GITLAB_OIDC_TOKEN}" --duration-seconds 3600 --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text > /tmp/aws-oidc-creds
+    - set -- $(cat /tmp/aws-oidc-creds)
+    - export AWS_ACCESS_KEY_ID="$1"
+    - export AWS_SECRET_ACCESS_KEY="$2"
+    - export AWS_SESSION_TOKEN="$3"
     - export HARBOR_IMAGE="${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:${IMAGE_TAG}"
     - export ECR_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${IMAGE_TAG}"
     - echo "${HARBOR_ROBOT_TOKEN}" | skopeo login "${HARBOR_REGISTRY}" --username "${HARBOR_ROBOT_USERNAME}" --password-stdin
@@ -324,7 +332,7 @@ GitLab CI variable 기준:
 | `MODEL_GIT_CLONE_URL` | Argo pod가 clone할 repo URL. private repo면 read-only deploy token 사용 |
 | `HARBOR_ROBOT_USERNAME`, `HARBOR_ROBOT_TOKEN` | Harbor pull source credential. masked/protected variable |
 | `AWS_ACCOUNT_ID`, `AWS_REGION`, `ECR_REPOSITORY` | ECR 대상 |
-| `AWS_ROLE_ARN` 또는 AWS access key | ECR push 권한. 가능하면 OIDC assume-role 사용 |
+| `AWS_ROLE_ARN` | ECR push 권한. 운영 기준은 GitLab OIDC + AssumeRoleWithWebIdentity |
 | `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` | release manifest 업로드용 |
 
 Harbor credential은 이미 Kubernetes secret `model-build/harbor-kaniko-push`에도 들어 있습니다. GitLab CI의 `promote:ecr` job은 Harbor에서 image를 pull해야 하므로 Runner 쪽에도 별도의 masked variable 또는 root-only credential file이 필요합니다.
@@ -458,5 +466,5 @@ mc cat "minio/artifacts/manifests/<project>/<tag>/release.json" | jq .
 
 1. build-worker GitLab Runner 설치와 등록을 `private-cloud-apply.sh` phase로 자동화.
 2. model repo `.gitlab-ci.yml`에서 runtime internet download를 Bastion cache 또는 Harbor mirror image로 대체.
-3. ECR promotion credential 방식을 확정. 운영 기준은 AWS OIDC assume-role.
+3. ECR promotion credential 방식은 AWS OIDC assume-role을 기본 기준으로 유지.
 4. release manifest를 MinIO와 GitLab artifact에 모두 남기고, public deploy는 ECR digest만 읽게 변경.

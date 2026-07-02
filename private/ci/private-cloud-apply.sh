@@ -4644,24 +4644,19 @@ setup_initial_gitlab_project() {
     minio_access_key="$(kubectl -n minio-tenant get secret minio-creds-secret -o jsonpath='{.data.accessKey}' | base64 -d 2>/dev/null || true)"
     minio_secret_key="$(kubectl -n minio-tenant get secret minio-creds-secret -o jsonpath='{.data.secretKey}' | base64 -d 2>/dev/null || true)"
 
-    # 🔐 [요청사항 반영] GitHub Actions 주입 명세 기반 변수 맵 바인딩 패치
-    # 1) AWS ECR 관련 계정 자산 주입
-    create_gitlab_variable "AWS_ACCESS_KEY_ID" "${AWS_ACCESS_KEY_ID:-}" "true"
-    create_gitlab_variable "AWS_SECRET_ACCESS_KEY" "${AWS_SECRET_ACCESS_KEY:-}" "true"
+    # 🔐 GitLab OIDC 기반 ECR promotion 변수 주입
+    # 장기 AWS access key는 더 이상 기본 경로로 주입하지 않는다.
+    create_gitlab_variable "AWS_ROLE_ARN" "${AWS_ROLE_ARN:-}" "false"
     
     # # 2) GitHub PAT 및 알림 채널 자산 주입
     # create_gitlab_variable "GITHUB_PAT" "${GITHUB_PAT:-}" "true"
     # create_gitlab_variable "SLACK_WEBHOOK_URL" "${SLACK_WEBHOOK_URL:-}" "true"
     
-    # # 3) ECR 엔드포인트 주소 바인딩 (호스트의 ECR_ENDPOINT 값을 GitLab 내의 ECR_API_URI로 매핑)
-    # local target_ecr_uri="${ECR_ENDPOINT:-${ECR_API_URI:-}}"
-    # create_gitlab_variable "ECR_API_URI" "${target_ecr_uri}" "false"
-    
-    # 4) Harbor 사설망 컨테이너 레지스트리 크레덴셜 추가 연동
+    # 2) Harbor 사설망 컨테이너 레지스트리 크레덴셜 추가 연동
     create_gitlab_variable "HARBOR_USER" "${HARBOR_USER:-}" "false"
     create_gitlab_variable "HARBOR_PASSWORD" "${HARBOR_PASSWORD:-}" "true"
     
-    # 5) 내부 스토리지 자격증명 백업 동기화
+    # 3) 내부 스토리지 자격증명 백업 동기화
     create_gitlab_variable "MINIO_ACCESS_KEY" "${minio_access_key:-}" "true"
     create_gitlab_variable "MINIO_SECRET_KEY" "${minio_secret_key:-}" "true"
   fi
