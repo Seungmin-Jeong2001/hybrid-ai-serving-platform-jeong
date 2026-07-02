@@ -323,7 +323,8 @@ sync-harbor-to-ecr:
     - |
       echo "[sync-harbor-to-ecr] start harbor to ecr sync" | tee ci_error_summary.txt
 
-      : "${AWS_ROLE_ARN:?AWS_ROLE_ARN is required}"
+      ECR_PROMOTION_ROLE_ARN="${GITLAB_ECR_PROMOTION_ROLE_ARN:-${AWS_ROLE_ARN:-}}"
+      : "${ECR_PROMOTION_ROLE_ARN:?GITLAB_ECR_PROMOTION_ROLE_ARN is required}"
       : "${GITLAB_OIDC_TOKEN:?GITLAB_OIDC_TOKEN is required}"
       : "${AWS_REGION:?AWS_REGION is required}"
       : "${HARBOR_USER:?HARBOR_USER is required}"
@@ -332,7 +333,7 @@ sync-harbor-to-ecr:
       echo "[sync-harbor-to-ecr] assume AWS role with GitLab OIDC" | tee -a ci_error_summary.txt
 
       aws sts assume-role-with-web-identity \
-        --role-arn "${AWS_ROLE_ARN}" \
+        --role-arn "${ECR_PROMOTION_ROLE_ARN}" \
         --role-session-name "gitlab-ecr-promotion-${CI_PIPELINE_ID}-${CI_JOB_ID}" \
         --web-identity-token "${GITLAB_OIDC_TOKEN}" \
         --duration-seconds 3600 \

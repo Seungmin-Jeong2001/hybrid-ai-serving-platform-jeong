@@ -8,7 +8,12 @@ output "gitlab_ecr_promotion_role_arn" {
   value       = aws_iam_role.gitlab_ecr_promotion.arn
 }
 
+output "gitlab_ecr_promotion_role_arn_variable_name" {
+  description = "GitLab CI/CD variable name that should store the ECR promotion role ARN."
+  value       = "GITLAB_ECR_PROMOTION_ROLE_ARN"
+}
+
 output "aws_role_arn_gitlab_variable" {
-  description = "Convenience string for the GitLab CI/CD variable value."
+  description = "Backward-compatible output for older references. Prefer gitlab_ecr_promotion_role_arn."
   value       = aws_iam_role.gitlab_ecr_promotion.arn
 }

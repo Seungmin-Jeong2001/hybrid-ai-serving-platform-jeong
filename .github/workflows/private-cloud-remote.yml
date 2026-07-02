@@ -295,7 +295,7 @@ jobs:
 
           
           write_env ECR_ENDPOINT "$ECR_ENDPOINT"
-          write_env AWS_ROLE_ARN "$AWS_ROLE_ARN"
+          write_env GITLAB_ECR_PROMOTION_ROLE_ARN "$GITLAB_ECR_PROMOTION_ROLE_ARN"
           write_env HARBOR_USER "$HARBOR_USER_GITLAB"
           write_env HARBOR_PASSWORD "$HARBOR_PASSWORD_GITLAB"
 
@@ -409,7 +409,7 @@ jobs:
           OPENSTACK_IMAGE_CACHE_PREFIX: ${{ vars.OPENSTACK_IMAGE_CACHE_PREFIX || 'hybrid-ai-cache' }}
           OPENSTACK_IMAGE_CACHE_DRIVER_PACKAGE: ${{ vars.GPU_DRIVER_PACKAGE || vars.OPENSTACK_IMAGE_CACHE_DRIVER_PACKAGE || 'nvidia-driver-595-open' }}
           ECR_ENDPOINT: ${{ secrets.ECR_ENDPOINT }}
-          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN_GITLAB || vars.AWS_ROLE_ARN || '' }}
+          GITLAB_ECR_PROMOTION_ROLE_ARN: ${{ vars.GITLAB_ECR_PROMOTION_ROLE_ARN || vars.AWS_ROLE_ARN_GITLAB || '' }}
           HARBOR_USER: ${{ secrets.HARBOR_USER_GITLAB }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD_GITLAB }}
 

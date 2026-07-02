@@ -4646,11 +4646,8 @@ setup_initial_gitlab_project() {
 
     # 🔐 GitLab OIDC 기반 ECR promotion 변수 주입
     # 장기 AWS access key는 더 이상 기본 경로로 주입하지 않는다.
-    create_gitlab_variable "AWS_ROLE_ARN" "${AWS_ROLE_ARN:-}" "false"
-    
-    # # 2) GitHub PAT 및 알림 채널 자산 주입
-    # create_gitlab_variable "GITHUB_PAT" "${GITHUB_PAT:-}" "true"
-    # create_gitlab_variable "SLACK_WEBHOOK_URL" "${SLACK_WEBHOOK_URL:-}" "true"
+    create_gitlab_variable "GITLAB_ECR_PROMOTION_ROLE_ARN" "${GITLAB_ECR_PROMOTION_ROLE_ARN:-}" "false"
+  
     
     # 2) Harbor 사설망 컨테이너 레지스트리 크레덴셜 추가 연동
     create_gitlab_variable "HARBOR_USER" "${HARBOR_USER:-}" "false"
