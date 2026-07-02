@@ -155,11 +155,11 @@ output "s3_gateway_endpoint_id" {
   value       = aws_vpc_endpoint.s3.id
 }
 
-# S3 Interface VPCE 비활성화됨 - endpoints.tf 참고
-# output "s3_interface_endpoint_id" {
-#   description = "S3 interface VPC endpoint ID (used by on-premise traffic over VPN)"
-#   value       = aws_vpc_endpoint.s3_interface.id
-# }
+# S3 interface VPC endpoint ID — 온프렘(VPN 경유) S3 접근용. enable_s3_interface_endpoint=false면 null.
+output "s3_interface_endpoint_id" {
+  description = "S3 interface VPC endpoint ID (used by on-premise traffic over VPN); null when disabled"
+  value       = try(aws_vpc_endpoint.s3_interface[0].id, null)
+}
 
 # VPN outputs
 output "vpn_gateway_id" {
